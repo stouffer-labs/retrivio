@@ -40,6 +40,36 @@ static LANCE_STORE: OnceLock<Mutex<Option<lance_store::LanceStore>>> = OnceLock:
 static PROGRESS_IO_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static CLI_DATA_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 static CLI_CONFIG_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
+const KNOWN_TOP_LEVEL_COMMANDS: &[&str] = &[
+    "doctor",
+    "setup",
+    "auth",
+    "config",
+    "autotune",
+    "init",
+    "install",
+    "add",
+    "del",
+    "roots",
+    "exclude",
+    "include",
+    "index",
+    "refresh",
+    "reembed",
+    "watch",
+    "search",
+    "pick",
+    "jump",
+    "ui",
+    "stop",
+    "daemon",
+    "bench",
+    "api",
+    "mcp",
+    "self-test",
+    "graph",
+    "legacy",
+];
 
 #[derive(Default)]
 struct EmbedRuntimeMetrics {
@@ -72,6 +102,111 @@ struct EmbedRuntimeSnapshot {
 fn embed_runtime_metrics() -> &'static EmbedRuntimeMetrics {
     static METRICS: OnceLock<EmbedRuntimeMetrics> = OnceLock::new();
     METRICS.get_or_init(EmbedRuntimeMetrics::default)
+}
+
+fn strip_terminal_control_sequences(raw: &str) -> String {
+    let mut cleaned = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\u{1b}' {
+            cleaned.push(ch);
+            continue;
+        }
+        match chars.peek().copied() {
+            Some('[') => {
+                chars.next();
+                while let Some(next) = chars.next() {
+                    if next.is_ascii_alphabetic() || next == '~' {
+                        break;
+                    }
+                }
+            }
+            Some('O') => {
+                chars.next();
+                let _ = chars.next();
+            }
+            _ => {}
+        }
+    }
+    cleaned
+}
+
+fn damerau_levenshtein_ascii(a: &str, b: &str) -> usize {
+    let a_chars: Vec<char> = a.chars().collect();
+    let b_chars: Vec<char> = b.chars().collect();
+    let mut dp = vec![vec![0usize; b_chars.len() + 1]; a_chars.len() + 1];
+    for i in 0..=a_chars.len() {
+        dp[i][0] = i;
+    }
+    for j in 0..=b_chars.len() {
+        dp[0][j] = j;
+    }
+    for i in 1..=a_chars.len() {
+        for j in 1..=b_chars.len() {
+            let cost = if a_chars[i - 1] == b_chars[j - 1] {
+                0
+            } else {
+                1
+            };
+            let mut best = (dp[i - 1][j] + 1)
+                .min(dp[i][j - 1] + 1)
+                .min(dp[i - 1][j - 1] + cost);
+            if i > 1
+                && j > 1
+                && a_chars[i - 1] == b_chars[j - 2]
+                && a_chars[i - 2] == b_chars[j - 1]
+            {
+                best = best.min(dp[i - 2][j - 2] + 1);
+            }
+            dp[i][j] = best;
+        }
+    }
+    dp[a_chars.len()][b_chars.len()]
+}
+
+fn likely_command_typo(input: &str) -> Option<&'static str> {
+    let normalized = input.trim().to_ascii_lowercase();
+    if normalized.len() < 4
+        || !normalized
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+    {
+        return None;
+    }
+    let mut best: Option<(&'static str, usize)> = None;
+    for &candidate in KNOWN_TOP_LEVEL_COMMANDS {
+        if candidate
+            .chars()
+            .next()
+            .zip(normalized.chars().next())
+            .map(|(a, b)| a != b)
+            .unwrap_or(true)
+        {
+            continue;
+        }
+        let max_distance = if candidate.len() <= 4 {
+            if normalized.len() != candidate.len() {
+                continue;
+            }
+            1
+        } else if candidate.len() >= 6 {
+            2
+        } else {
+            1
+        };
+        let distance = damerau_levenshtein_ascii(&normalized, candidate);
+        if distance > max_distance {
+            continue;
+        }
+        match best {
+            None => best = Some((candidate, distance)),
+            Some((_, best_distance)) if distance < best_distance => {
+                best = Some((candidate, distance));
+            }
+            _ => {}
+        }
+    }
+    best.map(|(candidate, _)| candidate)
 }
 
 fn atomic_update_max(dst: &AtomicU64, value: u64) {
@@ -345,6 +480,13 @@ fn main() {
                 eprintln!();
                 print_help();
                 process::exit(2);
+            }
+            if args.len() == 1 {
+                if let Some(candidate) = likely_command_typo(&first) {
+                    eprintln!("error: unknown command '{}'", first);
+                    eprintln!("hint: did you mean `retrivio {}`?", candidate);
+                    process::exit(2);
+                }
             }
             // Shorthand query mode:
             // - interactive terminals: open jump/picker flow
@@ -1179,7 +1321,18 @@ fn run_setup_cmd(args: &[OsString]) {
     } else {
         match run_ollama_preflight(&cfg) {
             Ok(_) => println!("setup: ollama preflight ok"),
-            Err(e) => eprintln!("warning: setup preflight failed: {}", e),
+            Err(e) => {
+                eprintln!("warning: setup preflight failed: {}", e);
+                if !command_exists("ollama") {
+                    eprintln!(
+                        "note: `ollama` is not installed on this system. install Ollama or rerun `retrivio setup` and choose `bedrock`."
+                    );
+                } else {
+                    eprintln!(
+                        "note: start Ollama with `ollama serve`, or rerun `retrivio setup` and choose `bedrock`."
+                    );
+                }
+            }
         }
     }
 
@@ -1766,10 +1919,11 @@ fn select_option(
         println!("  {:>2}. [{}] {}", idx + 1, marker, option);
     }
     let raw = prompt_line(&format!("select number (Enter for {}): ", default_idx + 1))?;
-    if raw.trim().is_empty() {
+    let normalized = strip_terminal_control_sequences(raw.trim());
+    if normalized.trim().is_empty() {
         return Ok(Some(default_idx));
     }
-    let parsed = raw
+    let parsed = normalized
         .trim()
         .parse::<usize>()
         .map_err(|_| "invalid selection: expected a number".to_string())?;
@@ -2490,7 +2644,9 @@ fn prompt_line_stderr(prompt: &str) -> Result<String, String> {
 fn prompt_yes_no(prompt: &str, default_yes: bool) -> Result<bool, String> {
     let hint = if default_yes { "[Y/n]" } else { "[y/N]" };
     let raw = prompt_line(&format!("{} {}: ", prompt, hint))?;
-    let trimmed = raw.trim().to_lowercase();
+    let trimmed = strip_terminal_control_sequences(raw.trim())
+        .trim()
+        .to_lowercase();
     if trimmed.is_empty() {
         return Ok(default_yes);
     }
@@ -17397,6 +17553,21 @@ fn source_chunk_json(source: &SourceChunk) -> Value {
 #[cfg(test)]
 mod chunk_contract_tests {
     use super::*;
+
+    #[test]
+    fn terminal_escape_sequences_are_stripped_from_prompt_input() {
+        assert_eq!(strip_terminal_control_sequences("\u{1b}[A\u{1b}[A1"), "1");
+        assert_eq!(strip_terminal_control_sequences("\u{1b}[B"), "");
+        assert_eq!(strip_terminal_control_sequences("1\u{1b}[D"), "1");
+    }
+
+    #[test]
+    fn likely_command_typos_get_suggestions() {
+        assert_eq!(likely_command_typo("setuo"), Some("setup"));
+        assert_eq!(likely_command_typo("refesh"), Some("refresh"));
+        assert_eq!(likely_command_typo("src/auth"), None);
+        assert_eq!(likely_command_typo("stops"), None);
+    }
 
     #[test]
     fn chunk_schema_constants_are_stable() {
