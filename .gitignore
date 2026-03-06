@@ -1,0 +1,44 @@
+# === OS ===
+.DS_Store
+Thumbs.db
+
+# === Editors / IDEs ===
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# === Python ===
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+.env
+*.egg
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+htmlcov/
+.coverage
+
+# === Rust ===
+target/
+Cargo.lock
+
+# === TypeScript / JavaScript ===
+node_modules/
+dist/
+build/
+.next/
+*.tsbuildinfo
+.env.local
+.env.*.local
+
+# === General ===
+*.log
+*.tmp
+tmp/
