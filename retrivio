@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Repo-local entrypoint:
+# - Prefer native Rust CLI built in this repo.
+# - No non-native fallback in normal usage.
+
+_repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+_rust_release="${_repo_dir}/target/release/retrivio"
+_rust_debug="${_repo_dir}/target/debug/retrivio"
+
+# Prefer native Rust CLI when available.
+if [[ -x "${_rust_release}" ]]; then
+  exec "${_rust_release}" "$@"
+fi
+if [[ -x "${_rust_debug}" ]]; then
+  exec "${_rust_debug}" "$@"
+fi
+
+echo "retrivio launcher: no runnable binary found." >&2
+echo "build one with: cargo build --release -p retrivio" >&2
+echo "then retry: ./retrivio <command>" >&2
+exit 127
