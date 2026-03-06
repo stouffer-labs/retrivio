@@ -10,8 +10,8 @@ Usage:
 
 Examples:
   scripts/install.sh            # installs latest release
-  scripts/install.sh v0.1.1     # installs a specific tag
-  scripts/install.sh 0.1.1      # same as above
+  scripts/install.sh v0.1.2     # installs a specific tag
+  scripts/install.sh 0.1.2      # same as above
 
 Environment variables:
   RETRIVIO_GITHUB_OWNER   GitHub owner (default: stouffer-labs)
