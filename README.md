@@ -1,5 +1,13 @@
 # retrivio
 
+<p align="center">
+  <img src="https://stouffer-labs.github.io/retrivio-logo-v2.svg" alt="retrivio logo" width="120" />
+</p>
+
+<p align="center">
+  <img src="https://stouffer-labs.github.io/retrivio-social-1280x640.png" alt="retrivio social banner" width="840" />
+</p>
+
 `retrivio` is a semantic intelligence and navigation index for project workspaces. It combines AST-aware chunking, multi-stage retrieval, and graph-based context expansion to power fast project search and AI-ready context packaging. Think of it like a scalable memory recall system, providing broad project-ware context to the LLM.
 
 Supports:
@@ -255,4 +263,3 @@ Graph viewer highlights:
 ## Embedding Model Changes
 
 When `embed_model` changes, Retrivio marks the index as migration-required. Search/pick/jump/API/MCP calls are blocked until re-embed is complete. Run `retrivio reembed` to rebuild vectors and reconstruct the embedded LanceDB index in one step.
-
