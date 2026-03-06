@@ -18,16 +18,42 @@ Supports:
 - local HTTP API if you want to integrate retrivio
 - MCP server makes it compatible with popular CLI coding tools
 
+## Install
+
+### One-line installer (recommended)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/stouffer-labs/retrivio/main/scripts/install.sh | bash
+```
+
+Installs `retrivio` to `~/.local/bin` by default.
+
+### Homebrew tap
+
+```bash
+brew tap stouffer-labs/retrivio https://github.com/stouffer-labs/retrivio
+brew install retrivio
+```
+
+### Linux support
+
+Retrivio supports Linux (x86_64 release binaries). Most core commands are platform-neutral.
+- `retrivio ui` uses `xdg-open` when available
+- `retrivio watch` falls back to polling if `fswatch` is not installed
+
+Release/distribution operations: [`docs/DISTRIBUTION.md`](docs/DISTRIBUTION.md)
+
 ## Quick Start
 
 ```bash
-cd /path/to/repo
-
 # Initialize Retrivio (embedded LanceDB + SQLite under ~/.retrivio by default)
 retrivio install
 
-# Install ollama if you want local model capabilities
+# Optional local model runtime on macOS:
 brew services start ollama
+
+# Optional local model runtime on Linux:
+# ollama serve
 
 # Configure Retrivio model providers
 retrivio setup
@@ -166,7 +192,7 @@ cargo build --release -p retrivio
 ### Watch Notes
 
 - Uses event-driven sync when `fswatch` is available, with automatic polling fallback
-- `retrivio install` attempts to install `fswatch` via Homebrew when available
+- `retrivio install` attempts to install `fswatch` via Homebrew when Homebrew is available
 - `--debounce-ms` controls event-batch delay before indexing
 - `--quiet` suppresses watch progress output
 
