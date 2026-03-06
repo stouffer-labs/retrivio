@@ -266,6 +266,7 @@ ALLOWLIST=(
   "LICENSE"
   ".gitignore"
   "retrivio"
+  "assets/animated"
   "crates/retrivio"
   "scripts/publish-gh-api.sh"
   "scripts/retrivio-shell.sh"
