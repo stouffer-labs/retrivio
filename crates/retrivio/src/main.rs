@@ -628,11 +628,36 @@ fn run_ui_cmd(args: &[OsString]) {
 
 fn run_stop_cmd(args: &[OsString]) {
     if args.iter().any(|a| a == "-h" || a == "--help") {
-        println!("usage: retrivio stop");
+        println!("usage: retrivio stop [--wait <seconds>]");
         println!("no-op (LanceDB is embedded; no external process to stop).");
         return;
     }
-    let _ = args; // accept any args silently for backward compat
+    let mut i = 0usize;
+    while i < args.len() {
+        let s = args[i].to_string_lossy().to_string();
+        match s.as_str() {
+            "--wait" => {
+                i += 1;
+                let value = arg_value(args, i, "--wait");
+                if value.parse::<u64>().is_err() {
+                    eprintln!("error: --wait must be an integer number of seconds");
+                    process::exit(2);
+                }
+            }
+            x if x.starts_with("--wait=") => {
+                let value = x.trim_start_matches("--wait=");
+                if value.parse::<u64>().is_err() {
+                    eprintln!("error: --wait must be an integer number of seconds");
+                    process::exit(2);
+                }
+            }
+            other => {
+                eprintln!("error: unknown stop option '{}'", other);
+                process::exit(2);
+            }
+        }
+        i += 1;
+    }
     println!("no longer needed (LanceDB is embedded — no external server process)");
 }
 
@@ -657,7 +682,6 @@ fn run_doctor(args: &[OsString]) {
     }
 
     let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let state_dir = data_dir(&cwd);
     let cfg_path = config_path(&cwd);
     let db_path = db_path(&cwd);
 
@@ -687,7 +711,7 @@ fn run_doctor(args: &[OsString]) {
     println!("config: {}", cfg_path.display());
     println!("db: {}", db_path.display());
     println!(
-        "root exists: {} ({})",
+        "config root exists: {} ({})",
         yes_no(root_exists),
         root.to_string_lossy()
     );
@@ -765,10 +789,7 @@ fn run_doctor(args: &[OsString]) {
     }
 
     if !cfg_exists {
-        eprintln!(
-            "warning: config is missing; initialize with: retrivio init --root {}",
-            state_dir.to_string_lossy()
-        );
+        eprintln!("warning: config is missing; initialize with: retrivio init");
     }
 
     if fix {
@@ -2055,7 +2076,7 @@ fn parse_autotune_options(args: &[OsString]) -> AutotuneOptions {
 
 fn config_rows() -> Vec<(&'static str, &'static str)> {
     vec![
-        ("root", "Tracked root directory"),
+        ("root", "Root path hint (not auto-tracked)"),
         ("embed_backend", "Embedding backend"),
         ("embed_model", "Embedding model id"),
         ("aws_profile", "AWS profile for Bedrock"),
@@ -2065,6 +2086,7 @@ fn config_rows() -> Vec<(&'static str, &'static str)> {
         ("bedrock_max_retries", "Bedrock max retry attempts"),
         ("bedrock_retry_base_ms", "Bedrock retry base backoff (ms)"),
         ("retrieval_backend", "Retrieval backend"),
+        ("local_embed_dim", "Embedding dimension for local models"),
         ("max_chars_per_project", "Indexing cap per project"),
         ("lexical_candidates", "Lexical candidates"),
         ("vector_candidates", "Vector candidates"),
@@ -4097,14 +4119,14 @@ fn run_autotune_cmd(args: &[OsString]) {
 
 fn run_graph_cmd(args: &[OsString]) {
     if args.iter().any(|a| a == "-h" || a == "--help") {
-        println!("usage: retrivio graph [doctor|status|view|open|neighbors|lineage] [--path <project-or-child-path>] [--limit <n>] [--threshold <0..1>] [--depth <1..3>]");
+        println!("usage: retrivio graph [doctor|status|start|stop|provision|view|open|neighbors|lineage] [--path <project-or-child-path>] [--limit <n>] [--threshold <0..1>] [--depth <1..3>]");
         println!("quick examples:");
         println!("  retrivio ui");
         println!(
-            "  retrivio graph neighbors --path ~/c-projects/202601-storage-cost-analysis --limit 12"
+            "  retrivio graph neighbors --path ~/projects/sample-project --limit 12"
         );
         println!(
-            "  retrivio graph lineage --path ~/c-projects/202601-storage-cost-analysis --depth 2 --threshold 0.60"
+            "  retrivio graph lineage --path ~/projects/sample-project --depth 2 --threshold 0.60"
         );
         println!("note: retrieval uses embedded LanceDB + SQLite FTS5 (no external server needed)");
         return;
@@ -4406,6 +4428,54 @@ fn graph_viewer_has_nodes(host: &str, port: u16) -> Option<bool> {
     Some(nodes)
 }
 
+fn graph_viewer_state(host: &str, port: u16) -> Option<Value> {
+    let url = format!("http://{}:{}/graph/view/state", host, port);
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(2))
+        .build();
+    let resp = agent.get(&url).call().ok()?;
+    resp.into_json::<Value>().ok()
+}
+
+fn graph_view_state_json(conn: &Connection, cwd: &Path) -> Result<Value, String> {
+    let mut roots: Vec<String> = list_tracked_roots_conn(conn)?
+        .into_iter()
+        .map(|p| normalize_path(&p.to_string_lossy()).to_string_lossy().to_string())
+        .collect();
+    roots.sort();
+    roots.dedup();
+
+    let mut hasher = Sha1::new();
+    for root in &roots {
+        hasher.update(root.as_bytes());
+        hasher.update(b"\n");
+    }
+    let roots_hash = format!("{:x}", hasher.finalize());
+
+    let projects_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM projects", [], |row| row.get(0))
+        .unwrap_or(0);
+
+    Ok(serde_json::json!({
+        "db_path": db_path(cwd).to_string_lossy().to_string(),
+        "tracked_roots_count": roots.len(),
+        "tracked_roots_hash": roots_hash,
+        "projects_count": projects_count
+    }))
+}
+
+fn local_graph_state(cwd: &Path) -> Option<Value> {
+    let dbp = db_path(cwd);
+    ensure_db_schema(&dbp).ok()?;
+    let conn = open_db_rw(&dbp).ok()?;
+    graph_view_state_json(&conn, cwd).ok()
+}
+
+fn graph_state_matches(remote: &Value, local: &Value) -> bool {
+    remote.get("db_path") == local.get("db_path")
+        && remote.get("tracked_roots_hash") == local.get("tracked_roots_hash")
+}
+
 fn graph_viewer_is_retrivio(host: &str, port: u16) -> Option<bool> {
     let url = format!("http://{}:{}/", host, port);
     let agent = ureq::AgentBuilder::new()
@@ -4428,11 +4498,69 @@ fn local_graph_has_nodes(cwd: &Path) -> bool {
     .unwrap_or(false)
 }
 
+fn stop_retrivio_graph_viewer_on_port(port: u16) -> bool {
+    let Some(pid) = listener_pid_for_port(port) else {
+        return false;
+    };
+    stop_pid_graceful(pid)
+}
+
+fn try_reuse_saved_graph_viewer(
+    host: &str,
+    requested_port: u16,
+    cwd: &Path,
+    local_state: Option<&Value>,
+) -> Option<u16> {
+    let Some(saved) = parse_graph_runtime_state(cwd) else {
+        return None;
+    };
+    if saved.host != host {
+        if pid_is_alive(saved.pid) {
+            let _ = stop_pid_graceful(saved.pid);
+        }
+        clear_graph_runtime_state(cwd);
+        return None;
+    }
+    if !pid_is_alive(saved.pid) {
+        clear_graph_runtime_state(cwd);
+        return None;
+    }
+    if saved.port == requested_port {
+        return None;
+    }
+
+    let healthy = api_health_host_port(host, saved.port);
+    let retrivio = matches!(graph_viewer_is_retrivio(host, saved.port), Some(true));
+    if healthy && retrivio {
+        if let Some(local) = local_state {
+            if let Some(remote) = graph_viewer_state(host, saved.port) {
+                if graph_state_matches(&remote, local) {
+                    return Some(saved.port);
+                }
+            }
+        } else {
+            // No local state to compare; reusing a healthy saved viewer avoids port fan-out.
+            return Some(saved.port);
+        }
+    }
+
+    let _ = stop_pid_graceful(saved.pid);
+    clear_graph_runtime_state(cwd);
+    None
+}
+
 fn ensure_graph_viewer_running(
     host: &str,
     port: u16,
     prefer_fresh_when_existing_empty: bool,
+    cwd: &Path,
 ) -> Result<u16, String> {
+    let local_state = local_graph_state(cwd);
+    if let Some(reuse_port) = try_reuse_saved_graph_viewer(host, port, cwd, local_state.as_ref()) {
+        return Ok(reuse_port);
+    }
+
+    let mut try_restart_existing = false;
     if api_health_host_port(host, port) {
         if !matches!(graph_viewer_is_retrivio(host, port), Some(true)) {
             eprintln!(
@@ -4443,11 +4571,45 @@ fn ensure_graph_viewer_running(
             && matches!(graph_viewer_has_nodes(host, port), Some(false))
         {
             eprintln!(
-                "graph open: existing viewer on port {} has no graph nodes; launching fresh viewer on a new port",
+                "graph open: existing viewer on port {} has no graph nodes; restarting it on the same port",
                 port
             );
+            try_restart_existing = true;
         } else {
-            return Ok(port);
+            let remote_state = graph_viewer_state(host, port);
+            match (remote_state, local_state.as_ref()) {
+                (Some(remote), Some(local)) if graph_state_matches(&remote, local) => {
+                    if let Some(pid) = listener_pid_for_port(port) {
+                        let _ = persist_graph_runtime_state(cwd, pid, host, port);
+                    }
+                    return Ok(port);
+                }
+                (Some(_), Some(_)) => {
+                    eprintln!(
+                        "graph open: existing viewer on port {} uses a different state; restarting it on the same port",
+                        port
+                    );
+                    try_restart_existing = true;
+                }
+                _ => {
+                    eprintln!(
+                        "graph open: unable to verify existing viewer state on port {}; restarting it on the same port",
+                        port
+                    );
+                    try_restart_existing = true;
+                }
+            }
+        }
+    }
+    if try_restart_existing {
+        if stop_retrivio_graph_viewer_on_port(port) {
+            clear_graph_runtime_state(cwd);
+            thread::sleep(Duration::from_millis(150));
+        } else {
+            eprintln!(
+                "graph open: unable to stop existing viewer on port {}; launching fresh viewer on a new port",
+                port
+            );
         }
     }
     let mut use_port = port;
@@ -4483,16 +4645,19 @@ fn ensure_graph_viewer_running(
     let deadline = Instant::now() + Duration::from_secs(8);
     while Instant::now() < deadline {
         if api_health_host_port(host, use_port) {
+            let _ = persist_graph_runtime_state(cwd, child.id(), host, use_port);
             return Ok(use_port);
         }
         if let Some(status) = child
             .try_wait()
             .map_err(|e| format!("failed checking graph viewer process: {}", e))?
         {
+            clear_graph_runtime_state(cwd);
             return Err(format!("graph viewer exited early with status {}", status));
         }
         thread::sleep(Duration::from_millis(120));
     }
+    clear_graph_runtime_state(cwd);
     Err(format!(
         "graph viewer did not become healthy at http://{}:{}/health within timeout",
         host, use_port
@@ -4533,7 +4698,7 @@ fn resolve_graph_target_project(
 
 fn run_graph_open_cmd(host: &str, port: u16) -> Result<(), String> {
     let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let bound_port = ensure_graph_viewer_running(host, port, local_graph_has_nodes(&cwd))?;
+    let bound_port = ensure_graph_viewer_running(host, port, local_graph_has_nodes(&cwd), &cwd)?;
     let url = format!("http://{}:{}/", host, bound_port);
     println!("graph viewer: {}", url);
     if let Err(err) = open_url_in_default_browser(&url) {
@@ -4994,7 +5159,7 @@ fn run_graph_ui_cmd(
     let mut data = load_graph_text_data(&cwd, focus_hint, state.limit)?;
     if data.nodes.is_empty() {
         println!(
-            "graph ui: no graph nodes found; run `retrivio add <path>` then `retrivio index` (example: `retrivio add ~/c-projects && retrivio index`)"
+            "graph ui: no graph nodes found; run `retrivio add <path>` then `retrivio index` (example: `retrivio add ~/projects && retrivio index`)"
         );
         return Ok(());
     }
@@ -6907,10 +7072,69 @@ fn graph_runtime_state_path(cwd: &Path) -> PathBuf {
     graph_runtime_dir_path(cwd).join("runtime-state.json")
 }
 
+#[derive(Debug, Clone)]
+struct GraphRuntimeState {
+    pid: u32,
+    host: String,
+    port: u16,
+}
+
 fn load_graph_runtime_state(cwd: &Path) -> Option<Value> {
     let path = graph_runtime_state_path(cwd);
     let raw = fs::read_to_string(path).ok()?;
     serde_json::from_str::<Value>(&raw).ok()
+}
+
+fn parse_graph_runtime_state(cwd: &Path) -> Option<GraphRuntimeState> {
+    let payload = load_graph_runtime_state(cwd)?;
+    let pid = payload.get("pid").and_then(Value::as_u64)? as u32;
+    let host = payload
+        .get("host")
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_string())?;
+    let port = payload.get("port").and_then(Value::as_u64)? as u16;
+    if pid == 0 || host.is_empty() || port == 0 {
+        return None;
+    }
+    Some(GraphRuntimeState { pid, host, port })
+}
+
+fn persist_graph_runtime_state(cwd: &Path, pid: u32, host: &str, port: u16) -> Result<(), String> {
+    let runtime_dir = graph_runtime_dir_path(cwd);
+    fs::create_dir_all(&runtime_dir).map_err(|e| {
+        format!(
+            "failed creating graph runtime dir '{}': {}",
+            runtime_dir.display(),
+            e
+        )
+    })?;
+    let payload = serde_json::json!({
+        "pid": pid,
+        "host": host,
+        "port": port,
+        "updated_at": now_ts(),
+    });
+    let raw = serde_json::to_string_pretty(&payload)
+        .map_err(|e| format!("failed serializing graph runtime state: {}", e))?;
+    fs::write(graph_runtime_state_path(cwd), raw)
+        .map_err(|e| format!("failed writing graph runtime state: {}", e))
+}
+
+fn clear_graph_runtime_state(cwd: &Path) {
+    let _ = fs::remove_file(graph_runtime_state_path(cwd));
+}
+
+fn stop_pid_graceful(pid: u32) -> bool {
+    let _ = run_shell_capture(&format!("kill {} >/dev/null 2>&1 || true", pid));
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if !pid_is_alive(pid) {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    let _ = run_shell_capture(&format!("kill -9 {} >/dev/null 2>&1 || true", pid));
+    !pid_is_alive(pid)
 }
 
 fn shell_words(input: &str) -> Vec<String> {
@@ -7131,10 +7355,6 @@ fn run_init(args: &[OsString]) {
 
     ensure_db_schema(&db_path).unwrap_or_else(|e| {
         eprintln!("error: failed to initialize database: {}", e);
-        process::exit(1);
-    });
-    ensure_tracked_root(&db_path, &cfg.root, now_ts()).unwrap_or_else(|e| {
-        eprintln!("error: failed to register tracked root: {}", e);
         process::exit(1);
     });
     if let Some(reason) = refresh_reembed_requirement_for_config_change(&cwd, &before_cfg, &cfg)
@@ -7375,10 +7595,6 @@ fn run_install_cmd(args: &[OsString]) {
     let mut cfg = ConfigValues::from_map(load_config_values(&cfg_path));
     ensure_db_schema(&dbp).unwrap_or_else(|e| {
         eprintln!("error: failed to initialize database: {}", e);
-        process::exit(1);
-    });
-    ensure_tracked_root(&dbp, &cfg.root, now_ts()).unwrap_or_else(|e| {
-        eprintln!("error: failed to register tracked root: {}", e);
         process::exit(1);
     });
 
@@ -7859,9 +8075,7 @@ fn run_roots(args: &[OsString]) {
     }
 
     let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let cfg_path = config_path(&cwd);
     let db_path = db_path(&cwd);
-    let cfg = ConfigValues::from_map(load_config_values(&cfg_path));
 
     ensure_db_schema(&db_path).unwrap_or_else(|e| {
         eprintln!("error: failed to initialize database: {}", e);
@@ -7873,17 +8087,10 @@ fn run_roots(args: &[OsString]) {
         process::exit(1);
     });
 
-    let mut rows = list_tracked_roots_full_conn(&conn).unwrap_or_else(|e| {
+    let rows = list_tracked_roots_full_conn(&conn).unwrap_or_else(|e| {
         eprintln!("error: failed to list tracked roots: {}", e);
         process::exit(1);
     });
-    if rows.is_empty() {
-        ensure_tracked_root_conn(&conn, &cfg.root, now_ts()).unwrap_or_else(|e| {
-            eprintln!("error: failed to ensure default tracked root: {}", e);
-            process::exit(1);
-        });
-        rows = list_tracked_roots_full_conn(&conn).unwrap_or_default();
-    }
 
     println!("tracked roots: {}", rows.len());
     for r in &rows {
@@ -7900,7 +8107,7 @@ fn run_exclude_cmd(args: &[OsString]) {
         println!("adds exclude patterns to a tracked root");
         println!("excluded directories are skipped during project discovery and indexing");
         println!();
-        println!("example: retrivio exclude ~/estouff Downloads Library/Caches .docker");
+        println!("example: retrivio exclude ~/projects node_modules .cache dist");
         return;
     }
 
@@ -8633,7 +8840,7 @@ fn run_watch_cmd(args: &[OsString]) {
 
     if !quiet {
         println!(
-            "watching tracked roots (default root: {}, tracked={})",
+            "watching tracked roots (config root: {}, tracked={})",
             cfg.root.display(),
             tracked_roots.len()
         );
@@ -11342,7 +11549,7 @@ fn serve_graph_viewer(host: &str, port: u16) -> Result<(), String> {
         host, port
     );
     println!(
-        "endpoints: GET /, GET /health, GET /search, GET /context/pack, GET /graph/neighbors, GET /graph/view/data, GET /graph/view/chunks, GET /graph/view/related, GET /chunks/feedback, POST /context/pack, POST /chunks/feedback/suppress, POST /chunks/feedback/restore, POST /chunks/feedback/quality"
+        "endpoints: GET /, GET /health, GET /search, GET /context/pack, GET /graph/neighbors, GET /graph/view/state, GET /graph/view/data, GET /graph/view/chunks, GET /graph/view/related, GET /chunks/feedback, POST /context/pack, POST /chunks/feedback/suppress, POST /chunks/feedback/restore, POST /chunks/feedback/quality"
     );
     for stream in listener.incoming() {
         let Ok(mut stream) = stream else {
@@ -11427,7 +11634,7 @@ fn serve_api_native(host: &str, port: u16) -> Result<(), String> {
         .map_err(|e| format!("failed to bind api listener: {}", e))?;
     println!("retrivio api listening on http://{}:{}", host, port);
     println!(
-        "endpoints: GET /health, GET /search, GET /search/pick, GET /context/pack, GET /chunks/search, GET /chunks/related, GET /chunks/get, GET /docs/read, GET /chunks/feedback, GET /tracked, GET /graph/neighbors, GET /graph/view/data, GET /graph/view/chunks, GET /graph/view/related, POST /context/pack, POST /chunks/feedback/suppress, POST /chunks/feedback/restore, POST /chunks/feedback/quality, POST /refresh, POST /select, POST /tracked/add, POST /tracked/del"
+        "endpoints: GET /health, GET /search, GET /search/pick, GET /context/pack, GET /chunks/search, GET /chunks/related, GET /chunks/get, GET /docs/read, GET /chunks/feedback, GET /tracked, GET /graph/neighbors, GET /graph/view/state, GET /graph/view/data, GET /graph/view/chunks, GET /graph/view/related, POST /context/pack, POST /chunks/feedback/suppress, POST /chunks/feedback/restore, POST /chunks/feedback/quality, POST /refresh, POST /select, POST /tracked/add, POST /tracked/del"
     );
     for stream in listener.incoming() {
         let Ok(stream) = stream else {
@@ -11978,19 +12185,39 @@ fn path_basename(path: &str) -> String {
         .to_string()
 }
 
+fn path_in_tracked_roots(path: &str, tracked_roots: &[PathBuf]) -> bool {
+    let target = normalize_path(path);
+    tracked_roots
+        .iter()
+        .any(|root| target == *root || target.starts_with(root))
+}
+
 fn graph_view_data_json(
     conn: &Connection,
     focus: Option<&str>,
     limit: usize,
 ) -> Result<Value, String> {
     let use_limit = limit.max(10).min(600);
+    let tracked_roots: Vec<PathBuf> = list_tracked_roots_conn(conn)?
+        .into_iter()
+        .map(|p| normalize_path(&p.to_string_lossy()))
+        .collect();
+    if tracked_roots.is_empty() {
+        return Ok(serde_json::json!({"focus": focus.unwrap_or(""), "nodes": [], "edges": []}));
+    }
+
     let mut selected: Vec<String> = Vec::new();
     if let Some(raw_focus) = focus {
         let focus_path = normalize_path(raw_focus).to_string_lossy().to_string();
+        if !path_in_tracked_roots(&focus_path, &tracked_roots) {
+            return Ok(serde_json::json!({"focus": focus.unwrap_or(""), "nodes": [], "edges": []}));
+        }
         selected.push(focus_path.clone());
         let outgoing = list_neighbors_by_path(conn, &focus_path, use_limit)?;
         for (dst, _, _) in outgoing {
-            selected.push(dst);
+            if path_in_tracked_roots(&dst, &tracked_roots) {
+                selected.push(dst);
+            }
         }
         let mut incoming_stmt = conn
             .prepare(
@@ -12015,7 +12242,9 @@ LIMIT ?2
         for row in incoming {
             let (path, _, _) =
                 row.map_err(|e| format!("failed reading incoming neighbor row: {}", e))?;
-            selected.push(path);
+            if path_in_tracked_roots(&path, &tracked_roots) {
+                selected.push(path);
+            }
         }
     } else {
         let mut stmt = conn
@@ -12044,7 +12273,10 @@ LIMIT ?1
             .query_map(params![use_limit as i64], |row| row.get::<_, String>(0))
             .map_err(|e| format!("failed querying project degree rows: {}", e))?;
         for row in rows {
-            selected.push(row.map_err(|e| format!("failed reading project degree row: {}", e))?);
+            let path = row.map_err(|e| format!("failed reading project degree row: {}", e))?;
+            if path_in_tracked_roots(&path, &tracked_roots) {
+                selected.push(path);
+            }
         }
     }
 
@@ -12093,7 +12325,7 @@ ORDER BY pe.weight DESC, src.path ASC, pe.dst ASC
     for row in edge_rows {
         let (src, dst, kind, weight) =
             row.map_err(|e| format!("failed reading graph edge row: {}", e))?;
-        if selected_set.contains(&src) || selected_set.contains(&dst) {
+        if selected_set.contains(&src) && selected_set.contains(&dst) {
             edges.push(serde_json::json!({
                 "source": src,
                 "target": dst,
@@ -12232,17 +12464,9 @@ fn handle_api_request(req: ApiRequest) -> (u16, Value) {
         }
         ("GET", "/tracked") => {
             let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            let cfg = ConfigValues::from_map(load_config_values(&config_path(&cwd)));
             let dbp = db_path(&cwd);
             if let Err(e) = ensure_db_schema(&dbp) {
                 return (500, serde_json::json!({"error": e}));
-            }
-            if let Ok(rows) = list_tracked_roots(&dbp) {
-                if rows.is_empty() {
-                    if let Err(e) = ensure_tracked_root(&dbp, &cfg.root, now_ts()) {
-                        return (500, serde_json::json!({"error": e}));
-                    }
-                }
             }
             let rows = match list_tracked_roots(&dbp) {
                 Ok(v) => v,
@@ -12925,6 +13149,22 @@ fn handle_api_request(req: ApiRequest) -> (u16, Value) {
                 200,
                 serde_json::json!({"path": target, "neighbors": neighbors}),
             );
+        }
+        ("GET", "/graph/view/state") => {
+            let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let dbp = db_path(&cwd);
+            if let Err(e) = ensure_db_schema(&dbp) {
+                return (500, serde_json::json!({"error": e}));
+            }
+            let conn = match open_db_rw(&dbp) {
+                Ok(v) => v,
+                Err(e) => return (500, serde_json::json!({"error": e})),
+            };
+            let payload = match graph_view_state_json(&conn, &cwd) {
+                Ok(v) => v,
+                Err(e) => return (500, serde_json::json!({"error": e})),
+            };
+            return (200, payload);
         }
         ("GET", "/graph/view/data") => {
             let focus = req
@@ -13703,7 +13943,6 @@ fn run_mcp_doctor() {
     let cfg_path = config_path(&cwd);
     let cfg = ConfigValues::from_map(load_config_values(&cfg_path));
     let dbfile = db_path(&cwd);
-    let root_ok = cfg.root.exists() && cfg.root.is_dir();
     let cfg_ok = cfg_path.exists();
     let db_ok = dbfile.exists();
 
@@ -13713,7 +13952,7 @@ fn run_mcp_doctor() {
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|| "-".to_string());
 
-    let ready = cfg_ok && root_ok && db_ok && cmd_ok;
+    let ready = cfg_ok && db_ok && cmd_ok;
     println!("mcp doctor");
     println!("  status:   {}", if ready { "ready" } else { "not ready" });
     println!("  command:  {}", cmd_display);
@@ -15794,7 +16033,7 @@ fn format_duration_ms(ms: u64) -> String {
 }
 
 fn print_index_stats(stats: &IndexStats, cfg: &ConfigValues) {
-    println!("default root: {}", cfg.root.display());
+    println!("config root: {}", cfg.root.display());
     println!("tracked roots indexed: {}", stats.tracked_roots);
     println!("projects found: {}", stats.total_projects);
     println!("projects updated: {}", stats.updated_projects);
@@ -19150,6 +19389,13 @@ struct ConfigValues {
     reranker_timeout_ms: u64,
 }
 
+fn default_config_root() -> PathBuf {
+    env::current_dir()
+        .ok()
+        .map(|p| normalize_path(&p.to_string_lossy()))
+        .unwrap_or_else(|| expand_tilde("~"))
+}
+
 impl ConfigValues {
     fn from_map(map: std::collections::HashMap<String, String>) -> Self {
         let mut embed_backend = map
@@ -19358,7 +19604,7 @@ impl ConfigValues {
             root: map
                 .get("root")
                 .map(|v| normalize_path(v))
-                .unwrap_or_else(|| normalize_path("~/c-projects")),
+                .unwrap_or_else(default_config_root),
             embed_backend,
             embed_model,
             aws_profile,
@@ -19457,6 +19703,7 @@ fn write_config_file(path: &Path, cfg: &ConfigValues) -> Result<(), String> {
             "retrieval_backend = \"{}\"",
             toml_escape(&cfg.retrieval_backend)
         ),
+        format!("local_embed_dim = {}", cfg.local_embed_dim),
         format!("max_chars_per_project = {}", cfg.max_chars_per_project),
         format!("lexical_candidates = {}", cfg.lexical_candidates),
         format!("vector_candidates = {}", cfg.vector_candidates),
@@ -19515,6 +19762,12 @@ fn write_config_file(path: &Path, cfg: &ConfigValues) -> Result<(), String> {
         format!("graph_related_base = {:.6}", cfg.graph_related_base),
         format!("graph_related_scale = {:.6}", cfg.graph_related_scale),
         format!("graph_related_cap = {:.6}", cfg.graph_related_cap),
+        format!("hyde_enabled = {}", cfg.hyde_enabled),
+        format!("reranker_enabled = {}", cfg.reranker_enabled),
+        format!("reranker_model = \"{}\"", toml_escape(&cfg.reranker_model)),
+        format!("reranker_pool_size = {}", cfg.reranker_pool_size),
+        format!("reranker_batch_size = {}", cfg.reranker_batch_size),
+        format!("reranker_timeout_ms = {}", cfg.reranker_timeout_ms),
         String::new(),
     ];
     fs::write(path, lines.join("\n")).map_err(|e| format!("failed writing config: {}", e))
@@ -20444,7 +20697,7 @@ ORDER BY path
 
 fn resolve_roots(
     conn: &Connection,
-    cfg: &ConfigValues,
+    _cfg: &ConfigValues,
     scope_roots: Option<Vec<PathBuf>>,
 ) -> Result<Vec<TrackedRoot>, String> {
     if let Some(roots) = scope_roots {
@@ -20469,11 +20722,7 @@ fn resolve_roots(
         return Ok(out);
     }
 
-    let mut rows = list_tracked_roots_full_conn(conn)?;
-    if rows.is_empty() {
-        ensure_tracked_root_conn(conn, &cfg.root, now_ts())?;
-        rows = list_tracked_roots_full_conn(conn)?;
-    }
+    let rows = list_tracked_roots_full_conn(conn)?;
     Ok(rows
         .into_iter()
         .map(|r| TrackedRoot {
