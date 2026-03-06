@@ -1,0 +1,98 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            archive_os: linux
+            archive_arch: x86_64
+          - runner: macos-13
+            target: x86_64-apple-darwin
+            archive_os: darwin
+            archive_arch: x86_64
+          - runner: macos-14
+            target: aarch64-apple-darwin
+            archive_os: darwin
+            archive_arch: arm64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build retrivio
+        run: cargo build --locked --release --target "${{ matrix.target }}" -p retrivio
+
+      - name: Package archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          package="retrivio-${version}-${{ matrix.archive_os }}-${{ matrix.archive_arch }}"
+          mkdir -p "dist/${package}"
+          cp "target/${{ matrix.target }}/release/retrivio" "dist/${package}/retrivio"
+          chmod +x "dist/${package}/retrivio"
+          tar -C dist -czf "${package}.tar.gz" "${package}"
+
+      - name: Upload archive artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.archive_os }}-${{ matrix.archive_arch }}
+          path: "*.tar.gz"
+          if-no-files-found: error
+
+  release:
+    name: Publish Release
+    runs-on: ubuntu-22.04
+    needs: build
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Collect release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          find dist -type f -name "*.tar.gz" -exec cp {} release/ \;
+          ls -lh release
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release
+          sha256sum *.tar.gz > SHA256SUMS.txt
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/*.tar.gz
+            release/SHA256SUMS.txt
+          generate_release_notes: true
