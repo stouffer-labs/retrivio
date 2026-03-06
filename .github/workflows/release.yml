@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (example: v0.1.1)"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -45,11 +51,29 @@ jobs:
       - name: Build retrivio
         run: cargo build --locked --release --target "${{ matrix.target }}" -p retrivio
 
+      - name: Resolve release tag/version
+        id: release_meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            tag="${{ github.event.inputs.tag }}"
+          else
+            tag="${GITHUB_REF_NAME}"
+          fi
+          if [[ "${tag}" != v* ]]; then
+            echo "error: tag must start with 'v' (got '${tag}')" >&2
+            exit 1
+          fi
+          version="${tag#v}"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
       - name: Package archive
         shell: bash
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
+          version="${{ steps.release_meta.outputs.version }}"
           package="retrivio-${version}-${{ matrix.archive_os }}-${{ matrix.archive_arch }}"
           mkdir -p "dist/${package}"
           cp "target/${{ matrix.target }}/release/retrivio" "dist/${package}/retrivio"
@@ -92,6 +116,7 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
           files: |
             release/*.tar.gz
             release/SHA256SUMS.txt
