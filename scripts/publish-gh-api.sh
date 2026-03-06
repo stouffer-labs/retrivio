@@ -15,6 +15,8 @@ Options:
   --create-repo           Create the GitHub repo if it does not exist
   --public                Visibility when creating repo (default)
   --private               Visibility when creating repo
+  --skip-ci               Append "[skip ci]" to commit messages (default)
+  --no-skip-ci            Do not append CI skip marker
   --dry-run               Show actions without writing
   -h, --help              Show this help
 
@@ -33,6 +35,7 @@ BRANCH="main"
 DRY_RUN=0
 CREATE_REPO=0
 VISIBILITY="public"
+SKIP_CI=1
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -62,6 +65,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --dry-run)
       DRY_RUN=1
+      shift
+      ;;
+    --skip-ci)
+      SKIP_CI=1
+      shift
+      ;;
+    --no-skip-ci)
+      SKIP_CI=0
       shift
       ;;
     -h|--help)
@@ -141,6 +152,11 @@ echo "files: ${#FILES[@]}"
 if [[ "$DRY_RUN" -eq 1 ]]; then
   echo "mode: dry-run"
 fi
+if [[ "$SKIP_CI" -eq 1 ]]; then
+  echo "ci: skip marker enabled ([skip ci])"
+else
+  echo "ci: skip marker disabled"
+fi
 
 added=0
 updated=0
@@ -167,6 +183,9 @@ for file in "${FILES[@]}"; do
   if [[ -n "$sha" ]]; then
     action="update"
     message="Update ${file}"
+    if [[ "$SKIP_CI" -eq 1 ]]; then
+      message="${message} [skip ci]"
+    fi
     if [[ "$DRY_RUN" -eq 1 ]]; then
       echo "dry-run: ${action} ${file}"
       updated=$((updated + 1))
@@ -189,6 +208,9 @@ for file in "${FILES[@]}"; do
   else
     action="add"
     message="Add ${file}"
+    if [[ "$SKIP_CI" -eq 1 ]]; then
+      message="${message} [skip ci]"
+    fi
     if [[ "$DRY_RUN" -eq 1 ]]; then
       echo "dry-run: ${action} ${file}"
       added=$((added + 1))
