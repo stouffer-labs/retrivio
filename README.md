@@ -1,10 +1,6 @@
 # retrivio
 
 <p align="center">
-  <img src="https://stouffer-labs.github.io/retrivio-logo-v2.svg" alt="retrivio logo" width="120" />
-</p>
-
-<p align="center">
   <img src="https://stouffer-labs.github.io/retrivio-social-1280x640.png" alt="retrivio social banner" width="840" />
 </p>
 
