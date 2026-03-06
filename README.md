@@ -7,7 +7,7 @@
 `retrivio` is a semantic intelligence and navigation index for project workspaces. It combines AST-aware chunking, multi-stage retrieval, and graph-based context expansion to power fast project search and AI-ready context packaging. Think of it like a scalable memory recall system, providing broad project-ware context to the LLM.
 
 <p align="center">
-  <img src="internal/animated/retrivio-query-example.gif" alt="retrivio query example demo" width="840" />
+  <img src="assets/animated/retrivio-query-example.gif" alt="retrivio query example demo" width="840" />
 </p>
 
 Supports:
@@ -46,7 +46,7 @@ retrivio doctor --fix
 ```
 
 <p align="center">
-  <img src="internal/animated/retrivio-initial-index-of-a-root.gif" alt="retrivio initial index of a root demo" width="840" />
+  <img src="assets/animated/retrivio-initial-index-of-a-root.gif" alt="retrivio initial index of a root demo" width="840" />
 </p>
 
 ## How It Works
@@ -179,7 +179,7 @@ Run the MCP server: `retrivio mcp serve`
 Readiness check: `retrivio mcp doctor`
 
 <p align="center">
-  <img src="internal/animated/retrivio-mcp-claude-integration.gif" alt="retrivio mcp claude integration demo" width="840" />
+  <img src="assets/animated/retrivio-mcp-claude-integration.gif" alt="retrivio mcp claude integration demo" width="840" />
 </p>
 
 
@@ -269,7 +269,7 @@ Graph viewer highlights:
   - local feedback history (decision + quality + note + timestamps)
 
 <p align="center">
-  <img src="internal/animated/retrivio-graph-ui.gif" alt="retrivio graph ui demo" width="840" />
+  <img src="assets/animated/retrivio-graph-ui.gif" alt="retrivio graph ui demo" width="840" />
 </p>
 
 ## Embedding Model Changes
