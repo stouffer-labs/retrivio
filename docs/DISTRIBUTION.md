@@ -20,11 +20,11 @@ Optional environment variables:
 ### 2. Homebrew tap
 
 ```bash
-brew tap stouffer-labs/retrivio https://github.com/stouffer-labs/retrivio
-brew install retrivio
+brew tap --custom-remote stouffer-labs/retrivio https://github.com/stouffer-labs/retrivio
+brew install stouffer-labs/retrivio/retrivio
 ```
 
-The tap formula builds from source (`main`) using Rust.
+The tap formula builds from source (`main`) using Rust. It is a valid install path, but the GitHub Releases installer is the primary end-user path.
 
 ### 3. Manual download
 
@@ -43,6 +43,7 @@ Verify with `SHA256SUMS.txt`.
 Notes:
 - `retrivio ui` opens via `open` (macOS) or `xdg-open` (Linux)
 - `retrivio watch` uses `fswatch` when present, otherwise polling fallback
+- if your configured embedding backend is Ollama, initial indexing requires a running Ollama daemon and the configured embedding model to be available locally
 
 ## Maintainer Release Flow
 
@@ -62,3 +63,5 @@ git push origin v0.1.2
 ```bash
 curl -fsSL https://raw.githubusercontent.com/stouffer-labs/retrivio/main/scripts/install.sh | bash
 ```
+
+If a user runs `retrivio add <path>` before Ollama is ready, the tracked root is still added. Retrivio skips the initial index and instructs the user to run `retrivio setup` or `retrivio index` after starting Ollama or changing backends.
