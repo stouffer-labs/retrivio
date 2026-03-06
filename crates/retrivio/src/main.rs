@@ -13396,14 +13396,17 @@ fn handle_api_request(req: ApiRequest) -> (u16, Value) {
 fn run_mcp_cmd(args: &[OsString]) {
     if args.iter().any(|a| a == "-h" || a == "--help") {
         println!("usage: retrivio mcp [serve|doctor|register|unregister] [--yes]");
+        println!("hint: run `retrivio mcp serve` to start the MCP stdio server");
+        println!("hint: run `retrivio mcp doctor` to verify local MCP integration setup");
         return;
     }
-    let action = args
-        .first()
-        .map(|v| v.to_string_lossy().to_string())
-        .unwrap_or_else(|| "serve".to_string())
-        .trim()
-        .to_lowercase();
+    let Some(action_raw) = args.first() else {
+        eprintln!("error: missing mcp action");
+        eprintln!("usage: retrivio mcp [serve|doctor|register|unregister] [--yes]");
+        eprintln!("hint: run `retrivio mcp serve` to start the MCP stdio server");
+        process::exit(2);
+    };
+    let action = action_raw.to_string_lossy().trim().to_lowercase();
     match action.as_str() {
         "serve" => serve_mcp_native().unwrap_or_else(|e| {
             eprintln!("error: {}", e);
@@ -15045,6 +15048,11 @@ fn write_mcp_frame<W: Write>(writer: &mut W, value: &Value, ndjson: bool) -> Res
 }
 
 fn serve_mcp_native() -> Result<(), String> {
+    if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        eprintln!(
+            "retrivio mcp serve: waiting for MCP client messages on stdio (Ctrl+C to exit)"
+        );
+    }
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut reader = BufReader::new(stdin.lock());
