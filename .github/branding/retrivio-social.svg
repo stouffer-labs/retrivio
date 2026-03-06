@@ -1,0 +1,37 @@
+<svg width="1280" height="640" viewBox="0 0 1280 640" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="panel" x1="0" y1="0" x2="1280" y2="640" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#0B223D"/>
+      <stop offset="1" stop-color="#0B5B73"/>
+    </linearGradient>
+    <linearGradient id="ring" x1="130" y1="120" x2="500" y2="520" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#7DEBFF"/>
+      <stop offset="1" stop-color="#14CBD8"/>
+    </linearGradient>
+    <linearGradient id="orb" x1="0" y1="0" x2="1280" y2="640" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#72E8FF" stop-opacity="0.16"/>
+      <stop offset="1" stop-color="#A3FFD4" stop-opacity="0.04"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1280" height="640" rx="40" fill="url(#panel)"/>
+  <rect width="1280" height="640" rx="40" fill="url(#orb)"/>
+  <rect x="20" y="20" width="1240" height="600" rx="28" stroke="#6CE8F2" stroke-opacity="0.22" stroke-width="2"/>
+
+  <g transform="translate(70 82)">
+    <rect width="412" height="476" rx="92" fill="#0E2A47" fill-opacity="0.42"/>
+    <circle cx="206" cy="238" r="136" stroke="url(#ring)" stroke-width="28"/>
+    <circle cx="110" cy="142" r="16" fill="#A5F7FF"/>
+    <circle cx="300" cy="146" r="14" fill="#A5F7FF"/>
+    <circle cx="308" cy="334" r="16" fill="#A5F7FF"/>
+    <circle cx="104" cy="332" r="14" fill="#A5F7FF"/>
+    <path d="M136 106H230C282 106 316 138 316 186C316 220 298 246 266 260L326 330H277L228 273H184V330H136V106ZM184 148V230H221C256 230 272 214 272 189C272 163 256 148 221 148H184Z" fill="#F4FBFF"/>
+  </g>
+
+  <text x="530" y="288" fill="#F4FBFF" font-family="'Avenir Next', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="128" font-weight="700" letter-spacing="1">retrivio</text>
+  <text x="536" y="354" fill="#B7F4FF" font-family="'Avenir Next', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="36" font-weight="500" letter-spacing="0.8">semantic code navigation for large local workspaces</text>
+
+  <path d="M530 404H1138" stroke="#7FE5F0" stroke-opacity="0.38" stroke-width="2"/>
+  <text x="536" y="458" fill="#D5FDFF" font-family="'Avenir Next', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="30" font-weight="600">SQLite + embedded LanceDB</text>
+  <text x="536" y="502" fill="#D5FDFF" font-family="'Avenir Next', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="30" font-weight="600">AST chunking, graph lineage, API + MCP</text>
+</svg>
