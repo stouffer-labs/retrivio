@@ -998,6 +998,66 @@ fn run_ollama_preflight(cfg: &ConfigValues) -> Result<(), String> {
     Ok(())
 }
 
+fn ensure_ollama_ready_for_add_refresh(cfg: &ConfigValues) -> Result<(), String> {
+    let host = ollama_host();
+    match ollama_is_reachable() {
+        Ok(true) => {}
+        Ok(false) => {
+            match maybe_autostart_ollama(&host) {
+                Ok(true) | Ok(false) => {}
+                Err(e) => {
+                    return Err(format!(
+                        "ollama is not reachable at '{}'; auto-start failed: {}",
+                        host, e
+                    ));
+                }
+            }
+            if !matches!(ollama_is_reachable(), Ok(true)) {
+                return Err(format!(
+                    "ollama is not reachable at '{}'. Start it with `ollama serve`.",
+                    host
+                ));
+            }
+        }
+        Err(e) => {
+            return Err(format!("ollama reachability check failed: {}", e));
+        }
+    }
+
+    let embedder = OllamaEmbedder::new(&cfg.embed_model);
+    let probe = "retrivio add refresh embedding probe";
+    match embedder.embed_one(probe) {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            let msg = e.to_string();
+            if !msg.contains("404") && !msg.contains("not found") {
+                return Err(format!("ollama model probe failed: {}", msg));
+            }
+            if !std::io::stdin().is_terminal() {
+                return Err(format!(
+                    "model '{}' not found. run `ollama pull {}` first.",
+                    cfg.embed_model, cfg.embed_model
+                ));
+            }
+            eprintln!("model '{}' is not available locally.", cfg.embed_model);
+            match prompt_yes_no(&format!("pull '{}' now?", cfg.embed_model), true) {
+                Ok(true) => ollama_pull_model(&cfg.embed_model)?,
+                Ok(false) => {
+                    return Err(format!(
+                        "model '{}' not pulled. run `ollama pull {}` before indexing.",
+                        cfg.embed_model, cfg.embed_model
+                    ));
+                }
+                Err(e) => return Err(format!("prompt failed: {}", e)),
+            }
+            embedder
+                .embed_one(probe)
+                .map(|_| ())
+                .map_err(|e| format!("ollama model probe failed after pull: {}", e))
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct AwsProfileChoice {
     name: String,
@@ -7968,6 +8028,23 @@ fn run_add(args: &[OsString]) {
         }
     };
     if do_refresh {
+        let refresh_was_explicit = refresh.is_some();
+        if cfg.embed_backend == "ollama" {
+            match ensure_ollama_ready_for_add_refresh(&cfg) {
+                Ok(()) => {}
+                Err(e) => {
+                    if refresh_was_explicit {
+                        eprintln!("error: {}", e);
+                        process::exit(1);
+                    }
+                    eprintln!("warning: skipping initial index because Ollama is not ready: {}", e);
+                    eprintln!(
+                        "note: tracked roots were added. run `retrivio setup`, start Ollama, or change embed_backend; then run `retrivio index`."
+                    );
+                    return;
+                }
+            }
+        }
         let force_paths: HashSet<PathBuf> = added.iter().cloned().collect();
         run_index_with_strategy(
             &cwd,
