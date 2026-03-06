@@ -36,6 +36,8 @@ DRY_RUN=0
 CREATE_REPO=0
 VISIBILITY="public"
 SKIP_CI=1
+MAX_RETRIES="${PUBLISH_GH_API_MAX_RETRIES:-5}"
+RETRY_BASE_DELAY_SEC="${PUBLISH_GH_API_RETRY_DELAY_SEC:-1}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -87,6 +89,149 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+is_retryable_http_code() {
+  case "$1" in
+    408|409|425|429|500|502|503|504)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+extract_http_code() {
+  local text="${1:-}"
+  if [[ "$text" =~ HTTP[[:space:]]+([0-9]{3}) ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  if [[ "$text" =~ status[[:space:]]code:[[:space:]]*([0-9]{3}) ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  return 1
+}
+
+gh_content_sha_with_retry() {
+  local file="$1"
+  local endpoint="repos/${OWNER}/${REPO}/contents/${file}"
+  local attempt=1
+  local delay="$RETRY_BASE_DELAY_SEC"
+  local err_file err_text code sha
+
+  while true; do
+    err_file="$(mktemp -t retrivio-publish-sha.XXXXXX)"
+    sha="$(gh api "$endpoint" --jq '.sha' 2>"$err_file" || true)"
+    err_text="$(cat "$err_file" 2>/dev/null || true)"
+    rm -f "$err_file"
+
+    if [[ -n "$sha" && "$sha" != "null" ]]; then
+      printf '%s\n' "$sha"
+      return 0
+    fi
+
+    code="$(extract_http_code "$err_text" || true)"
+    if [[ "$code" == "404" ]]; then
+      return 1
+    fi
+    if [[ -n "$code" ]] && ! is_retryable_http_code "$code"; then
+      [[ -n "$err_text" ]] && echo "$err_text" >&2
+      return 2
+    fi
+    if (( attempt >= MAX_RETRIES )); then
+      [[ -n "$err_text" ]] && echo "$err_text" >&2
+      return 2
+    fi
+
+    if [[ -n "$code" ]]; then
+      echo "warn: sha probe failed for ${file} (HTTP ${code}); retry ${attempt}/${MAX_RETRIES} in ${delay}s..." >&2
+    else
+      echo "warn: sha probe failed for ${file}; retry ${attempt}/${MAX_RETRIES} in ${delay}s..." >&2
+    fi
+    sleep "$delay"
+    attempt=$((attempt + 1))
+    delay=$((delay * 2))
+  done
+}
+
+gh_put_content_with_retry() {
+  local endpoint="$1"
+  local payload="$2"
+  local file="$3"
+  local attempt=1
+  local delay="$RETRY_BASE_DELAY_SEC"
+  local err_file err_text code
+
+  while true; do
+    err_file="$(mktemp -t retrivio-publish-put.XXXXXX)"
+    if gh api --method PUT "$endpoint" --input "$payload" >/dev/null 2>"$err_file"; then
+      rm -f "$err_file"
+      return 0
+    fi
+    err_text="$(cat "$err_file" 2>/dev/null || true)"
+    rm -f "$err_file"
+
+    code="$(extract_http_code "$err_text" || true)"
+    if [[ -n "$code" ]] && ! is_retryable_http_code "$code"; then
+      [[ -n "$err_text" ]] && echo "$err_text" >&2
+      return 1
+    fi
+    if (( attempt >= MAX_RETRIES )); then
+      [[ -n "$err_text" ]] && echo "$err_text" >&2
+      return 1
+    fi
+
+    if [[ -n "$code" ]]; then
+      echo "warn: publish failed for ${file} (HTTP ${code}); retry ${attempt}/${MAX_RETRIES} in ${delay}s..." >&2
+    else
+      echo "warn: publish failed for ${file}; retry ${attempt}/${MAX_RETRIES} in ${delay}s..." >&2
+    fi
+    sleep "$delay"
+    attempt=$((attempt + 1))
+    delay=$((delay * 2))
+  done
+}
+
+gh_repo_accessible_with_retry() {
+  local endpoint="repos/${OWNER}/${REPO}"
+  local attempt=1
+  local delay="$RETRY_BASE_DELAY_SEC"
+  local err_file err_text code
+
+  while true; do
+    err_file="$(mktemp -t retrivio-publish-repo.XXXXXX)"
+    if gh api "$endpoint" >/dev/null 2>"$err_file"; then
+      rm -f "$err_file"
+      return 0
+    fi
+    err_text="$(cat "$err_file" 2>/dev/null || true)"
+    rm -f "$err_file"
+    code="$(extract_http_code "$err_text" || true)"
+
+    if [[ "$code" == "404" ]]; then
+      return 1
+    fi
+    if [[ -n "$code" ]] && ! is_retryable_http_code "$code"; then
+      [[ -n "$err_text" ]] && echo "$err_text" >&2
+      return 1
+    fi
+    if (( attempt >= MAX_RETRIES )); then
+      [[ -n "$err_text" ]] && echo "$err_text" >&2
+      return 1
+    fi
+
+    if [[ -n "$code" ]]; then
+      echo "warn: repo check failed for ${OWNER}/${REPO} (HTTP ${code}); retry ${attempt}/${MAX_RETRIES} in ${delay}s..." >&2
+    else
+      echo "warn: repo check failed for ${OWNER}/${REPO}; retry ${attempt}/${MAX_RETRIES} in ${delay}s..." >&2
+    fi
+    sleep "$delay"
+    attempt=$((attempt + 1))
+    delay=$((delay * 2))
+  done
+}
+
 if ! command -v gh >/dev/null 2>&1; then
   echo "error: gh CLI not found" >&2
   exit 1
@@ -97,7 +242,7 @@ if ! gh auth status >/dev/null 2>&1; then
   exit 1
 fi
 
-if ! gh api "repos/${OWNER}/${REPO}" >/dev/null 2>&1; then
+if ! gh_repo_accessible_with_retry; then
   if [[ "$CREATE_REPO" -eq 1 ]]; then
     if [[ "$DRY_RUN" -eq 1 ]]; then
       echo "dry-run: would create repo ${OWNER}/${REPO} (${VISIBILITY})"
@@ -171,10 +316,16 @@ for file in "${FILES[@]}"; do
   fi
 
   sha=""
-  if probed_sha="$(gh api "repos/${OWNER}/${REPO}/contents/${file}" --jq '.sha' 2>/dev/null)"; then
-    if [[ -n "$probed_sha" && "$probed_sha" != "null" ]]; then
-      sha="$probed_sha"
-    fi
+  sha_status=1
+  if probed_sha="$(gh_content_sha_with_retry "$file")"; then
+    sha="$probed_sha"
+  else
+    sha_status=$?
+  fi
+  if [[ "$sha_status" -eq 2 ]]; then
+    echo "failed: $file (unable to probe remote sha)" >&2
+    failed=$((failed + 1))
+    continue
   fi
   content_file="$(mktemp -t retrivio-publish-content.XXXXXX)"
   base64 -i "$file" | tr -d '\n' >"$content_file"
@@ -198,7 +349,7 @@ for file in "${FILES[@]}"; do
       --arg sha "$sha" \
       --arg branch "$BRANCH" \
       '{message:$message, content:$content, sha:$sha, branch:$branch}' >"$payload"
-    if gh api --method PUT "repos/${OWNER}/${REPO}/contents/${file}" --input "$payload" >/dev/null; then
+    if gh_put_content_with_retry "repos/${OWNER}/${REPO}/contents/${file}" "$payload" "$file"; then
       echo "updated: $file"
       updated=$((updated + 1))
     else
@@ -222,7 +373,7 @@ for file in "${FILES[@]}"; do
       --rawfile content "$content_file" \
       --arg branch "$BRANCH" \
       '{message:$message, content:$content, branch:$branch}' >"$payload"
-    if gh api --method PUT "repos/${OWNER}/${REPO}/contents/${file}" --input "$payload" >/dev/null; then
+    if gh_put_content_with_retry "repos/${OWNER}/${REPO}/contents/${file}" "$payload" "$file"; then
       echo "added: $file"
       added=$((added + 1))
     else
