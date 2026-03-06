@@ -143,7 +143,7 @@ main() {
   checksums_url="${base_url}/SHA256SUMS.txt"
 
   tmp_dir="$(mktemp -d -t retrivio-install.XXXXXX)"
-  trap 'rm -rf "${tmp_dir}"' EXIT
+  trap "rm -rf -- '${tmp_dir}'" EXIT
   archive_path="${tmp_dir}/${asset_name}"
   checksums_path="${tmp_dir}/SHA256SUMS.txt"
 
