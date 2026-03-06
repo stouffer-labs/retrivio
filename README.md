@@ -28,16 +28,20 @@ curl -fsSL https://raw.githubusercontent.com/stouffer-labs/retrivio/main/scripts
 
 Installs `retrivio` to `~/.local/bin` by default.
 
-### Homebrew tap
+This is the primary supported install path for end users. It downloads a published release binary and verifies `SHA256SUMS.txt`.
+
+### Homebrew tap (source build)
 
 ```bash
-brew tap stouffer-labs/retrivio https://github.com/stouffer-labs/retrivio
-brew install retrivio
+brew tap --custom-remote stouffer-labs/retrivio https://github.com/stouffer-labs/retrivio
+brew install stouffer-labs/retrivio/retrivio
 ```
+
+This tap is real, but it currently builds Retrivio from source from `main`. It is slower than the release installer and requires a working Homebrew + Rust toolchain environment.
 
 ### Linux support
 
-Retrivio supports Linux (x86_64 release binaries). Most core commands are platform-neutral.
+Retrivio supports Linux (`x86_64` release binaries). Most core commands are platform-neutral.
 - `retrivio ui` uses `xdg-open` when available
 - `retrivio watch` falls back to polling if `fswatch` is not installed
 
@@ -49,13 +53,13 @@ Release/distribution operations: [`docs/DISTRIBUTION.md`](docs/DISTRIBUTION.md)
 # Initialize Retrivio (embedded LanceDB + SQLite under ~/.retrivio by default)
 retrivio install
 
-# Optional local model runtime on macOS:
+# If you plan to use the default Ollama embedding backend on macOS:
 brew services start ollama
 
-# Optional local model runtime on Linux:
+# If you plan to use the default Ollama embedding backend on Linux:
 # ollama serve
 
-# Configure Retrivio model providers
+# Configure Retrivio model providers before indexing
 retrivio setup
 
 # Track and index your workspace roots
@@ -70,6 +74,8 @@ retrivio search s3vectors
 # Preflight identity + model access checks
 retrivio doctor --fix
 ```
+
+If Ollama is selected as your embedding backend and it is not running yet, `retrivio add` still records the tracked root and skips the initial index. Start Ollama or switch backends in `retrivio setup`, then run `retrivio index`.
 
 <p align="center">
   <img src="assets/animated/retrivio-initial-index-of-a-root.gif" alt="retrivio initial index of a root demo" width="840" />
