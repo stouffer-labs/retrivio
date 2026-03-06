@@ -39,6 +39,7 @@ jobs:
             target: aarch64-apple-darwin
             archive_os: darwin
             archive_arch: arm64
+            deployment_target: "14.0"
 
     steps:
       - name: Checkout
@@ -59,9 +60,14 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install protobuf
 
-      - name: Build retrivio
+      - name: Build retrivio (non-macOS)
+        if: runner.os != 'macOS'
+        run: cargo build --locked --release --target "${{ matrix.target }}" -p retrivio
+
+      - name: Build retrivio (macOS)
+        if: runner.os == 'macOS'
         env:
-          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deployment_target || '' }}
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deployment_target }}
         run: cargo build --locked --release --target "${{ matrix.target }}" -p retrivio
 
       - name: Resolve release tag/version
