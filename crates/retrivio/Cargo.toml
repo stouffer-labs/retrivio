@@ -1,0 +1,37 @@
+[package]
+name = "retrivio"
+version = "0.1.1"
+edition = "2021"
+license = "MIT"
+description = "Rust CLI entrypoint for Retrivio"
+
+[dependencies]
+rusqlite = { version = "0.32.1", features = ["bundled"] }
+sha1 = "0.10.6"
+sha2 = "0.10"
+hmac = "0.12"
+serde_json = "1.0.145"
+ureq = { version = "2.10.1", features = ["json"] }
+base64 = "0.22.1"
+libc = "0.2"
+
+# File-level incremental change detection
+xxhash-rust = { version = "0.8", features = ["xxh64"] }
+
+# Code intelligence — AST parsing via tree-sitter
+tree-sitter = "0.24"
+tree-sitter-python = "0.23"
+tree-sitter-javascript = "0.23"
+tree-sitter-typescript = "0.23"
+tree-sitter-rust = "0.23"
+tree-sitter-go = "0.23"
+tree-sitter-java = "0.23"
+tree-sitter-c = "0.23"
+tree-sitter-cpp = "0.23"
+
+# LanceDB vector search (replaces FalkorDB)
+lancedb = "0.26"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+arrow-array = "57"
+arrow-schema = "57"
+futures = "0.3"
