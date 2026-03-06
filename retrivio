@@ -9,7 +9,13 @@ _repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 _rust_release="${_repo_dir}/target/release/retrivio"
 _rust_debug="${_repo_dir}/target/debug/retrivio"
 
-# Prefer native Rust CLI when available.
+# Prefer the newest local Rust binary so recent code changes are used.
+if [[ -x "${_rust_release}" && -x "${_rust_debug}" ]]; then
+  if [[ "${_rust_debug}" -nt "${_rust_release}" ]]; then
+    exec "${_rust_debug}" "$@"
+  fi
+  exec "${_rust_release}" "$@"
+fi
 if [[ -x "${_rust_release}" ]]; then
   exec "${_rust_release}" "$@"
 fi
