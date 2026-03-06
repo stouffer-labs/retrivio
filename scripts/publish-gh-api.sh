@@ -114,7 +114,6 @@ ALLOWLIST=(
   "scripts/publish-gh-api.sh"
   "scripts/retrivio-shell.sh"
   "scripts/retrivio-bedrock-refresh.sh"
-  ".github/branding"
 )
 
 collect_allowlist_files() {
