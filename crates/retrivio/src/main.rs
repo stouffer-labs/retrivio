@@ -60,6 +60,7 @@ const KNOWN_TOP_LEVEL_COMMANDS: &[&str] = &[
     "search",
     "pick",
     "jump",
+    "jump-feed",
     "ui",
     "stop",
     "daemon",
@@ -422,6 +423,104 @@ fn consume_global_path_overrides(args: Vec<OsString>) -> Result<Vec<OsString>, S
     Ok(args.into_iter().skip(i).collect())
 }
 
+fn current_platform_exe_name() -> String {
+    format!("retrivio{}", env::consts::EXE_SUFFIX)
+}
+
+fn repo_root_from_anchor_path(anchor: &Path) -> Option<PathBuf> {
+    let mut cur = if anchor.is_file() {
+        anchor.parent()?.to_path_buf()
+    } else {
+        anchor.to_path_buf()
+    };
+    loop {
+        if cur.join("Cargo.toml").exists() && cur.join("crates").join("retrivio").is_dir() {
+            return Some(cur);
+        }
+        if !cur.pop() {
+            return None;
+        }
+    }
+}
+
+fn preferred_local_repo_binary(repo: &Path) -> Option<PathBuf> {
+    let exe_name = current_platform_exe_name();
+    let release = repo.join("target").join("release").join(&exe_name);
+    let debug = repo.join("target").join("debug").join(&exe_name);
+    let release_ok = is_executable_file(&release);
+    let debug_ok = is_executable_file(&debug);
+    match (release_ok, debug_ok) {
+        (true, true) => {
+            let release_mtime = file_mtime(&release).unwrap_or(0.0);
+            let debug_mtime = file_mtime(&debug).unwrap_or(0.0);
+            if debug_mtime > release_mtime {
+                Some(debug)
+            } else {
+                Some(release)
+            }
+        }
+        (true, false) => Some(release),
+        (false, true) => Some(debug),
+        (false, false) => None,
+    }
+}
+
+fn stale_local_repo_binary_warning() -> Option<(PathBuf, PathBuf, PathBuf)> {
+    let current_exe = env::current_exe().ok()?;
+    if !is_executable_file(&current_exe) {
+        return None;
+    }
+    let repo = repo_root_from_anchor_path(&current_exe).or_else(find_repo_root)?;
+    let preferred = preferred_local_repo_binary(&repo)?;
+    let current_norm = normalize_path(&current_exe.to_string_lossy());
+    let preferred_norm = normalize_path(&preferred.to_string_lossy());
+    let repo_norm = normalize_path(&repo.to_string_lossy());
+    if !current_norm.starts_with(&repo_norm) || current_norm == preferred_norm {
+        return None;
+    }
+    Some((repo_norm, current_norm, preferred_norm))
+}
+
+fn is_mcp_serve_invocation(args: &[OsString]) -> bool {
+    args.first()
+        .and_then(|v| v.to_str())
+        .map(|v| v == "mcp")
+        .unwrap_or(false)
+        && args
+            .get(1)
+            .and_then(|v| v.to_str())
+            .map(|v| v == "serve")
+            .unwrap_or(false)
+}
+
+fn should_warn_for_local_binary_mismatch(args: &[OsString]) -> bool {
+    if env::var_os("RETRIVIO_SKIP_LOCAL_BINARY_WARNING").is_some() {
+        return false;
+    }
+    if is_mcp_serve_invocation(args) {
+        return true;
+    }
+    std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+}
+
+fn maybe_warn_if_stale_local_binary(args: &[OsString]) {
+    if !should_warn_for_local_binary_mismatch(args) {
+        return;
+    }
+    let Some((repo, current, preferred)) = stale_local_repo_binary_warning() else {
+        return;
+    };
+    eprintln!(
+        "warning: running stale local retrivio binary '{}'; newer local build is '{}'",
+        current.display(),
+        preferred.display()
+    );
+    eprintln!(
+        "hint: point local MCP configs at '{}' so they always use the newest local build",
+        repo.join("retrivio").display()
+    );
+}
+
 fn main() {
     configure_sigpipe();
     let raw_args: Vec<OsString> = env::args_os().skip(1).collect();
@@ -430,6 +529,7 @@ fn main() {
         process::exit(2);
     });
     if args.is_empty() {
+        maybe_warn_if_stale_local_binary(&args);
         // Default to interactive query flow when invoked without a subcommand.
         if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
             maybe_prompt_shell_hook_setup_for_shorthand_query();
@@ -438,6 +538,7 @@ fn main() {
         return;
     }
 
+    maybe_warn_if_stale_local_binary(&args);
     let first = args[0].to_string_lossy().to_string();
     match first.as_str() {
         "-h" | "--help" | "help" => {
@@ -465,6 +566,7 @@ fn main() {
         "search" => run_search_cmd(&args[1..]),
         "pick" => run_pick_cmd(&args[1..]),
         "jump" => run_jump_cmd(&args[1..]),
+        "jump-feed" => run_jump_feed_cmd(&args[1..]),
         "ui" => run_ui_cmd(&args[1..]),
         "stop" => run_stop_cmd(&args[1..]),
         "daemon" => run_daemon_cmd(&args[1..]),
@@ -9140,7 +9242,9 @@ fn run_jump_cmd(args: &[OsString]) {
             "usage: retrivio jump [--files|--dirs] [--view projects|files] [--limit <n>] [--emit-path-file <path>] [query...]"
         );
         println!("prints selected path to stdout (intended for shell wrappers to cd/open).");
-        println!("picker keys: Tab=toggle dir/file, Ctrl-D=dirs, Ctrl-F=files, Ctrl-U=clear query");
+        println!(
+            "picker keys: Enter=select/requery, Tab=toggle dir/file, Ctrl-D=dirs, Ctrl-F=files, Ctrl-U=clear query"
+        );
         return;
     }
 
@@ -9206,27 +9310,7 @@ fn run_jump_cmd(args: &[OsString]) {
         process::exit(2);
     }
 
-    let query = if !query_parts.is_empty() {
-        query_parts.join(" ")
-    } else {
-        if !std::io::stdin().is_terminal() {
-            eprintln!("usage: retrivio jump [--files|--dirs] [query...]");
-            process::exit(2);
-        }
-        match prompt_line_stderr("retrivio query: ") {
-            Ok(v) => v.trim().to_string(),
-            Err(e) => {
-                if e.to_ascii_lowercase().contains("interrupted") {
-                    process::exit(130);
-                }
-                eprintln!("error: {}", e);
-                process::exit(1);
-            }
-        }
-    };
-    if query.is_empty() {
-        process::exit(130);
-    }
+    let query = query_parts.join(" ");
 
     let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let cfg_path = config_path(&cwd);
@@ -9249,67 +9333,48 @@ fn run_jump_cmd(args: &[OsString]) {
         process::exit(1);
     });
 
+    // Non-interactive fallback: need a query and use old path.
+    // Check stderr (not stdout) because shell wrappers like `r() { cd "$(retrivio "$@")" }`
+    // capture stdout, making stdout().is_terminal() false even in interactive use.
+    // fzf renders via /dev/tty, so it works fine with captured stdout.
+    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+        if query.trim().is_empty() {
+            eprintln!("usage: retrivio jump [--files|--dirs] [query...]");
+            process::exit(2);
+        }
+        let candidates: Vec<PickCandidate> = if view == "files" {
+            rank_files_native(&conn, &cfg, &query, limit)
+                .unwrap_or_else(|e| { eprintln!("error: {}", e); process::exit(1); })
+                .iter().map(|r| make_file_pick_candidate(r)).collect()
+        } else {
+            rank_projects_native(&conn, &cfg, &query, limit)
+                .unwrap_or_else(|e| { eprintln!("error: {}", e); process::exit(1); })
+                .iter().map(|r| make_project_pick_candidate(r)).collect()
+        };
+        if let Some(first) = candidates.first() {
+            record_selection_event(&conn, &query, &first.path, now_ts()).ok();
+            maybe_write_emit_path(&cwd, &emit_path_file, &first.path).unwrap_or_else(|e| {
+                eprintln!("error: {}", e);
+                process::exit(1);
+            });
+            if emit_path_file.trim().is_empty() {
+                println!("{}", first.path);
+            }
+        }
+        return;
+    }
+
+    if !command_exists("fzf") {
+        eprintln!("error: `fzf` is required for interactive mode. install it or provide a query: retrivio [query]");
+        process::exit(2);
+    }
+
+    // Interactive live-search mode: fzf calls `jump-feed` on each keystroke
     let mut active_view = view;
     let mut active_query = query;
-    let mut is_first_run = true;
     loop {
-        let candidates = if active_view == "files" {
-            match rank_files_native(&conn, &cfg, &active_query, limit) {
-                Err(e) => {
-                    if is_first_run {
-                        eprintln!("error: {}", e);
-                        process::exit(1);
-                    }
-                    Vec::new()
-                }
-                Ok(rows) => {
-                    if rows.is_empty() && is_first_run {
-                        eprintln!("error: no file matches found.");
-                        process::exit(1);
-                    }
-                    rows.into_iter()
-                        .map(|item| make_file_pick_candidate(&item))
-                        .collect::<Vec<_>>()
-                }
-            }
-        } else {
-            match rank_projects_native(&conn, &cfg, &active_query, limit) {
-                Err(e) => {
-                    if is_first_run {
-                        eprintln!("error: {}", e);
-                        process::exit(1);
-                    }
-                    Vec::new()
-                }
-                Ok(rows) => {
-                    if rows.is_empty() && is_first_run {
-                        eprintln!("error: no indexed projects found. run `retrivio index` first.");
-                        process::exit(1);
-                    }
-                    rows.into_iter()
-                        .map(|item| make_project_pick_candidate(&item))
-                        .collect::<Vec<_>>()
-                }
-            }
-        };
-        is_first_run = false;
-
-        if candidates.is_empty() {
-            let empty_view = active_view.clone();
-            active_view = if empty_view == "files" {
-                "projects".to_string()
-            } else {
-                "files".to_string()
-            };
-            eprintln!(
-                "no {} matches for '{}'; switching to {} mode",
-                empty_view, active_query, active_view
-            );
-            continue;
-        }
-
         let action =
-            pick_candidate_path(&candidates, &active_query, &active_view).unwrap_or_else(|e| {
+            pick_interactive_live(&active_view, &active_query).unwrap_or_else(|e| {
                 eprintln!("error: picker failed: {}", e);
                 process::exit(1);
             });
@@ -9317,6 +9382,9 @@ fn run_jump_cmd(args: &[OsString]) {
             PickAction::Cancel => process::exit(130),
             PickAction::Toggle { view, query } => {
                 active_view = view;
+                active_query = query;
+            }
+            PickAction::Refresh { query } => {
                 active_query = query;
             }
             PickAction::Selected {
@@ -9342,6 +9410,67 @@ fn run_jump_cmd(args: &[OsString]) {
                 return;
             }
         }
+    }
+}
+
+fn format_pick_candidate_line(item: &PickCandidate) -> String {
+    let display = format!(
+        "{:<60} {:>5}  {:<4} {}",
+        item.display_path, item.score, item.kind, item.signals
+    );
+    format!("{}\t{}\t{}", item.path, display, item.preview)
+}
+
+fn run_jump_feed_cmd(args: &[OsString]) {
+    let mut view = "projects".to_string();
+    let mut query_parts: Vec<String> = Vec::new();
+    let mut limit: usize = 40;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].to_string_lossy().to_string();
+        match a.as_str() {
+            "--dirs" | "--projects" => view = "projects".to_string(),
+            "--files" => view = "files".to_string(),
+            "--limit" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    limit = v.to_string_lossy().parse().unwrap_or(40);
+                }
+            }
+            other if !other.starts_with('-') => {
+                query_parts.push(other.to_string());
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let query = query_parts.join(" ");
+    let query = query.trim();
+    if query.is_empty() {
+        return;
+    }
+    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let cfg = ConfigValues::from_map(load_config_values(&config_path(&cwd)));
+    let dbp = db_path(&cwd);
+    let conn = match open_db_rw(&dbp) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let candidates: Vec<PickCandidate> = if view == "files" {
+        rank_files_native(&conn, &cfg, query, limit)
+            .unwrap_or_default()
+            .iter()
+            .map(|r| make_file_pick_candidate(r))
+            .collect()
+    } else {
+        rank_projects_native(&conn, &cfg, query, limit)
+            .unwrap_or_default()
+            .iter()
+            .map(|r| make_project_pick_candidate(r))
+            .collect()
+    };
+    for item in &candidates {
+        println!("{}", format_pick_candidate_line(item));
     }
 }
 
@@ -9447,40 +9576,50 @@ fn run_pick_cmd(args: &[OsString]) {
         eprintln!("error: {}", e);
         process::exit(1);
     });
-    let candidates = if view == "files" {
-        let rows = rank_files_native(&conn, &cfg, &query, limit).unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            process::exit(1);
-        });
-        if rows.is_empty() {
-            eprintln!("error: no file matches found.");
-            process::exit(1);
-        }
-        rows.into_iter()
-            .map(|item| make_file_pick_candidate(&item))
-            .collect::<Vec<_>>()
-    } else {
-        let rows = rank_projects_native(&conn, &cfg, &query, limit).unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            process::exit(1);
-        });
-        if rows.is_empty() {
-            eprintln!("error: no indexed projects found. run `retrivio index` first.");
-            process::exit(1);
-        }
-        rows.into_iter()
-            .map(|item| make_project_pick_candidate(&item))
-            .collect::<Vec<_>>()
-    };
+    let mut active_view = view;
+    let mut active_query = query;
+    let selected_path = loop {
+        let candidates = if active_view == "files" {
+            let rows = rank_files_native(&conn, &cfg, &active_query, limit).unwrap_or_else(|e| {
+                eprintln!("error: {}", e);
+                process::exit(1);
+            });
+            if rows.is_empty() {
+                eprintln!("error: no file matches found.");
+                process::exit(1);
+            }
+            rows.into_iter()
+                .map(|item| make_file_pick_candidate(&item))
+                .collect::<Vec<_>>()
+        } else {
+            let rows = rank_projects_native(&conn, &cfg, &active_query, limit).unwrap_or_else(|e| {
+                eprintln!("error: {}", e);
+                process::exit(1);
+            });
+            if rows.is_empty() {
+                eprintln!("error: no indexed projects found. run `retrivio index` first.");
+                process::exit(1);
+            }
+            rows.into_iter()
+                .map(|item| make_project_pick_candidate(&item))
+                .collect::<Vec<_>>()
+        };
 
-    let selected = pick_candidate_path(&candidates, &query, &view).unwrap_or_else(|e| {
-        eprintln!("error: picker failed: {}", e);
-        process::exit(1);
-    });
-    let selected_path = match selected {
-        PickAction::Selected { path, .. } => path,
-        PickAction::Toggle { .. } | PickAction::Cancel => {
-            process::exit(1);
+        let selected =
+            pick_candidate_path(&candidates, &active_query, &active_view).unwrap_or_else(|e| {
+                eprintln!("error: picker failed: {}", e);
+                process::exit(1);
+            });
+        match selected {
+            PickAction::Selected { path, .. } => break path,
+            PickAction::Toggle { view, query } => {
+                active_view = view;
+                active_query = query;
+            }
+            PickAction::Refresh { query } => {
+                active_query = query;
+            }
+            PickAction::Cancel => process::exit(130),
         }
     };
     if selected_path.is_empty() {
@@ -9512,7 +9651,7 @@ fn run_pick_cmd(args: &[OsString]) {
         });
     }
 
-    record_selection_event(&conn, &query, &selected_path, now_ts()).unwrap_or_else(|e| {
+    record_selection_event(&conn, &active_query, &selected_path, now_ts()).unwrap_or_else(|e| {
         eprintln!("warning: failed to record selection event: {}", e);
     });
     println!("{}", selected_path);
@@ -9632,7 +9771,118 @@ fn make_file_pick_candidate(item: &RankedFileResult) -> PickCandidate {
 enum PickAction {
     Selected { path: String, query: String },
     Toggle { view: String, query: String },
+    Refresh { query: String },
     Cancel,
+}
+
+fn normalize_pick_query(query: &str) -> String {
+    collapse_whitespace(query).to_ascii_lowercase()
+}
+
+fn pick_query_changed(original: &str, updated: &str) -> bool {
+    normalize_pick_query(original) != normalize_pick_query(updated)
+}
+
+fn pick_interactive_live(
+    view: &str,
+    initial_query: &str,
+) -> Result<PickAction, String> {
+    let bin = env::current_exe()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| "retrivio".to_string());
+    let view_flag = if view == "files" { "--files" } else { "--dirs" };
+    // Shell-escape the binary path (handle spaces/quotes)
+    let escaped_bin = bin.replace('\'', "'\\''");
+    let feed_cmd = format!("'{}' jump-feed {} {{q}}", escaped_bin, view_flag);
+    let prompt = if view == "files" {
+        "retrivio[file]> "
+    } else {
+        "retrivio[dir]> "
+    };
+    let mut cmd = Command::new("fzf");
+    cmd.arg("--height=70%")
+        .arg("--layout=reverse")
+        .arg("--border")
+        .arg("--delimiter=\t")
+        .arg("--with-nth=2")
+        .arg("--no-sort")
+        .arg("--disabled")
+        .arg("--prompt")
+        .arg(prompt)
+        .arg("--header")
+        .arg("type to search | Enter=select Tab=toggle Ctrl-D=dirs Ctrl-F=files")
+        .arg("--preview")
+        .arg("echo {3}")
+        .arg("--preview-window=down,6,wrap")
+        .arg("--bind")
+        .arg(format!("start:reload({})", feed_cmd))
+        .arg("--bind")
+        .arg(format!("change:reload({})", feed_cmd))
+        .arg("--print-query")
+        .arg("--expect=tab,ctrl-d,ctrl-f")
+        .arg("--bind")
+        .arg("ctrl-u:unix-line-discard");
+    if !initial_query.is_empty() {
+        cmd.arg("--query").arg(initial_query);
+    }
+    cmd.stdout(Stdio::piped()).stderr(Stdio::inherit());
+    let out = cmd
+        .output()
+        .map_err(|e| format!("failed to launch fzf: {}", e))?;
+    let output = String::from_utf8_lossy(&out.stdout);
+    let mut lines = output.lines();
+    let query_line = lines.next().unwrap_or("").trim().to_string();
+    let effective_query = if query_line.trim().is_empty() {
+        initial_query.to_string()
+    } else {
+        query_line
+    };
+    let second_line = lines.next().unwrap_or("").trim().to_string();
+    let mut key_line = second_line.clone();
+    let mut selected_line = String::new();
+    if second_line.contains('\t') {
+        key_line.clear();
+        selected_line = second_line;
+    }
+    if key_line == "tab" {
+        let toggled = if view == "files" { "projects" } else { "files" };
+        return Ok(PickAction::Toggle {
+            view: toggled.to_string(),
+            query: effective_query,
+        });
+    }
+    if key_line == "ctrl-d" {
+        return Ok(PickAction::Toggle {
+            view: "projects".to_string(),
+            query: effective_query,
+        });
+    }
+    if key_line == "ctrl-f" {
+        return Ok(PickAction::Toggle {
+            view: "files".to_string(),
+            query: effective_query,
+        });
+    }
+    if !out.status.success() {
+        return Ok(PickAction::Cancel);
+    }
+    if selected_line.is_empty() {
+        selected_line = lines
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("")
+            .to_string();
+    }
+    if selected_line.trim().is_empty() {
+        return Ok(PickAction::Cancel);
+    }
+    let path = selected_line.split('\t').next().unwrap_or("").trim().to_string();
+    if path.is_empty() {
+        return Ok(PickAction::Cancel);
+    }
+    Ok(PickAction::Selected {
+        path,
+        query: effective_query,
+    })
 }
 
 fn pick_candidate_path(
@@ -9696,10 +9946,10 @@ fn pick_candidate_path(
         .arg(prompt)
         .arg("--header")
         .arg(if query.trim().is_empty() {
-            "path | score | type | s=sem l=lex g=graph q=qual r=rel | Tab=toggle Ctrl-D=dirs Ctrl-F=files".to_string()
+            "path | score | type | s=sem l=lex g=graph q=qual r=rel | Enter=select/requery Tab=toggle Ctrl-D=dirs Ctrl-F=files".to_string()
         } else {
             format!(
-                "ranked for query='{}' | path | score | type | s=sem l=lex g=graph q=qual r=rel | Tab=toggle Ctrl-D=dirs Ctrl-F=files",
+                "ranked for query='{}' | path | score | type | s=sem l=lex g=graph q=qual r=rel | Enter=select/requery Tab=toggle Ctrl-D=dirs Ctrl-F=files",
                 query
             )
         })
@@ -9754,6 +10004,11 @@ fn pick_candidate_path(
         return Ok(PickAction::Toggle {
             view: "files".to_string(),
             query: effective_query.clone(),
+        });
+    }
+    if pick_query_changed(query, &effective_query) {
+        return Ok(PickAction::Refresh {
+            query: effective_query,
         });
     }
     if !out.status.success() {
@@ -16555,12 +16810,7 @@ fn model_key_for_cfg(cfg: &ConfigValues) -> String {
             format!("ollama:{}", model)
         }
         "bedrock" => {
-            let model = if cfg.embed_model.trim().is_empty() {
-                default_embed_model_for_backend("bedrock").to_string()
-            } else {
-                cfg.embed_model.trim().to_string()
-            };
-            format!("bedrock:{}:{}", bedrock_region_for_cfg(Some(cfg)), model)
+            bedrock_embedding_space_key(&cfg.embed_model)
         }
         other => {
             let model = if cfg.embed_model.trim().is_empty() {
@@ -16571,6 +16821,15 @@ fn model_key_for_cfg(cfg: &ConfigValues) -> String {
             format!("{}:{}", other, model)
         }
     }
+}
+
+fn bedrock_embedding_space_key(model: &str) -> String {
+    let normalized = if model.trim().is_empty() {
+        default_embed_model_for_backend("bedrock").to_string()
+    } else {
+        model.trim().to_string()
+    };
+    format!("bedrock:{}", normalized)
 }
 
 fn embed_query_cached(cfg: &ConfigValues, query: &str) -> Result<(String, Vec<f32>), String> {
@@ -17569,6 +17828,13 @@ mod chunk_contract_tests {
     }
 
     #[test]
+    fn picker_query_change_detection_ignores_case_and_spacing() {
+        assert!(!pick_query_changed("speech to text", "  Speech   To   Text  "));
+        assert!(pick_query_changed("call", "speech to text"));
+        assert!(pick_query_changed("call", ""));
+    }
+
+    #[test]
     fn likely_command_typos_get_suggestions() {
         assert_eq!(likely_command_typo("setuo"), Some("setup"));
         assert_eq!(likely_command_typo("refesh"), Some("refresh"));
@@ -17826,6 +18092,14 @@ VALUES (1, '/tmp/p/b.md', 'b.md', 0, 1, 10, 'h2', 'beta', 0);
             default_embed_model_for_backend("bedrock"),
             "amazon.titan-embed-text-v2:0"
         );
+        assert_eq!(
+            bedrock_embedding_space_key("amazon.titan-embed-text-v2:0"),
+            "bedrock:amazon.titan-embed-text-v2:0"
+        );
+        assert_eq!(
+            bedrock_embedding_space_key(""),
+            "bedrock:amazon.titan-embed-text-v2:0"
+        );
         let embedder = BedrockEmbedder::new("");
         let payload = embedder.request_payload("hello world");
         assert_eq!(
@@ -17834,6 +18108,10 @@ VALUES (1, '/tmp/p/b.md', 'b.md', 0, 1, 10, 'h2', 'beta', 0);
                 .and_then(|v| v.as_str())
                 .unwrap_or_default(),
             "hello world"
+        );
+        assert_eq!(
+            embedder.model_key(),
+            "bedrock:amazon.titan-embed-text-v2:0"
         );
     }
 
@@ -21181,6 +21459,19 @@ mod project_discovery_tests {
         p
     }
 
+    fn write_executable(path: &Path) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("create parent");
+        }
+        fs::write(path, "#!/bin/sh\nexit 0\n").expect("write executable");
+        #[cfg(unix)]
+        {
+            let mut perms = fs::metadata(path).expect("stat executable").permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(path, perms).expect("chmod executable");
+        }
+    }
+
     #[test]
     fn discovers_children_inside_projects_container_even_with_root_readme() {
         let root = temp_dir("container-root");
@@ -21298,6 +21589,28 @@ mod project_discovery_tests {
             .chunks
             .iter()
             .any(|c| c.doc_rel_path.starts_with("tmp/")));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn preferred_local_repo_binary_picks_newest_build() {
+        let root = temp_dir("preferred-bin");
+        fs::create_dir_all(root.join("crates").join("retrivio")).expect("mk crate dir");
+        fs::write(root.join("Cargo.toml"), "[workspace]\nmembers=[]\n").expect("write cargo");
+        let exe_name = current_platform_exe_name();
+        let release = root.join("target").join("release").join(&exe_name);
+        let debug = root.join("target").join("debug").join(&exe_name);
+        write_executable(&release);
+        thread::sleep(Duration::from_millis(20));
+        write_executable(&debug);
+
+        let preferred = preferred_local_repo_binary(&root).expect("preferred binary");
+        assert_eq!(preferred, debug);
+        assert_eq!(
+            repo_root_from_anchor_path(&debug).expect("repo from binary"),
+            root
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -22870,8 +23183,8 @@ trait Embedder {
 
 fn bedrock_profile_for_cfg(cfg: Option<&ConfigValues>) -> Option<String> {
     non_empty_env("RETRIVIO_AWS_PROFILE")
-        .or_else(|| non_empty_env("AWS_PROFILE"))
         .or_else(|| cfg.and_then(|c| non_empty_string(c.aws_profile.trim())))
+        .or_else(|| non_empty_env("AWS_PROFILE"))
         .or_else(|| {
             let in_config =
                 parse_ini_profile_names(&aws_config_file_path(), true).contains("default");
@@ -22886,13 +23199,13 @@ fn bedrock_profile_for_cfg(cfg: Option<&ConfigValues>) -> Option<String> {
 }
 
 fn bedrock_region_for_cfg(cfg: Option<&ConfigValues>) -> String {
-    if let Some(v) = non_empty_env("RETRIVIO_AWS_REGION")
-        .or_else(|| non_empty_env("AWS_REGION"))
-        .or_else(|| non_empty_env("AWS_DEFAULT_REGION"))
-    {
+    if let Some(v) = non_empty_env("RETRIVIO_AWS_REGION") {
         return v;
     }
     if let Some(v) = cfg.and_then(|c| non_empty_string(c.aws_region.trim())) {
+        return v;
+    }
+    if let Some(v) = non_empty_env("AWS_REGION").or_else(|| non_empty_env("AWS_DEFAULT_REGION")) {
         return v;
     }
     if let Some(profile) = bedrock_profile_for_cfg(cfg) {
@@ -24053,7 +24366,7 @@ impl BedrockEmbedder {
 
 impl Embedder for BedrockEmbedder {
     fn model_key(&self) -> String {
-        format!("bedrock:{}:{}", self.region, self.model)
+        bedrock_embedding_space_key(&self.model)
     }
 
     fn embed_many(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
