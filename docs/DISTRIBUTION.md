@@ -47,18 +47,44 @@ Notes:
 
 ## Maintainer Release Flow
 
-1. Tag a release:
+This project does not use a local `.git` repository. Source is published via GitHub Contents API.
+
+### 1. Bump version
+
+Edit `crates/retrivio/Cargo.toml` and update the `version` field. Also update version examples in `scripts/install.sh`.
+
+### 2. Build locally
 
 ```bash
-git tag v0.1.4
-git push origin v0.1.4
+cargo build --release -p retrivio
+./target/release/retrivio --version
 ```
 
-2. GitHub Actions workflow `.github/workflows/release.yml` builds platform binaries and publishes:
-- `retrivio-<version>-<os>-<arch>.tar.gz`
+### 3. Publish source to GitHub
+
+```bash
+scripts/publish-gh-api.sh
+```
+
+This syncs the allowlisted files to `stouffer-labs/Retrivio` on GitHub. Each file is a separate commit. The `[skip ci]` marker is appended by default to avoid triggering CI on every commit. **Do not use `--no-skip-ci`** — it causes 50+ CI runs.
+
+### 4. Create a release tag
+
+```bash
+SHA=$(gh api repos/stouffer-labs/Retrivio/git/ref/heads/main --jq '.object.sha')
+gh api repos/stouffer-labs/Retrivio/git/refs \
+  --method POST -f ref="refs/tags/v0.1.4" -f sha="$SHA"
+```
+
+### 5. Release builds automatically
+
+GitHub Actions workflow `.github/workflows/release.yml` triggers on `v*` tags and builds:
+- `retrivio-<version>-darwin-arm64.tar.gz`
+- `retrivio-<version>-darwin-x86_64.tar.gz`
+- `retrivio-<version>-linux-x86_64.tar.gz`
 - `SHA256SUMS.txt`
 
-3. End users can then install with:
+### 6. End users install with
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/stouffer-labs/retrivio/main/scripts/install.sh | bash
