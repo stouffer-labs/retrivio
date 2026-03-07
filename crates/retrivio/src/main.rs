@@ -9650,6 +9650,13 @@ fn pick_candidate_path(
         });
     }
     if !command_exists("fzf") {
+        eprintln!(
+            "warning: `fzf` is not installed; interactive picker UI is unavailable. selecting the top-ranked {} match automatically.",
+            if view == "files" { "file" } else { "directory" }
+        );
+        eprintln!(
+            "hint: install `fzf` to enable interactive dir/file switching, previews, and manual selection."
+        );
         return Ok(PickAction::Selected {
             path: candidates[0].path.clone(),
             query: query.to_string(),
