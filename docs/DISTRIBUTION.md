@@ -50,8 +50,8 @@ Notes:
 1. Tag a release:
 
 ```bash
-git tag v0.1.2
-git push origin v0.1.2
+git tag v0.1.3
+git push origin v0.1.3
 ```
 
 2. GitHub Actions workflow `.github/workflows/release.yml` builds platform binaries and publishes:
