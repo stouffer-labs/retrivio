@@ -73,7 +73,7 @@ This syncs the allowlisted files to `stouffer-labs/Retrivio` on GitHub. Each fil
 ```bash
 SHA=$(gh api repos/stouffer-labs/Retrivio/git/ref/heads/main --jq '.object.sha')
 gh api repos/stouffer-labs/Retrivio/git/refs \
-  --method POST -f ref="refs/tags/v0.1.4" -f sha="$SHA"
+  --method POST -f ref="refs/tags/v0.1.5" -f sha="$SHA"
 ```
 
 ### 5. Release builds automatically
