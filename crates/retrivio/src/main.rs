@@ -35,6 +35,11 @@ const SHELL_HOOK_MARKER_END: &str = "# <<< retrivio shell <<<";
 const SHELL_WRAPPER_ENV: &str = "RETRIVIO_SHELL_WRAPPER";
 static BEDROCK_REQ_SEQ: AtomicU64 = AtomicU64::new(1);
 static BEDROCK_REFRESH_ONCE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+static BEDROCK_REFRESH_FAILED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+static BEDROCK_PREFLIGHT_STATE: OnceLock<Mutex<Option<Result<(), String>>>> = OnceLock::new();
+/// True after the first verbose Bedrock 5xx diagnostic has been emitted, so
+/// repeat 5xx errors during a long index don't spam the terminal.
+static BEDROCK_5XX_DIAG_LOGGED: AtomicBool = AtomicBool::new(false);
 static OLLAMA_AUTOSTART_ONCE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 static LANCE_STORE: OnceLock<Mutex<Option<lance_store::LanceStore>>> = OnceLock::new();
 static PROGRESS_IO_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -1104,6 +1109,7 @@ fn run_doctor_fix(cfg: &ConfigValues) -> Result<(), String> {
     let aws_cli = bedrock_aws_cli_path();
     let region = bedrock_region_for_cfg(Some(cfg));
     let profile = bedrock_profile_for_cfg(Some(cfg));
+    let credential_cmd = bedrock_credential_cmd_for_cfg(Some(cfg));
     println!(
         "doctor --fix: bedrock preflight (model='{}', region='{}', profile='{}')",
         cfg.embed_model,
@@ -1111,42 +1117,66 @@ fn run_doctor_fix(cfg: &ConfigValues) -> Result<(), String> {
         profile.clone().unwrap_or_else(|| "<default>".to_string())
     );
 
-    if !command_available(&aws_cli) {
+    if credential_cmd.is_none() && !command_available(&aws_cli) {
         return Err(format!(
-            "AWS CLI '{}' is not available/executable (set RETRIVIO_AWS_CLI or install aws cli)",
+            "AWS CLI '{}' is not available/executable (set RETRIVIO_AWS_CLI or install aws cli, or set aws_credential_cmd)",
             aws_cli
         ));
     }
-    println!("doctor --fix: aws cli executable: ok ({})", aws_cli);
+    if credential_cmd.is_none() {
+        println!("doctor --fix: aws cli executable: ok ({})", aws_cli);
+    }
 
     if bedrock_refresh_cmd_for_cfg(Some(cfg)).is_some() {
-        println!("doctor --fix: running RETRIVIO_AWS_REFRESH_CMD...");
+        println!("doctor --fix: running aws_refresh_cmd...");
         refresh_aws_credentials_if_configured(Some(cfg))?;
         println!("doctor --fix: credential refresh: ok");
-    } else {
+    } else if credential_cmd.is_none() {
         println!(
-            "doctor --fix: credential refresh hook not set (configure via `retrivio setup` / `retrivio config set aws_refresh_cmd ...`)"
+            "doctor --fix: no credential hook set (configure via `retrivio setup` / `retrivio config set aws_credential_cmd ...`)"
         );
     }
 
-    let identity = aws_cli_json(
-        &aws_cli,
-        &region,
-        profile.as_deref(),
-        &["sts", "get-caller-identity"],
-    )?;
-    let account = identity
-        .get("Account")
-        .and_then(|v| v.as_str())
-        .unwrap_or("<unknown>");
-    let arn = identity
-        .get("Arn")
-        .and_then(|v| v.as_str())
-        .unwrap_or("<unknown>");
-    println!(
-        "doctor --fix: aws identity: account={} arn={}",
-        account, arn
-    );
+    if let Some(cmd) = credential_cmd.as_deref() {
+        println!("doctor --fix: running aws_credential_cmd...");
+        let creds =
+            AwsCredentials::resolve(profile.as_deref(), &aws_cli, Some(cmd)).map_err(|err| {
+                format_bedrock_preflight_error(
+                    "doctor --fix",
+                    &region,
+                    profile.as_deref(),
+                    &format!("aws_credential_cmd failed: {}", err),
+                )
+            })?;
+        if creds.is_near_expiry() {
+            return Err(format_bedrock_preflight_error(
+                "doctor --fix",
+                &region,
+                profile.as_deref(),
+                "aws_credential_cmd returned credentials that are already expired or expire within 5 minutes",
+            ));
+        }
+        println!("doctor --fix: aws_credential_cmd: ok (returned valid creds)");
+    } else {
+        let identity = aws_cli_json(
+            &aws_cli,
+            &region,
+            profile.as_deref(),
+            &["sts", "get-caller-identity"],
+        )?;
+        let account = identity
+            .get("Account")
+            .and_then(|v| v.as_str())
+            .unwrap_or("<unknown>");
+        let arn = identity
+            .get("Arn")
+            .and_then(|v| v.as_str())
+            .unwrap_or("<unknown>");
+        println!(
+            "doctor --fix: aws identity: account={} arn={}",
+            account, arn
+        );
+    }
 
     let embedder = BedrockEmbedder::new_with_config(&cfg.embed_model, Some(cfg));
     let probe = "retrivio doctor embedding probe";
@@ -1381,6 +1411,7 @@ fn run_setup_cmd(args: &[OsString]) {
         cfg.aws_profile.clear();
         cfg.aws_region.clear();
         cfg.aws_refresh_cmd.clear();
+        cfg.aws_credential_cmd.clear();
     }
 
     // 4. Write config
@@ -1407,6 +1438,14 @@ fn run_setup_cmd(args: &[OsString]) {
                 "<none>"
             } else {
                 cfg.aws_refresh_cmd.trim()
+            }
+        );
+        println!(
+            "aws_credential_cmd: {}",
+            if cfg.aws_credential_cmd.trim().is_empty() {
+                "<none>"
+            } else {
+                cfg.aws_credential_cmd.trim()
             }
         );
         println!("bedrock_concurrency: {}", cfg.bedrock_concurrency);
@@ -1509,6 +1548,10 @@ fn run_auth_cmd(args: &[OsString]) {
                 bedrock_refresh_cmd_for_cfg(Some(&cfg)).unwrap_or_else(|| "<none>".to_string())
             );
             println!(
+                "aws_credential_cmd: {}",
+                bedrock_credential_cmd_for_cfg(Some(&cfg)).unwrap_or_else(|| "<none>".to_string())
+            );
+            println!(
                 "bedrock_concurrency: {}",
                 bedrock_concurrency_for_cfg(Some(&cfg))
             );
@@ -1572,12 +1615,12 @@ fn configure_bedrock_auth_interactive(cfg: &mut ConfigValues) -> Result<(), Stri
     if !isengard_accounts.is_empty() {
         let source_options = vec![
             "aws profile (from local aws config/credentials)".to_string(),
-            "isengard account (auto-refresh command)".to_string(),
+            "isengard account (on-demand credentials)".to_string(),
         ];
         let source_idx = select_option(
             "choose bedrock auth source",
             &source_options,
-            Some(if cfg.aws_refresh_cmd.trim().is_empty() {
+            Some(if cfg.aws_credential_cmd.trim().is_empty() {
                 0
             } else {
                 1
@@ -1589,16 +1632,18 @@ fn configure_bedrock_auth_interactive(cfg: &mut ConfigValues) -> Result<(), Stri
 
     if use_isengard {
         let labels: Vec<String> = isengard_accounts.iter().map(|a| a.label.clone()).collect();
-        if let Some(idx) = select_option("choose isengard account for refresh", &labels, Some(0))? {
+        if let Some(idx) =
+            select_option("choose isengard account for credentials", &labels, Some(0))?
+        {
             let choice = &isengard_accounts[idx];
             if let Some(cli) = &isengard_cli {
-                // Select role so the refresh command is non-interactive
                 let role_options = vec![
                     "Admin".to_string(),
                     "ReadOnly".to_string(),
                     "PowerUser".to_string(),
                 ];
-                let existing_role = extract_role_from_refresh_cmd(&cfg.aws_refresh_cmd);
+                let existing_role = extract_role_from_refresh_cmd(&cfg.aws_credential_cmd)
+                    .or_else(|| extract_role_from_refresh_cmd(&cfg.aws_refresh_cmd));
                 let default_role_idx = existing_role
                     .as_ref()
                     .and_then(|r| role_options.iter().position(|o| o.eq_ignore_ascii_case(r)))
@@ -1612,15 +1657,20 @@ fn configure_bedrock_auth_interactive(cfg: &mut ConfigValues) -> Result<(), Stri
                 } else {
                     "Admin".to_string()
                 };
-                cfg.aws_refresh_cmd = format!(
-                    "{} add-profile {} --role {}",
+                cfg.aws_credential_cmd = format!(
+                    "{} credentials --awscli {} --role {}",
                     shell_escape(cli),
                     shell_escape(&choice.account_ref),
-                    role
+                    shell_escape(&role)
                 );
+                // Stop running the legacy refresh-shaped command alongside the new
+                // on-demand one — it's redundant at best, and broken in tenants that
+                // no longer issue static keys.
+                cfg.aws_refresh_cmd.clear();
             }
         }
     } else {
+        cfg.aws_credential_cmd.clear();
         cfg.aws_refresh_cmd.clear();
     }
 
@@ -2398,6 +2448,10 @@ fn config_rows() -> Vec<(&'static str, &'static str)> {
         ("aws_profile", "AWS profile for Bedrock"),
         ("aws_region", "AWS region for Bedrock"),
         ("aws_refresh_cmd", "Credential refresh command (optional)"),
+        (
+            "aws_credential_cmd",
+            "On-demand credential command, must print credential_process JSON (optional)",
+        ),
         ("bedrock_concurrency", "Bedrock invoke concurrency"),
         ("bedrock_max_retries", "Bedrock max retry attempts"),
         ("bedrock_retry_base_ms", "Bedrock retry base backoff (ms)"),
@@ -2468,6 +2522,7 @@ fn config_value_string(cfg: &ConfigValues, key: &str) -> Option<String> {
         "aws_profile" => Some(cfg.aws_profile.clone()),
         "aws_region" => Some(cfg.aws_region.clone()),
         "aws_refresh_cmd" => Some(cfg.aws_refresh_cmd.clone()),
+        "aws_credential_cmd" => Some(cfg.aws_credential_cmd.clone()),
         "bedrock_concurrency" => Some(cfg.bedrock_concurrency.to_string()),
         "bedrock_max_retries" => Some(cfg.bedrock_max_retries.to_string()),
         "bedrock_retry_base_ms" => Some(cfg.bedrock_retry_base_ms.to_string()),
@@ -2541,6 +2596,9 @@ fn config_set_value(cfg: &mut ConfigValues, key: &str, raw: &str) -> Result<(), 
         }
         "aws_refresh_cmd" => {
             cfg.aws_refresh_cmd = value.to_string();
+        }
+        "aws_credential_cmd" => {
+            cfg.aws_credential_cmd = value.to_string();
         }
         "bedrock_concurrency" => {
             cfg.bedrock_concurrency = value
@@ -12562,13 +12620,148 @@ fn handle_search_pick_request(req: &ApiRequest) -> (u16, String) {
 }
 
 fn ensure_native_embed_backend(cfg: &ConfigValues, context: &str) -> Result<(), String> {
-    if matches!(cfg.embed_backend.as_str(), "ollama" | "bedrock") {
+    match cfg.embed_backend.as_str() {
+        "ollama" => Ok(()),
+        "bedrock" => bedrock_preflight_credentials(cfg, context),
+        other => Err(format!(
+            "{} requires native embed_backend in [ollama, bedrock] (current='{}')",
+            context, other
+        )),
+    }
+}
+
+/// Verify that Bedrock credentials are usable (run refresh cmd if configured,
+/// then `sts get-caller-identity`). Caches the result per process so repeated
+/// calls (MCP requests, indexing, etc.) don't re-run the refresh command on
+/// every invocation.
+///
+/// On failure, returns a single actionable error message. Callers should
+/// surface it verbatim and abort the current operation rather than falling
+/// through to Bedrock calls that would fail in noisy ways.
+fn bedrock_preflight_credentials(cfg: &ConfigValues, context: &str) -> Result<(), String> {
+    if bool_env("RETRIVIO_BEDROCK_PREFLIGHT_SKIP", false) {
         return Ok(());
     }
-    Err(format!(
-        "{} requires native embed_backend in [ollama, bedrock] (current='{}')",
-        context, cfg.embed_backend
-    ))
+    let lock = BEDROCK_PREFLIGHT_STATE.get_or_init(|| Mutex::new(None));
+    // Hold the lock across the whole preflight so concurrent callers (e.g.
+    // parallel MCP requests) don't stampede the refresh command. Only cache
+    // successful preflights for the life of the process; failures are re-checked
+    // on subsequent calls so the user can recover (e.g. after re-running mwinit)
+    // without restarting Retrivio.
+    let mut guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(Ok(())) = guard.as_ref() {
+        return Ok(());
+    }
+    let result = bedrock_preflight_credentials_inner(cfg, context);
+    if result.is_ok() {
+        *guard = Some(Ok(()));
+    }
+    result
+}
+
+fn bedrock_preflight_credentials_inner(cfg: &ConfigValues, context: &str) -> Result<(), String> {
+    let region = bedrock_region_for_cfg(Some(cfg));
+    let profile = bedrock_profile_for_cfg(Some(cfg));
+    let credential_cmd = bedrock_credential_cmd_for_cfg(Some(cfg));
+
+    // Allow the user to retry after fixing their environment (e.g. re-running
+    // `mwinit`) without restarting Retrivio: clear the per-process failure latch
+    // before each preflight attempt so the refresh command actually runs again.
+    if let Ok(mut failed) = bedrock_refresh_failed_state().lock() {
+        failed.clear();
+    }
+
+    if let Some(refresh_cmd) = bedrock_refresh_cmd_for_cfg(Some(cfg)) {
+        // Also clear the success latch so a retry of the refresh command runs fresh.
+        if let Ok(mut done) = bedrock_refresh_once_state().lock() {
+            done.clear();
+        }
+        if let Err(err) = run_refresh_command_once(&refresh_cmd) {
+            return Err(format_bedrock_preflight_error(
+                context,
+                &region,
+                profile.as_deref(),
+                &format!("credential refresh failed: {}", err),
+            ));
+        }
+    }
+
+    if let Some(cmd) = credential_cmd.as_deref() {
+        // On-demand credential command: exec it, validate the JSON, and confirm
+        // Expiration is in the future. Skip the `aws sts` probe because the AWS CLI
+        // doesn't share Retrivio's in-memory creds.
+        match AwsCredentials::resolve(profile.as_deref(), &bedrock_aws_cli_path(), Some(cmd)) {
+            Ok(creds) => {
+                if creds.is_near_expiry() {
+                    return Err(format_bedrock_preflight_error(
+                        context,
+                        &region,
+                        profile.as_deref(),
+                        "aws_credential_cmd returned credentials that are already expired or expire within 5 minutes",
+                    ));
+                }
+                Ok(())
+            }
+            Err(err) => Err(format_bedrock_preflight_error(
+                context,
+                &region,
+                profile.as_deref(),
+                &format!("aws_credential_cmd failed: {}", err),
+            )),
+        }
+    } else {
+        let aws_cli = bedrock_aws_cli_path();
+        if !command_available(&aws_cli) {
+            return Err(format!(
+                "{}: AWS CLI '{}' not available/executable; install aws cli or set RETRIVIO_AWS_CLI",
+                context, aws_cli
+            ));
+        }
+        match aws_cli_json(
+            &aws_cli,
+            &region,
+            profile.as_deref(),
+            &["sts", "get-caller-identity"],
+        ) {
+            Ok(_) => Ok(()),
+            Err(err) => Err(format_bedrock_preflight_error(
+                context,
+                &region,
+                profile.as_deref(),
+                &err,
+            )),
+        }
+    }
+}
+
+fn format_bedrock_preflight_error(
+    context: &str,
+    region: &str,
+    profile: Option<&str>,
+    detail: &str,
+) -> String {
+    let profile_label = profile.unwrap_or("<default>");
+    let lower = detail.to_ascii_lowercase();
+    let looks_midway_stale = lower.contains("midway")
+        || lower.contains("mwinit")
+        || lower.contains("cookie")
+        || lower.contains("unable to resolve midway");
+    let primary_fix = if looks_midway_stale {
+        "- midway cookie looks stale: `mwinit --ssh-public-key ~/.ssh/id_ecdsa.pub && ssh-add -K -t 72000`"
+    } else {
+        "- refresh AWS credentials (e.g. run your isengard/ada/aws-sso login)"
+    };
+    format!(
+        "{}: Bedrock credentials are not usable (region={}, profile={}).\n\
+         \n\
+         detail: {}\n\
+         \n\
+         fixes:\n\
+         {}\n\
+         - then run `retrivio doctor --fix` to validate\n\
+         - or switch to local embeddings with `retrivio config set embed_backend ollama`",
+        context, region, profile_label, detail, primary_fix
+    )
 }
 
 fn list_neighbors_by_path(
@@ -14770,12 +14963,29 @@ fn mcp_status_resource() -> Result<String, String> {
     ))
 }
 
+fn mcp_tool_needs_rw(name: &str) -> bool {
+    matches!(
+        name,
+        "suppress_relation"
+            | "restore_relation"
+            | "set_relation_quality"
+            | "add_tracked_root"
+            | "remove_tracked_root"
+            | "run_incremental_index"
+            | "run_forced_refresh"
+    )
+}
+
 fn mcp_tool_call(name: &str, args: &Value) -> Result<Value, String> {
     let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let cfg = ConfigValues::from_map(load_config_values(&config_path(&cwd)));
     let dbp = db_path(&cwd);
-    ensure_db_schema(&dbp)?;
-    let conn = open_db_rw(&dbp)?;
+    let conn = if mcp_tool_needs_rw(name) {
+        ensure_db_schema(&dbp)?;
+        open_db_rw(&dbp)?
+    } else {
+        open_db_read_only(&dbp)?
+    };
 
     match name {
         "search_projects" => {
@@ -18087,6 +18297,118 @@ VALUES (1, '/tmp/p/b.md', 'b.md', 0, 1, 10, 'h2', 'beta', 0);
     }
 
     #[test]
+    fn shell_split_handles_quoted_args() {
+        let tokens = shell_split("foo 'bar baz' --qux \"quoted value\"").unwrap();
+        assert_eq!(tokens, vec!["foo", "bar baz", "--qux", "quoted value"]);
+    }
+
+    #[test]
+    fn shell_split_rejects_unbalanced_quotes() {
+        assert!(shell_split("foo 'bar").is_none());
+        assert!(shell_split("foo \"bar").is_none());
+    }
+
+    #[test]
+    fn migrate_isengard_add_profile_rewrites_to_credentials() {
+        let legacy = "'isengardcli' add-profile 'wwso-strategics-data-ai-fusion@amazon.com' --role Admin";
+        let migrated =
+            migrate_isengard_add_profile_to_credential_cmd(legacy).expect("should migrate");
+        // shell_split should round-trip the migrated form back to the same tokens.
+        let tokens = shell_split(&migrated).expect("migrated form must be parseable");
+        assert_eq!(
+            tokens,
+            vec![
+                "isengardcli",
+                "credentials",
+                "--awscli",
+                "wwso-strategics-data-ai-fusion@amazon.com",
+                "--role",
+                "Admin"
+            ]
+        );
+    }
+
+    #[test]
+    fn migrate_isengard_add_profile_keeps_absolute_path() {
+        let legacy = "/Users/x/Scripts/isengardcli/isengardcli add-profile foo@bar.com --role ReadOnly";
+        let migrated =
+            migrate_isengard_add_profile_to_credential_cmd(legacy).expect("should migrate");
+        let tokens = shell_split(&migrated).expect("migrated form must be parseable");
+        assert_eq!(
+            tokens,
+            vec![
+                "/Users/x/Scripts/isengardcli/isengardcli",
+                "credentials",
+                "--awscli",
+                "foo@bar.com",
+                "--role",
+                "ReadOnly"
+            ]
+        );
+    }
+
+    #[test]
+    fn migrate_isengard_add_profile_ignores_non_isengard() {
+        // aws-sso login command should not be rewritten
+        assert!(migrate_isengard_add_profile_to_credential_cmd(
+            "aws sso login --profile foo"
+        )
+        .is_none());
+        // isengardcli credentials (already correct) should not be rewritten
+        assert!(migrate_isengard_add_profile_to_credential_cmd(
+            "isengardcli credentials --awscli foo --role Admin"
+        )
+        .is_none());
+        assert!(migrate_isengard_add_profile_to_credential_cmd("").is_none());
+    }
+
+    #[test]
+    fn config_migrates_legacy_aws_refresh_cmd_to_credential_cmd() {
+        let mut map = std::collections::HashMap::new();
+        map.insert("embed_backend".to_string(), "bedrock".to_string());
+        map.insert(
+            "aws_refresh_cmd".to_string(),
+            "'isengardcli' add-profile 'foo@amazon.com' --role Admin".to_string(),
+        );
+        let cfg = ConfigValues::from_map(map);
+        assert_eq!(cfg.aws_refresh_cmd, "");
+        let tokens =
+            shell_split(&cfg.aws_credential_cmd).expect("migrated form must be parseable");
+        assert_eq!(
+            tokens,
+            vec![
+                "isengardcli",
+                "credentials",
+                "--awscli",
+                "foo@amazon.com",
+                "--role",
+                "Admin"
+            ]
+        );
+    }
+
+    #[test]
+    fn config_preserves_explicit_aws_credential_cmd_over_migration() {
+        let mut map = std::collections::HashMap::new();
+        map.insert("embed_backend".to_string(), "bedrock".to_string());
+        map.insert(
+            "aws_refresh_cmd".to_string(),
+            "'isengardcli' add-profile 'foo@amazon.com' --role Admin".to_string(),
+        );
+        map.insert(
+            "aws_credential_cmd".to_string(),
+            "/usr/local/bin/my-creds.sh".to_string(),
+        );
+        let cfg = ConfigValues::from_map(map);
+        // Explicit aws_credential_cmd wins; legacy aws_refresh_cmd is left alone.
+        assert_eq!(cfg.aws_credential_cmd, "/usr/local/bin/my-creds.sh");
+        assert_eq!(
+            cfg.aws_refresh_cmd,
+            "'isengardcli' add-profile 'foo@amazon.com' --role Admin"
+        );
+    }
+
+    #[test]
     fn bedrock_defaults_and_payload_contract() {
         assert_eq!(
             default_embed_model_for_backend("bedrock"),
@@ -19893,6 +20215,7 @@ struct ConfigValues {
     aws_profile: String,
     aws_region: String,
     aws_refresh_cmd: String,
+    aws_credential_cmd: String,
     bedrock_concurrency: i64,
     bedrock_max_retries: i64,
     bedrock_retry_base_ms: i64,
@@ -19973,12 +20296,28 @@ impl ConfigValues {
             .unwrap_or_default()
             .trim()
             .to_string();
-        let aws_refresh_cmd = map
+        let mut aws_refresh_cmd = map
             .get("aws_refresh_cmd")
             .cloned()
             .unwrap_or_default()
             .trim()
             .to_string();
+        let mut aws_credential_cmd = map
+            .get("aws_credential_cmd")
+            .cloned()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        // Silent migration: legacy `isengardcli add-profile EMAIL --role ROLE` was a
+        // one-shot that wrote static keys; those are no longer issued. Convert it to
+        // an on-demand `isengardcli credentials --awscli EMAIL --role ROLE` invocation.
+        if aws_credential_cmd.is_empty() {
+            if let Some(migrated) = migrate_isengard_add_profile_to_credential_cmd(&aws_refresh_cmd)
+            {
+                aws_credential_cmd = migrated;
+                aws_refresh_cmd.clear();
+            }
+        }
         let bedrock_concurrency = map
             .get("bedrock_concurrency")
             .and_then(|v| v.parse::<i64>().ok())
@@ -20151,6 +20490,7 @@ impl ConfigValues {
             aws_profile,
             aws_region,
             aws_refresh_cmd,
+            aws_credential_cmd,
             bedrock_concurrency,
             bedrock_max_retries,
             bedrock_retry_base_ms,
@@ -20236,6 +20576,10 @@ fn write_config_file(path: &Path, cfg: &ConfigValues) -> Result<(), String> {
         format!(
             "aws_refresh_cmd = \"{}\"",
             toml_escape(&cfg.aws_refresh_cmd)
+        ),
+        format!(
+            "aws_credential_cmd = \"{}\"",
+            toml_escape(&cfg.aws_credential_cmd)
         ),
         format!("bedrock_concurrency = {}", cfg.bedrock_concurrency),
         format!("bedrock_max_retries = {}", cfg.bedrock_max_retries),
@@ -23224,6 +23568,105 @@ fn bedrock_refresh_cmd_for_cfg(cfg: Option<&ConfigValues>) -> Option<String> {
         .or_else(|| cfg.and_then(|c| non_empty_string(c.aws_refresh_cmd.trim())))
 }
 
+fn bedrock_credential_cmd_for_cfg(cfg: Option<&ConfigValues>) -> Option<String> {
+    non_empty_env("RETRIVIO_AWS_CREDENTIAL_CMD")
+        .or_else(|| cfg.and_then(|c| non_empty_string(c.aws_credential_cmd.trim())))
+}
+
+/// If `cmd` is the legacy `isengardcli add-profile EMAIL --role ROLE` shape,
+/// return the equivalent on-demand `isengardcli credentials --awscli EMAIL --role ROLE`.
+/// Returns None if `cmd` doesn't match the legacy shape.
+fn migrate_isengard_add_profile_to_credential_cmd(cmd: &str) -> Option<String> {
+    let trimmed = cmd.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let tokens = shell_split(trimmed)?;
+    let mut iter = tokens.iter();
+    let bin = iter.next()?;
+    let bin_basename = std::path::Path::new(bin)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| bin.to_string());
+    if !bin_basename.contains("isengardcli") {
+        return None;
+    }
+    let sub = iter.next()?;
+    if sub != "add-profile" {
+        return None;
+    }
+    let account = iter.next()?;
+    let mut role = "Admin".to_string();
+    while let Some(arg) = iter.next() {
+        if arg == "--role" {
+            if let Some(v) = iter.next() {
+                role = v.clone();
+            }
+        }
+    }
+    Some(format!(
+        "{} credentials --awscli {} --role {}",
+        shell_escape(bin),
+        shell_escape(account),
+        shell_escape(&role)
+    ))
+}
+
+/// Minimal POSIX-ish shell tokenizer: handles single/double quotes and backslash escapes.
+/// Returns None on unbalanced quotes.
+fn shell_split(input: &str) -> Option<Vec<String>> {
+    let mut out: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut escaping = false;
+    let mut has_token = false;
+    for ch in input.chars() {
+        if escaping {
+            current.push(ch);
+            escaping = false;
+            has_token = true;
+            continue;
+        }
+        if let Some(q) = quote {
+            if ch == q {
+                quote = None;
+            } else if q == '"' && ch == '\\' {
+                escaping = true;
+            } else {
+                current.push(ch);
+            }
+            continue;
+        }
+        match ch {
+            '\\' => {
+                escaping = true;
+                has_token = true;
+            }
+            '\'' | '"' => {
+                quote = Some(ch);
+                has_token = true;
+            }
+            c if c.is_whitespace() => {
+                if has_token {
+                    out.push(std::mem::take(&mut current));
+                    has_token = false;
+                }
+            }
+            other => {
+                current.push(other);
+                has_token = true;
+            }
+        }
+    }
+    if quote.is_some() || escaping {
+        return None;
+    }
+    if has_token {
+        out.push(current);
+    }
+    Some(out)
+}
+
 fn bedrock_concurrency_for_cfg(cfg: Option<&ConfigValues>) -> usize {
     non_empty_env("RETRIVIO_BEDROCK_CONCURRENCY")
         .and_then(|v| v.parse::<usize>().ok())
@@ -23261,6 +23704,19 @@ fn bedrock_refresh_once_state() -> &'static Mutex<HashSet<String>> {
     BEDROCK_REFRESH_ONCE.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
+fn bedrock_refresh_failed_state() -> &'static Mutex<HashSet<String>> {
+    BEDROCK_REFRESH_FAILED.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn tail_lines(text: &str, max_lines: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.len() <= max_lines {
+        return lines.join("\n");
+    }
+    let start = lines.len() - max_lines;
+    lines[start..].join("\n")
+}
+
 fn run_refresh_command_once(cmd: &str) -> Result<(), String> {
     let trimmed = cmd.trim();
     if trimmed.is_empty() {
@@ -23274,21 +23730,97 @@ fn run_refresh_command_once(cmd: &str) -> Result<(), String> {
                 return Ok(());
             }
         }
+        // If we already failed this exact command once in this process, short-circuit silently
+        // with a cached error rather than re-running it and re-spamming the terminal.
+        if let Ok(failed) = bedrock_refresh_failed_state().lock() {
+            if failed.contains(trimmed) {
+                return Err("aws refresh command previously failed in this process; not retrying (run `retrivio doctor --fix` after resolving)".to_string());
+            }
+        }
     }
 
-    let status = Command::new("bash")
-        .arg("-lc")
-        .arg(trimmed)
-        .status()
-        .map_err(|e| format!("failed executing aws refresh command: {}", e))?;
-    if !status.success() {
-        return Err(format!(
-            "aws refresh command failed with status {}",
-            status
+    let verbose = bool_env("RETRIVIO_AWS_REFRESH_VERBOSE", false);
+    // If stdin is an interactive terminal, let the refresh command inherit
+    // stdio so prompts (Midway PIN, SSO codes) still work for humans running
+    // `retrivio index` directly. When headless (MCP server, piped, CI), capture
+    // output and surface a compact summary on failure instead of spamming.
+    let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+    let force_capture = bool_env("RETRIVIO_AWS_REFRESH_CAPTURE", false);
+    let capture = force_capture || !interactive;
+
+    let mut builder = Command::new("bash");
+    builder.arg("-lc").arg(trimmed);
+    if capture {
+        builder
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+    }
+    // Clear the progress line so any direct output (interactive mode) or our
+    // follow-up diagnostics aren't interleaved with the spinner.
+    progress_clear_line();
+
+    if capture {
+        let output = builder
+            .output()
+            .map_err(|e| format!("failed executing aws refresh command: {}", e))?;
+        if !output.status.success() {
+            if !always {
+                if let Ok(mut failed) = bedrock_refresh_failed_state().lock() {
+                    failed.insert(trimmed.to_string());
+                }
+            }
+            let code = output
+                .status
                 .code()
                 .map(|c| c.to_string())
-                .unwrap_or_else(|| "unknown".to_string())
-        ));
+                .unwrap_or_else(|| "unknown".to_string());
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let combined = if !stderr.trim().is_empty() {
+                stderr.to_string()
+            } else {
+                stdout.to_string()
+            };
+            let tail = tail_lines(combined.trim(), 6);
+            let hint = if tail.is_empty() {
+                String::new()
+            } else {
+                format!("\n  last output:\n    {}", tail.replace('\n', "\n    "))
+            };
+            return Err(format!(
+                "aws credential refresh failed (exit {}){}",
+                code, hint
+            ));
+        }
+        if verbose {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if !stdout.trim().is_empty() {
+                eprintln!("aws refresh stdout:\n{}", stdout.trim());
+            }
+            if !stderr.trim().is_empty() {
+                eprintln!("aws refresh stderr:\n{}", stderr.trim());
+            }
+        }
+    } else {
+        let status = builder
+            .status()
+            .map_err(|e| format!("failed executing aws refresh command: {}", e))?;
+        if !status.success() {
+            if !always {
+                if let Ok(mut failed) = bedrock_refresh_failed_state().lock() {
+                    failed.insert(trimmed.to_string());
+                }
+            }
+            return Err(format!(
+                "aws credential refresh failed (exit {})",
+                status
+                    .code()
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "unknown".to_string())
+            ));
+        }
     }
 
     if !always {
@@ -23744,31 +24276,63 @@ struct AwsCredentials {
 }
 
 impl AwsCredentials {
-    fn resolve(profile: Option<&str>, aws_cli: &str) -> Result<Self, String> {
-        let mut cmd = Command::new(aws_cli);
-        cmd.arg("configure").arg("export-credentials");
-        if let Some(p) = profile {
-            cmd.arg("--profile").arg(p);
-        }
-        let output = cmd
-            .output()
-            .map_err(|e| format!("aws configure export-credentials: {}", e))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!(
-                "aws configure export-credentials failed: {}",
-                stderr.trim()
-            ));
-        }
-        let json: Value = serde_json::from_slice(&output.stdout)
-            .map_err(|e| format!("failed parsing credentials JSON: {}", e))?;
+    fn resolve(
+        profile: Option<&str>,
+        aws_cli: &str,
+        credential_cmd: Option<&str>,
+    ) -> Result<Self, String> {
+        let (stdout, source_label) = if let Some(cmd_str) = credential_cmd
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            let tokens = shell_split(cmd_str)
+                .ok_or_else(|| format!("aws_credential_cmd has unbalanced quotes: {}", cmd_str))?;
+            let (program, args) = tokens
+                .split_first()
+                .ok_or_else(|| "aws_credential_cmd is empty".to_string())?;
+            let mut cmd = Command::new(program);
+            cmd.args(args);
+            let output = cmd
+                .output()
+                .map_err(|e| format!("aws_credential_cmd '{}': {}", program, e))?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let detail = if !stderr.trim().is_empty() {
+                    stderr.trim().to_string()
+                } else {
+                    stdout.trim().to_string()
+                };
+                return Err(format!("aws_credential_cmd failed: {}", detail));
+            }
+            (output.stdout, "aws_credential_cmd")
+        } else {
+            let mut cmd = Command::new(aws_cli);
+            cmd.arg("configure").arg("export-credentials");
+            if let Some(p) = profile {
+                cmd.arg("--profile").arg(p);
+            }
+            let output = cmd
+                .output()
+                .map_err(|e| format!("aws configure export-credentials: {}", e))?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(format!(
+                    "aws configure export-credentials failed: {}",
+                    stderr.trim()
+                ));
+            }
+            (output.stdout, "aws configure export-credentials")
+        };
+        let json: Value = serde_json::from_slice(&stdout)
+            .map_err(|e| format!("{}: failed parsing credentials JSON: {}", source_label, e))?;
         let access_key = json["AccessKeyId"]
             .as_str()
-            .ok_or("missing AccessKeyId in exported credentials")?
+            .ok_or_else(|| format!("{}: missing AccessKeyId", source_label))?
             .to_string();
         let secret_key = json["SecretAccessKey"]
             .as_str()
-            .ok_or("missing SecretAccessKey in exported credentials")?
+            .ok_or_else(|| format!("{}: missing SecretAccessKey", source_label))?
             .to_string();
         let session_token = json["SessionToken"]
             .as_str()
@@ -23974,12 +24538,16 @@ struct BedrockEmbedder {
     region: String,
     profile: Option<String>,
     refresh_cmd: Option<String>,
+    credential_cmd: Option<String>,
     normalize: bool,
     aws_cli: String,
     concurrency: usize,
     max_retries: usize,
     retry_base_ms: u64,
     credentials: Arc<Mutex<Option<AwsCredentials>>>,
+    /// Single-flight gate so concurrent embed threads don't all spawn
+    /// the credential command at once on cold start / refresh.
+    credential_resolve_lock: Arc<Mutex<()>>,
     http_agent: ureq::Agent,
     /// Adaptive concurrency: decreases on throttle, recovers on success.
     active_concurrency: Arc<AtomicUsize>,
@@ -24001,6 +24569,7 @@ impl BedrockEmbedder {
         let region = bedrock_region_for_cfg(cfg);
         let profile = bedrock_profile_for_cfg(cfg);
         let refresh_cmd = bedrock_refresh_cmd_for_cfg(cfg);
+        let credential_cmd = bedrock_credential_cmd_for_cfg(cfg);
         let normalize = bool_env("RETRIVIO_BEDROCK_NORMALIZE", true);
         let aws_cli = bedrock_aws_cli_path();
         let concurrency = bedrock_concurrency_for_cfg(cfg);
@@ -24015,12 +24584,14 @@ impl BedrockEmbedder {
             region,
             profile,
             refresh_cmd,
+            credential_cmd,
             normalize,
             aws_cli,
             concurrency,
             max_retries,
             retry_base_ms,
             credentials: Arc::new(Mutex::new(None)),
+            credential_resolve_lock: Arc::new(Mutex::new(())),
             http_agent,
             active_concurrency: Arc::new(AtomicUsize::new(concurrency)),
             consecutive_ok: Arc::new(AtomicU64::new(0)),
@@ -24088,16 +24659,33 @@ impl BedrockEmbedder {
     }
 
     fn ensure_credentials(&self) -> Option<AwsCredentials> {
-        {
-            if let Ok(guard) = self.credentials.lock() {
-                if let Some(creds) = guard.as_ref() {
-                    if !creds.is_near_expiry() {
-                        return Some(creds.clone());
-                    }
+        // Fast path: cached creds still valid.
+        if let Ok(guard) = self.credentials.lock() {
+            if let Some(creds) = guard.as_ref() {
+                if !creds.is_near_expiry() {
+                    return Some(creds.clone());
                 }
             }
         }
-        match AwsCredentials::resolve(self.profile.as_deref(), &self.aws_cli) {
+        // Slow path: serialize concurrent resolvers so cold-start with N
+        // worker threads only spawns the credential command once.
+        let _resolve_guard = self
+            .credential_resolve_lock
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // Re-check inside the resolve gate: another thread may have populated.
+        if let Ok(guard) = self.credentials.lock() {
+            if let Some(creds) = guard.as_ref() {
+                if !creds.is_near_expiry() {
+                    return Some(creds.clone());
+                }
+            }
+        }
+        match AwsCredentials::resolve(
+            self.profile.as_deref(),
+            &self.aws_cli,
+            self.credential_cmd.as_deref(),
+        ) {
             Ok(creds) => {
                 if let Ok(mut guard) = self.credentials.lock() {
                     *guard = Some(creds.clone());
@@ -24123,10 +24711,39 @@ impl BedrockEmbedder {
         req = req.set("Accept", "application/json");
         let resp = req.send_bytes(&body).map_err(|e| match e {
             ureq::Error::Status(code, resp) => {
+                // Capture diagnostic fields BEFORE consuming the body. Bedrock
+                // surfaces the actual error in headers (x-amzn-RequestId,
+                // x-amzn-ErrorType) — empty 5xx bodies often still carry these.
+                let request_id = resp.header("x-amzn-RequestId").unwrap_or("").to_string();
+                let error_type = resp.header("x-amzn-ErrorType").unwrap_or("").to_string();
                 let body_text = resp.into_string().unwrap_or_default();
+                if code >= 500
+                    && !BEDROCK_5XX_DIAG_LOGGED.swap(true, Ordering::Relaxed)
+                {
+                    progress_clear_line();
+                    eprintln!(
+                        "bedrock 5xx diagnostic (first occurrence in this process):\n  model={}\n  region={}\n  http_status={}\n  x-amzn-RequestId={}\n  x-amzn-ErrorType={}\n  body={:?}",
+                        self.model,
+                        self.region,
+                        code,
+                        if request_id.is_empty() { "<missing>" } else { &request_id },
+                        if error_type.is_empty() { "<missing>" } else { &error_type },
+                        body_text.chars().take(500).collect::<String>(),
+                    );
+                }
+                let mut detail = format!("HTTP {}", code);
+                if !error_type.is_empty() {
+                    detail.push_str(&format!(" {}", error_type));
+                }
+                if !body_text.trim().is_empty() {
+                    detail.push_str(&format!(" - {}", body_text.trim()));
+                }
+                if !request_id.is_empty() {
+                    detail.push_str(&format!(" (RequestId={})", request_id));
+                }
                 format!(
-                    "Bedrock invoke failed (model='{}', region='{}'): HTTP {} - {}",
-                    self.model, self.region, code, body_text
+                    "Bedrock invoke failed (model='{}', region='{}'): {}",
+                    self.model, self.region, detail
                 )
             }
             ureq::Error::Transport(t) => {
@@ -24214,7 +24831,16 @@ impl BedrockEmbedder {
             let creds = self.ensure_credentials();
             let result = match &creds {
                 Some(c) => self.invoke_model_http(payload, c),
-                None => self.invoke_model_cli(payload),
+                None => {
+                    if self.credential_cmd.is_some() {
+                        // With an explicit credential_cmd configured, the AWS CLI
+                        // fallback won't see those creds — surface the resolution
+                        // failure rather than producing a misleading SignatureV4 error.
+                        Err("aws_credential_cmd did not return usable credentials".to_string())
+                    } else {
+                        self.invoke_model_cli(payload)
+                    }
+                }
             };
             match result {
                 Ok(parsed) => {
@@ -24232,7 +24858,16 @@ impl BedrockEmbedder {
                     let is_throttle = msg.contains("Throttl")
                         || msg.contains("TooManyRequests")
                         || msg.contains("429");
+                    // Bedrock occasionally returns empty-body 5xx responses
+                    // mid-stream during long bulk index runs (e.g. HTTP 500/502/503).
+                    // Treat these as retryable — they're transient backend hiccups,
+                    // not auth or input failures.
+                    let is_server_5xx = msg.contains("HTTP 500")
+                        || msg.contains("HTTP 502")
+                        || msg.contains("HTTP 503")
+                        || msg.contains("HTTP 504");
                     let retryable = is_throttle
+                        || is_server_5xx
                         || msg.contains("timed out")
                         || msg.contains("ExpiredToken")
                         || msg.contains("expired");
