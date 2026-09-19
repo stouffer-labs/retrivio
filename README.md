@@ -98,7 +98,8 @@ retrivio hook status             # what is installed, which binary, last runs
 ```
 
 - **Claude Code** gets a `UserPromptSubmit` hook and a `SessionStart` hook (matcher `compact|clear`) in `~/.claude/settings.json`, written in exec form (`command` + `args`, no shell). Existing hooks are preserved; a `.bak-retrivio` copy is kept.
-- **Codex** gets the same two hooks in `~/.codex/hooks.json`. Codex trusts hook definitions by hash: run `/hooks` inside Codex and trust the retrivio entries after installing and after any later change (for example a new binary path).
+- **Codex** gets the same two hooks in `~/.codex/hooks.json`. Codex only runs hooks whose definition hash it has trusted, so `retrivio hook install` performs that trust step for you through the Codex app-server API (the same call the `/hooks` screen makes) whenever `codex` is on your PATH; `retrivio hook status` shows the trust state, and `retrivio hook trust --codex` redoes it after a change such as a new binary path. If the app-server is unavailable, open `/hooks` inside Codex and trust the two entries manually.
+- Optional: `retrivio mcp register` adds the Retrivio MCP server to Claude Code, Codex, Kiro and Gemini CLI so the agent can search, read documents and pack context itself when a lead is worth digging into.
 - Optional but recommended: install the skill in [`docs/skills/retrivio-recall`](docs/skills/retrivio-recall/SKILL.md) for both CLIs. Codex reads `~/.agents/skills/`, Claude Code reads `~/.claude/skills/`; copy the folder to one and symlink it into the other. It tells the agent how to weigh leads by freshness and when to search Retrivio itself.
 
 ### What the agent sees
