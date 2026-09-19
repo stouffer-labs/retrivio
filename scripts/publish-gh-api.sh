@@ -271,6 +271,8 @@ ALLOWLIST=(
   "assets/animated"
   "crates/retrivio"
   "docs/DISTRIBUTION.md"
+  "docs/API_HELP.md"
+  "docs/skills"
   "scripts/install.sh"
   "scripts/publish-gh-api.sh"
   "scripts/retrivio-shell.sh"
