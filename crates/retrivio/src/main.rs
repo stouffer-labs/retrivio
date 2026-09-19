@@ -25,7 +25,10 @@ use sha1::{Digest, Sha1};
 use xxhash_rust::xxh64;
 
 mod code_intel;
+mod freshness;
+mod hook_install;
 mod lance_store;
+mod recall;
 
 const APP_STATE_ACTIVE_MODEL_KEY: &str = "active_model_key";
 const APP_STATE_REEMBED_REQUIRED: &str = "reembed_required";
@@ -40,7 +43,90 @@ static BEDROCK_PREFLIGHT_STATE: OnceLock<Mutex<Option<Result<(), String>>>> = On
 /// True after the first verbose Bedrock 5xx diagnostic has been emitted, so
 /// repeat 5xx errors during a long index don't spam the terminal.
 static BEDROCK_5XX_DIAG_LOGGED: AtomicBool = AtomicBool::new(false);
+/// Set by `retrivio recall` (editor hook): credential refresh commands are never spawned and
+/// the non-interactive credential export is time-boxed. Process-global and one-way.
+static HOOK_MODE: AtomicBool = AtomicBool::new(false);
 static OLLAMA_AUTOSTART_ONCE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+/// Enter hook mode for the rest of the process (see [`HOOK_MODE`]).
+pub(crate) fn set_hook_mode() {
+    HOOK_MODE.store(true, Ordering::SeqCst);
+}
+
+fn hook_mode_active() -> bool {
+    HOOK_MODE.load(Ordering::SeqCst)
+}
+
+#[cfg(test)]
+mod hook_mode_tests {
+    use super::*;
+
+    #[test]
+    fn hook_mode_never_spawns_the_refresh_command() {
+        set_hook_mode();
+        assert!(hook_mode_active());
+        let mut map: HashMap<String, String> = HashMap::new();
+        map.insert("aws_refresh_cmd".to_string(), "sleep 30".to_string());
+        let cfg = ConfigValues::from_map(map);
+        assert_eq!(cfg.aws_refresh_cmd, "sleep 30");
+        let started = Instant::now();
+        let err = refresh_aws_credentials_if_configured(Some(&cfg)).unwrap_err();
+        assert!(started.elapsed() < Duration::from_millis(100), "took {:?}", started.elapsed());
+        assert!(err.contains("hook mode"), "{}", err);
+        let started = Instant::now();
+        assert!(run_refresh_command_once("sleep 30").is_err());
+        assert!(started.elapsed() < Duration::from_millis(100));
+        // An empty command is still a no-op.
+        assert!(run_refresh_command_once("   ").is_ok());
+    }
+
+    #[test]
+    fn bounded_credential_command_is_killed_on_timeout() {
+        let mut slow = Command::new("sleep");
+        slow.arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let started = Instant::now();
+        let err = bounded_command_output(&mut slow, Duration::from_millis(150)).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(2), "took {:?}", started.elapsed());
+
+        let mut fast = Command::new("sh");
+        fast.arg("-c")
+            .arg("printf '{\"AccessKeyId\":\"x\"}'")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let out = bounded_command_output(&mut fast, Duration::from_secs(5)).unwrap();
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "{\"AccessKeyId\":\"x\"}");
+
+        // A grandchild that inherited the pipe does not stall the read past the budget.
+        let mut orphan = Command::new("sh");
+        orphan
+            .arg("-c")
+            .arg("sleep 2 & printf ok")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let started = Instant::now();
+        let err = bounded_command_output(&mut orphan, Duration::from_millis(300)).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_millis(1500), "took {:?}", started.elapsed());
+    }
+
+    #[test]
+    fn hook_mode_disables_daemon_autostart_and_cli_fallback() {
+        set_hook_mode();
+        let started = Instant::now();
+        assert_eq!(maybe_autostart_ollama("http://127.0.0.1:1"), Ok(false));
+        assert!(started.elapsed() < Duration::from_millis(100));
+        let embedder = BedrockEmbedder::new("amazon.titan-embed-text-v2:0");
+        let err = embedder.invoke_model_cli(&serde_json::json!({ "inputText": "x" })).unwrap_err();
+        assert!(err.contains("hook mode"), "{}", err);
+    }
+}
 static LANCE_STORE: OnceLock<Mutex<Option<lance_store::LanceStore>>> = OnceLock::new();
 static PROGRESS_IO_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static CLI_DATA_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
@@ -61,6 +147,7 @@ const KNOWN_TOP_LEVEL_COMMANDS: &[&str] = &[
     "index",
     "refresh",
     "reembed",
+    "prune",
     "watch",
     "search",
     "pick",
@@ -75,6 +162,9 @@ const KNOWN_TOP_LEVEL_COMMANDS: &[&str] = &[
     "self-test",
     "graph",
     "legacy",
+    "recall",
+    "hook",
+    "service",
 ];
 
 #[derive(Default)]
@@ -349,6 +439,14 @@ where
     }
 }
 
+/// True once `get_or_open_lance` (or a rebuild) has installed a store for this process.
+fn lance_store_is_open() -> bool {
+    LANCE_STORE
+        .get()
+        .map(|lock| lock.lock().unwrap_or_else(|p| p.into_inner()).is_some())
+        .unwrap_or(false)
+}
+
 fn set_cli_data_dir_override(raw: &str) -> Result<(), String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -567,8 +665,12 @@ fn main() {
         "index" => run_index_cmd(&args[1..]),
         "refresh" => run_refresh_cmd(&args[1..]),
         "reembed" => run_reembed_cmd(&args[1..]),
+        "prune" => run_prune_cmd(&args[1..]),
         "watch" => run_watch_cmd(&args[1..]),
         "search" => run_search_cmd(&args[1..]),
+        "recall" => recall::run_recall_cmd(&args[1..]),
+        "hook" => hook_install::run_hook_cmd(&args[1..]),
+        "service" => hook_install::run_service_cmd(&args[1..]),
         "pick" => run_pick_cmd(&args[1..]),
         "jump" => run_jump_cmd(&args[1..]),
         "jump-feed" => run_jump_feed_cmd(&args[1..]),
@@ -811,6 +913,9 @@ fn print_help() {
     println!(
         "  retrivio reembed                    # rebuild vectors/graph after embed model change"
     );
+    println!(
+        "  retrivio prune [--dry-run] [path ...]  # drop index rows for files no longer in the corpus"
+    );
     println!("  retrivio watch [--interval <seconds>] [--debounce-ms <ms>] [--once] [--quiet]");
     println!("  retrivio search [--view projects|files] [--limit <n>] <query...>");
     println!(
@@ -827,6 +932,9 @@ fn print_help() {
     println!("  retrivio api [--host <addr>] [--port <n>]");
     println!("  retrivio mcp [serve|doctor|register|unregister]");
     println!("  retrivio self-test");
+    println!("  retrivio recall [--query <text>] [--cwd <dir>] [--session <id>] [--format json|text] [--reset-session]  # agent hook mode (reads hook JSON on stdin)");
+    println!("  retrivio hook [install|uninstall|status] [--claude] [--codex] [--yes]   # Claude Code / Codex UserPromptSubmit hooks");
+    println!("  retrivio service [install|uninstall|status]                            # background watcher (launchd)");
     println!();
     println!("Compatibility:");
     println!("  retrivio legacy <args...>   # explicit Python bridge");
@@ -2503,6 +2611,36 @@ fn config_rows() -> Vec<(&'static str, &'static str)> {
         ("graph_related_base", "Related-project graph base"),
         ("graph_related_scale", "Related-project graph scale"),
         ("graph_related_cap", "Related-project graph cap"),
+        ("hyde_enabled", "HyDE hypothetical-document query expansion (opt-in)"),
+        ("reranker_enabled", "Ollama cross-encoder re-ranking of chunk results"),
+        ("reranker_model", "Ollama model used for re-ranking"),
+        ("reranker_pool_size", "Re-ranker candidate pool size"),
+        ("reranker_batch_size", "Re-ranker parallel batch size"),
+        ("reranker_timeout_ms", "Re-ranker per-request timeout (ms)"),
+        ("rank_recency_weight", "Recency blend weight for living docs"),
+        ("rank_recency_record_weight", "Recency blend weight for records"),
+        ("recency_half_life_days", "Recency half-life for living docs (days)"),
+        (
+            "recency_record_half_life_days",
+            "Recency half-life for records (days)",
+        ),
+        (
+            "recency_record_patterns",
+            "Comma-separated path patterns that mark records",
+        ),
+        (
+            "skip_dir_names",
+            "Extra directory names skipped at discovery/indexing (comma-separated)",
+        ),
+        ("recall_max_leads", "Max leads injected by `retrivio recall`"),
+        ("recall_min_score_ratio", "Recall: min score ratio vs top lead"),
+        ("recall_min_abs_score", "Recall: min absolute score for the top lead"),
+        ("recall_band_ratio", "Recall: score band ratio for grouping leads"),
+        ("recall_roots", "Recall: comma-separated roots (empty = all tracked)"),
+        ("recall_excerpts", "Recall: include excerpts in leads"),
+        ("recall_system_message", "Recall: emit as system message"),
+        ("recall_semantic", "Recall: semantic retrieval mode"),
+        ("recall_session_ttl_days", "Recall: session memory TTL (days)"),
     ]
 }
 
@@ -2510,6 +2648,10 @@ fn config_enum_options(key: &str) -> Option<Vec<&'static str>> {
     match key {
         "embed_backend" => Some(vec!["ollama", "bedrock"]),
         "retrieval_backend" => Some(vec!["lancedb"]),
+        "recall_semantic" => Some(vec!["auto", "on", "off"]),
+        "hyde_enabled" | "reranker_enabled" | "recall_excerpts" | "recall_system_message" => {
+            Some(vec!["false", "true"])
+        }
         _ => None,
     }
 }
@@ -2556,6 +2698,29 @@ fn config_value_string(cfg: &ConfigValues, key: &str) -> Option<String> {
         "graph_related_base" => Some(format!("{:.6}", cfg.graph_related_base)),
         "graph_related_scale" => Some(format!("{:.6}", cfg.graph_related_scale)),
         "graph_related_cap" => Some(format!("{:.6}", cfg.graph_related_cap)),
+        "hyde_enabled" => Some(cfg.hyde_enabled.to_string()),
+        "reranker_enabled" => Some(cfg.reranker_enabled.to_string()),
+        "reranker_model" => Some(cfg.reranker_model.clone()),
+        "reranker_pool_size" => Some(cfg.reranker_pool_size.to_string()),
+        "reranker_batch_size" => Some(cfg.reranker_batch_size.to_string()),
+        "reranker_timeout_ms" => Some(cfg.reranker_timeout_ms.to_string()),
+        "rank_recency_weight" => Some(format!("{:.6}", cfg.rank_recency_weight)),
+        "rank_recency_record_weight" => Some(format!("{:.6}", cfg.rank_recency_record_weight)),
+        "recency_half_life_days" => Some(format!("{:.6}", cfg.recency_half_life_days)),
+        "recency_record_half_life_days" => {
+            Some(format!("{:.6}", cfg.recency_record_half_life_days))
+        }
+        "recency_record_patterns" => Some(cfg.recency_record_patterns.clone()),
+        "skip_dir_names" => Some(cfg.skip_dir_names.clone()),
+        "recall_max_leads" => Some(cfg.recall_max_leads.to_string()),
+        "recall_min_score_ratio" => Some(format!("{:.6}", cfg.recall_min_score_ratio)),
+        "recall_min_abs_score" => Some(format!("{:.6}", cfg.recall_min_abs_score)),
+        "recall_band_ratio" => Some(format!("{:.6}", cfg.recall_band_ratio)),
+        "recall_roots" => Some(cfg.recall_roots.clone()),
+        "recall_excerpts" => Some(cfg.recall_excerpts.to_string()),
+        "recall_system_message" => Some(cfg.recall_system_message.to_string()),
+        "recall_semantic" => Some(cfg.recall_semantic.clone()),
+        "recall_session_ttl_days" => Some(format!("{:.6}", cfg.recall_session_ttl_days)),
         _ => None,
     }
 }
@@ -2759,6 +2924,112 @@ fn config_set_value(cfg: &mut ConfigValues, key: &str, raw: &str) -> Result<(), 
                 .parse::<f64>()
                 .map_err(|_| "graph_related_cap must be a number".to_string())?
                 .clamp(0.0, 1.0);
+        }
+        "hyde_enabled" => cfg.hyde_enabled = parse_bool_setting(key, value)?,
+        "reranker_enabled" => cfg.reranker_enabled = parse_bool_setting(key, value)?,
+        "reranker_model" => {
+            if value.is_empty() {
+                return Err("reranker_model must not be empty".to_string());
+            }
+            cfg.reranker_model = value.to_string();
+        }
+        "reranker_pool_size" => {
+            cfg.reranker_pool_size = value
+                .parse::<usize>()
+                .map_err(|_| "reranker_pool_size must be an integer".to_string())?
+                .clamp(10, 200);
+        }
+        "reranker_batch_size" => {
+            cfg.reranker_batch_size = value
+                .parse::<usize>()
+                .map_err(|_| "reranker_batch_size must be an integer".to_string())?
+                .clamp(1, 32);
+        }
+        "reranker_timeout_ms" => {
+            cfg.reranker_timeout_ms = value
+                .parse::<u64>()
+                .map_err(|_| "reranker_timeout_ms must be an integer".to_string())?
+                .clamp(500, 30_000);
+        }
+        "rank_recency_weight" => {
+            cfg.rank_recency_weight = value
+                .parse::<f64>()
+                .map_err(|_| "rank_recency_weight must be a number".to_string())?
+                .clamp(0.0, 0.5);
+        }
+        "rank_recency_record_weight" => {
+            cfg.rank_recency_record_weight = value
+                .parse::<f64>()
+                .map_err(|_| "rank_recency_record_weight must be a number".to_string())?
+                .clamp(0.0, 0.5);
+        }
+        "recency_half_life_days" => {
+            cfg.recency_half_life_days = value
+                .parse::<f64>()
+                .map_err(|_| "recency_half_life_days must be a number".to_string())?
+                .clamp(1.0, 3650.0);
+        }
+        "recency_record_half_life_days" => {
+            cfg.recency_record_half_life_days = value
+                .parse::<f64>()
+                .map_err(|_| "recency_record_half_life_days must be a number".to_string())?
+                .clamp(1.0, 3650.0);
+        }
+        "recency_record_patterns" => {
+            cfg.recency_record_patterns = split_csv_setting(value).join(",");
+        }
+        "skip_dir_names" => {
+            for name in split_csv_setting(value) {
+                if name.contains('/') || name == "." || name == ".." {
+                    return Err(format!(
+                        "skip_dir_names entries must be bare directory names, got '{}'",
+                        name
+                    ));
+                }
+            }
+            cfg.skip_dir_names = split_csv_setting(value).join(",");
+        }
+        "recall_max_leads" => {
+            cfg.recall_max_leads = value
+                .parse::<usize>()
+                .map_err(|_| "recall_max_leads must be an integer".to_string())?
+                .clamp(1, 5);
+        }
+        "recall_min_score_ratio" => {
+            cfg.recall_min_score_ratio = value
+                .parse::<f64>()
+                .map_err(|_| "recall_min_score_ratio must be a number".to_string())?
+                .clamp(0.1, 1.0);
+        }
+        "recall_min_abs_score" => {
+            cfg.recall_min_abs_score = value
+                .parse::<f64>()
+                .map_err(|_| "recall_min_abs_score must be a number".to_string())?
+                .clamp(0.0, 1.0);
+        }
+        "recall_band_ratio" => {
+            cfg.recall_band_ratio = value
+                .parse::<f64>()
+                .map_err(|_| "recall_band_ratio must be a number".to_string())?
+                .clamp(0.5, 1.0);
+        }
+        "recall_roots" => {
+            cfg.recall_roots = split_csv_setting(value).join(",");
+        }
+        "recall_excerpts" => cfg.recall_excerpts = parse_bool_setting(key, value)?,
+        "recall_system_message" => cfg.recall_system_message = parse_bool_setting(key, value)?,
+        "recall_semantic" => {
+            let v = value.to_lowercase();
+            if !matches!(v.as_str(), "auto" | "on" | "off") {
+                return Err("recall_semantic must be one of: auto, on, off".to_string());
+            }
+            cfg.recall_semantic = v;
+        }
+        "recall_session_ttl_days" => {
+            cfg.recall_session_ttl_days = value
+                .parse::<f64>()
+                .map_err(|_| "recall_session_ttl_days must be a number".to_string())?
+                .clamp(1.0, 30.0);
         }
         _ => return Err(format!("unknown config key '{}'", key)),
     }
@@ -7758,7 +8029,7 @@ fn render_shell_init_script(shell: &str) -> String {
         .unwrap_or_default();
     let exec_q = shell_escape(&exec_path);
     let wrapper_env = SHELL_WRAPPER_ENV;
-    let passthrough = "init|install|setup|auth|add|del|roots|index|refresh|reembed|watch|search|pick|jump|doctor|config|autotune|version|api|mcp|self-test|graph|bench|daemon|legacy|ui|stop|help|-h|--help";
+    let passthrough = "init|install|setup|auth|add|del|roots|index|refresh|reembed|prune|watch|search|pick|jump|doctor|config|autotune|version|api|mcp|self-test|graph|bench|daemon|legacy|ui|stop|recall|hook|service|help|-h|--help";
 
     match shell {
         "fish" => format!(
@@ -8365,7 +8636,7 @@ fn run_add(args: &[OsString]) {
         run_index_with_strategy(
             &cwd,
             &cfg,
-            Some(added.clone()),
+            IndexScope::roots(added.clone()),
             true,
             Some(force_paths),
             false,
@@ -8434,7 +8705,15 @@ fn run_del(args: &[OsString]) {
         }
     }
     if refresh {
-        run_index_with_strategy(&cwd, &_cfg, None, false, None, true, "delete refresh")
+        run_index_with_strategy(
+            &cwd,
+            &_cfg,
+            IndexScope::AllRoots,
+            false,
+            None,
+            true,
+            "delete refresh",
+        )
             .unwrap_or_else(|e| {
                 eprintln!("error: {}", e);
                 process::exit(1);
@@ -8613,7 +8892,16 @@ fn run_index_cmd(args: &[OsString]) {
     let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let cfg_path = config_path(&cwd);
     let cfg = ConfigValues::from_map(load_config_values(&cfg_path));
-    run_index_with_strategy(&cwd, &cfg, None, false, None, true, "index").unwrap_or_else(|e| {
+    run_index_with_strategy(
+        &cwd,
+        &cfg,
+        IndexScope::AllRoots,
+        false,
+        None,
+        true,
+        "index",
+    )
+    .unwrap_or_else(|e| {
         eprintln!("error: {}", e);
         process::exit(1);
     });
@@ -8622,6 +8910,13 @@ fn run_index_cmd(args: &[OsString]) {
 fn run_refresh_cmd(args: &[OsString]) {
     if args.iter().any(|a| a == "-h" || a == "--help") {
         println!("usage: retrivio refresh [path ...]");
+        println!("re-collects and re-embeds projects regardless of modification times.");
+        println!("  no path     every project under every tracked root (also drops projects");
+        println!("              whose directory is gone)");
+        println!("  path        a tracked root: every project discovered under it");
+        println!("              a project directory: exactly that project (its child directories");
+        println!("              are never treated as projects of their own)");
+        println!("              anything else is an error naming the project or root to use");
         return;
     }
 
@@ -8636,27 +8931,29 @@ fn run_refresh_cmd(args: &[OsString]) {
             eprintln!("error: unknown option '{}'", s);
             process::exit(2);
         }
-        let p = normalize_path(&s);
-        if !p.is_dir() {
-            eprintln!("skip (not a directory): {}", p.display());
-            continue;
-        }
-        scoped.push(p);
+        scoped.push(normalize_path(&s));
     }
 
-    let (scope_roots, force_paths, remove_missing) = if scoped.is_empty() {
-        (None, None, true)
+    let (scope, remove_missing) = if scoped.is_empty() {
+        (IndexScope::AllRoots, true)
     } else {
-        let force_set: HashSet<PathBuf> = scoped.iter().cloned().collect();
-        (Some(scoped.clone()), Some(force_set), false)
+        let conn = open_db_rw(&db_path(&cwd)).unwrap_or_else(|e| {
+            eprintln!("error: {}", e);
+            process::exit(1);
+        });
+        let scope = plan_scoped_refresh(&conn, &cfg, &scoped).unwrap_or_else(|e| {
+            eprintln!("error: {}", e);
+            process::exit(2);
+        });
+        (scope, false)
     };
 
     run_index_with_strategy(
         &cwd,
         &cfg,
-        scope_roots,
+        scope,
         true,
-        force_paths,
+        None,
         remove_missing,
         "refresh",
     )
@@ -8695,7 +8992,7 @@ fn run_reembed_cmd(args: &[OsString]) {
     let mut stats = run_native_index(
         &cwd,
         &cfg,
-        None,
+        IndexScope::AllRoots,
         true,
         HashSet::new(),
         true,
@@ -8743,19 +9040,478 @@ fn run_reembed_cmd(args: &[OsString]) {
     println!("reembed: complete (model={})", model_key);
 }
 
+fn run_prune_cmd(args: &[OsString]) {
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        println!("usage: retrivio prune [--dry-run] [--no-compact] [path ...]");
+        println!("removes index rows for files that are no longer part of a project's corpus:");
+        println!("deleted files, files under excluded or skip_dir_names directories, files past the");
+        println!("per-project caps. Drops their chunks, LanceDB vectors, manifest, symbol and import");
+        println!("rows; removes projects whose directory is gone or excluded; and deletes LanceDB");
+        println!("vectors that have no sqlite chunk. Re-reads and re-chunks files (no embedding).");
+        println!("Real runs end by compacting LanceDB (deletes are tombstones until then) and");
+        println!("dropping its old versions, which is what returns disk space.");
+        println!("  --dry-run     report what would be removed without writing anything");
+        println!("  --no-compact  skip the LanceDB compaction at the end");
+        println!("  path ...      only projects at or under these directories");
+        return;
+    }
+    let mut dry_run = false;
+    let mut compact = true;
+    let mut scoped: Vec<PathBuf> = Vec::new();
+    for raw in args {
+        let s = raw.to_string_lossy().to_string();
+        if s == "--dry-run" || s == "-n" {
+            dry_run = true;
+            continue;
+        }
+        if s == "--no-compact" {
+            compact = false;
+            continue;
+        }
+        if s.starts_with('-') {
+            eprintln!("error: unknown option '{}'", s);
+            process::exit(2);
+        }
+        let p = normalize_path(&s);
+        if !p.is_dir() {
+            eprintln!(
+                "note: {} is not a directory; only stale project rows under it can be pruned",
+                p.display()
+            );
+        }
+        scoped.push(p);
+    }
+
+    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let cfg_path = config_path(&cwd);
+    let cfg = ConfigValues::from_map(load_config_values(&cfg_path));
+    let scope = if scoped.is_empty() {
+        None
+    } else {
+        Some(scoped)
+    };
+    if let Err(e) = run_prune(&cwd, &cfg, scope, dry_run, compact) {
+        eprintln!("error: {}", e);
+        process::exit(1);
+    }
+}
+
+/// `retrivio prune`: re-collect every in-scope project's corpus with the same code path
+/// indexing uses (excludes, skip dirs, indexable suffixes, size limits, caps, chunking, but
+/// no embedding) and delete the rows the corpus no longer covers. Then drop project rows
+/// whose directory vanished or is no longer discovered, and LanceDB rows with no sqlite
+/// vector. Real runs then compact LanceDB and drop its old versions (unless `compact` is
+/// off), which is what actually frees disk space. With `dry_run`, only report.
+fn run_prune(
+    cwd: &Path,
+    cfg: &ConfigValues,
+    scope: Option<Vec<PathBuf>>,
+    dry_run: bool,
+    compact: bool,
+) -> Result<(), String> {
+    let t_start = Instant::now();
+    set_extra_skip_dirs(cfg);
+    let dbp = db_path(cwd);
+    if !dbp.exists() {
+        return Err("no index database found; run `retrivio index` first".to_string());
+    }
+    let conn = open_db_rw(&dbp)?;
+    let roots = resolve_roots(&conn, cfg, None)?;
+    if roots.is_empty() {
+        return Err("No tracked roots configured. Add one with `retrivio add <path>`.".to_string());
+    }
+    let scope_set: Option<HashSet<PathBuf>> = scope.map(|v| v.into_iter().collect());
+    let in_scope = |p: &Path| scope_set.as_ref().map_or(true, |s| is_under_any(p, s));
+    let discovered = discover_projects(&roots);
+    let discovered_set: HashSet<String> = discovered
+        .iter()
+        .map(|p| p.to_string_lossy().to_string())
+        .collect();
+    let projects: Vec<PathBuf> = discovered.into_iter().filter(|p| in_scope(p)).collect();
+
+    let model_key = model_key_for_cfg(cfg);
+    let lance_ready = match vector_dim_from_sqlite(&conn, &model_key) {
+        // A dry run must not create the LanceDB directory or table.
+        Some(_) if dry_run && !data_dir(cwd).join("lance").exists() => false,
+        Some(dim) => match get_or_open_lance(cwd, dim) {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!("warning: LanceDB open failed ({}); pruning sqlite only", e);
+                false
+            }
+        },
+        None => false,
+    };
+
+    let verb = if dry_run { "would prune" } else { "pruned" };
+    println!(
+        "prune: {} projects in scope{}",
+        projects.len(),
+        if dry_run { " (dry run)" } else { "" }
+    );
+
+    let max_chars = cfg.max_chars_per_project as usize;
+    const PRUNE_PARALLELISM: usize = 4;
+    let mut total = PruneOutcome::default();
+    let mut projects_pruned = 0usize;
+    let mut projects_skipped = 0usize;
+    let mut lance_deleted = 0usize;
+    let mut lance_delete_failed = 0usize;
+    for work in projects.chunks(PRUNE_PARALLELISM) {
+        let results = Mutex::new(Vec::<(usize, PathBuf, Result<ProjectCorpus, String>)>::new());
+        thread::scope(|s| {
+            let handles: Vec<_> = work
+                .iter()
+                .enumerate()
+                .map(|(i, dir)| {
+                    let results = &results;
+                    let roots = &roots;
+                    s.spawn(move || {
+                        // An unreadable directory (unmounted volume, permissions) must not
+                        // read as an empty corpus and wipe the project's rows.
+                        let result = match fs::read_dir(dir) {
+                            Err(e) => Err(format!("cannot read {}: {}", dir.display(), e)),
+                            Ok(_) => {
+                                let excludes = project_excludes_for_path(dir, roots);
+                                collect_project_corpus(dir, max_chars, 0.0, &excludes)
+                            }
+                        };
+                        if let Ok(mut v) = results.lock() {
+                            v.push((i, dir.clone(), result));
+                        }
+                    })
+                })
+                .collect();
+            for h in handles {
+                let _ = h.join();
+            }
+        });
+        let mut corpora = results.into_inner().unwrap_or_default();
+        corpora.sort_by_key(|(i, _, _)| *i);
+        for (_, dir, corpus_result) in corpora {
+            let corpus = match corpus_result {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("  skip (nothing pruned): {}", e);
+                    projects_skipped += 1;
+                    continue;
+                }
+            };
+            let path_str = dir.to_string_lossy().to_string();
+            // Never indexed: nothing to prune.
+            let Some(row) = get_project_by_path(&conn, &path_str)? else {
+                continue;
+            };
+            let keep = PruneKeepSet::from_chunks(&corpus.chunks);
+            let outcome = prune_stale_project_rows(&conn, row.id, &keep, dry_run)?;
+            if outcome.is_empty() {
+                continue;
+            }
+            projects_pruned += 1;
+            let name = dir
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("project");
+            let mut extras: Vec<String> = Vec::new();
+            if outcome.manifest_rows > 0 {
+                extras.push(format!("{} manifest", outcome.manifest_rows));
+            }
+            if outcome.symbol_rows > 0 {
+                extras.push(format!("{} symbols", outcome.symbol_rows));
+            }
+            if outcome.import_rows > 0 {
+                extras.push(format!("{} imports", outcome.import_rows));
+            }
+            if outcome.edge_rows > 0 {
+                extras.push(format!("{} edges", outcome.edge_rows));
+            }
+            println!(
+                "  {} {}: {} chunks from {} files{}",
+                verb,
+                name,
+                outcome.chunks,
+                outcome.files,
+                if extras.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (+ {})", extras.join(", "))
+                }
+            );
+            if !dry_run && lance_ready && !outcome.chunk_ids.is_empty() {
+                match delete_lance_vectors_for_chunks(&outcome.chunk_ids) {
+                    Ok(n) => lance_deleted += n,
+                    Err(e) => {
+                        lance_delete_failed += outcome.chunk_ids.len();
+                        eprintln!("warning: LanceDB delete failed for {}: {}", name, e);
+                    }
+                }
+            }
+            total.absorb(outcome);
+        }
+    }
+
+    // Projects whose directory vanished, is now excluded, or whose root is no longer tracked.
+    // Projects under a tracked root that is not readable right now are left alone.
+    let unavailable_roots: HashSet<PathBuf> = roots
+        .iter()
+        .filter(|r| !r.path.is_dir())
+        .map(|r| r.path.clone())
+        .collect();
+    for root in &unavailable_roots {
+        println!(
+            "  note: tracked root {} is not readable now; its projects are left alone",
+            root.display()
+        );
+    }
+    let mut stale_projects = 0usize;
+    let mut stale_project_chunks = 0usize;
+    let project_rows: Vec<(i64, String)> = {
+        let mut stmt = conn
+            .prepare("SELECT id, path FROM projects ORDER BY path")
+            .map_err(|e| format!("failed preparing project list query: {}", e))?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))
+            .map_err(|e| format!("failed listing projects: {}", e))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| format!("failed reading project row: {}", e))?);
+        }
+        out
+    };
+    for (id, path) in project_rows {
+        if discovered_set.contains(&path)
+            || !in_scope(Path::new(&path))
+            || is_under_any(Path::new(&path), &unavailable_roots)
+        {
+            continue;
+        }
+        let ids = project_chunk_ids(&conn, id)?;
+        let reason = if Path::new(&path).is_dir() {
+            "excluded or root no longer tracked"
+        } else {
+            "directory missing"
+        };
+        println!(
+            "  {} project {} ({}; {} chunks)",
+            if dry_run { "would remove" } else { "removed" },
+            path,
+            reason,
+            ids.len()
+        );
+        if !dry_run {
+            conn.execute("DELETE FROM projects WHERE id = ?1", params![id])
+                .map_err(|e| format!("failed deleting stale project row: {}", e))?;
+            if lance_ready && !ids.is_empty() {
+                match delete_lance_vectors_for_chunks(&ids) {
+                    Ok(n) => lance_deleted += n,
+                    Err(e) => {
+                        lance_delete_failed += ids.len();
+                        eprintln!("warning: LanceDB delete failed for {}: {}", path, e);
+                    }
+                }
+            }
+        }
+        stale_projects += 1;
+        stale_project_chunks += ids.len();
+    }
+
+    // LanceDB rows nothing in sqlite refers to any more.
+    let mut lance_orphans = 0usize;
+    let mut lance_rows_after: Option<usize> = None;
+    if lance_ready {
+        match lance_orphan_chunk_ids(&conn) {
+            Ok(orphans) => {
+                lance_orphans = orphans.len();
+                if !orphans.is_empty() {
+                    println!(
+                        "  {} {} LanceDB vectors with no sqlite chunk",
+                        verb,
+                        orphans.len()
+                    );
+                    if !dry_run {
+                        match delete_lance_vectors_for_chunks(&orphans) {
+                            Ok(n) => lance_deleted += n,
+                            Err(e) => {
+                                lance_delete_failed += orphans.len();
+                                eprintln!("warning: LanceDB orphan delete failed: {}", e);
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => eprintln!("warning: LanceDB orphan scan failed: {}", e),
+        }
+        lance_rows_after = with_lance_store(|store| lance_store::count(store)).ok();
+    }
+    if !dry_run {
+        conn.execute_batch("PRAGMA optimize;")
+            .map_err(|e| format!("database optimize failed: {}", e))?;
+    }
+    let sqlite_chunks: i64 = conn
+        .query_row("SELECT COUNT(*) FROM project_chunks", [], |row| row.get(0))
+        .map_err(|e| format!("failed counting chunks: {}", e))?;
+
+    println!(
+        "prune summary{}:",
+        if dry_run {
+            " (dry run, nothing written)"
+        } else {
+            ""
+        }
+    );
+    println!("  projects scanned: {}", projects.len());
+    println!("  projects with stale rows: {}", projects_pruned);
+    if projects_skipped > 0 {
+        println!("  projects skipped (unreadable): {}", projects_skipped);
+    }
+    println!(
+        "  chunks {}: {} (from {} files)",
+        verb, total.chunks, total.files
+    );
+    println!(
+        "  manifest rows: {}, symbol rows: {}, import rows: {}, dependency edges: {}",
+        total.manifest_rows, total.symbol_rows, total.import_rows, total.edge_rows
+    );
+    println!(
+        "  stale projects {}: {} ({} chunks)",
+        if dry_run { "to remove" } else { "removed" },
+        stale_projects,
+        stale_project_chunks
+    );
+    if lance_ready {
+        if dry_run {
+            println!(
+                "  lancedb vectors to delete: {} from stale rows + {} orphans",
+                total.chunks + stale_project_chunks,
+                lance_orphans
+            );
+        } else {
+            println!(
+                "  lancedb vectors deleted: {} ({} from stale rows, {} orphans{})",
+                lance_deleted,
+                total.chunks + stale_project_chunks,
+                lance_orphans,
+                if lance_delete_failed > 0 {
+                    format!(", {} failed", lance_delete_failed)
+                } else {
+                    String::new()
+                }
+            );
+        }
+        if let Some(n) = lance_rows_after {
+            println!("  lancedb rows now: {}", n);
+        }
+        // Deleted rows are tombstones and every write is a new version kept on disk, so the
+        // directory only shrinks once fragments are rewritten and old versions dropped.
+        let lance_dir = data_dir(cwd).join("lance");
+        let size_before = lance_store::dir_size_bytes(&lance_dir);
+        if dry_run {
+            println!(
+                "  lancedb on disk: {} (a real run compacts it afterwards)",
+                format_bytes(size_before)
+            );
+        } else if !compact {
+            println!(
+                "  lancedb on disk: {} (compaction skipped: --no-compact)",
+                format_bytes(size_before)
+            );
+        } else {
+            let t_compact = Instant::now();
+            match with_lance_store(|store| lance_store::optimize(store)) {
+                Ok(report) => {
+                    let size_after = lance_store::dir_size_bytes(&lance_dir);
+                    println!(
+                        "  lancedb compacted: {} -> {} on disk; rewrote {} fragments into {}, dropped {} old versions ({})",
+                        format_bytes(size_before),
+                        format_bytes(size_after),
+                        report.fragments_removed,
+                        report.fragments_added,
+                        report.old_versions,
+                        format_duration_ms(t_compact.elapsed().as_millis() as u64)
+                    );
+                }
+                Err(e) => eprintln!("warning: LanceDB compaction failed: {}", e),
+            }
+        }
+    } else {
+        println!(
+            "  lancedb: skipped (no vectors for model {} yet)",
+            model_key
+        );
+    }
+    println!("  sqlite chunks now: {}", sqlite_chunks);
+    println!(
+        "  elapsed: {}",
+        format_duration_ms(t_start.elapsed().as_millis() as u64)
+    );
+    Ok(())
+}
+
+/// Human-readable byte count: 512 B, 3.4 KB, 1.52 GB.
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0usize;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{} B", bytes)
+    } else if value >= 100.0 {
+        format!("{:.0} {}", value, UNITS[unit])
+    } else if value >= 10.0 {
+        format!("{:.1} {}", value, UNITS[unit])
+    } else {
+        format!("{:.2} {}", value, UNITS[unit])
+    }
+}
+
 fn run_search_cmd(args: &[OsString]) {
     if args.iter().any(|a| a == "-h" || a == "--help") {
-        println!("usage: retrivio search [--view projects|files] [--limit <n>] <query...>");
+        println!(
+            "usage: retrivio search [--view projects|files] [--limit <n>] [--since <days>] [--json] <query...>"
+        );
+        println!("  --since <days>  files view only: drop results whose content date is older");
+        println!("  --json          emit the same JSON payload as the API GET /search");
         return;
     }
 
     let mut limit: usize = 20;
     let mut view = "projects".to_string();
+    let mut json_output = false;
+    let mut since_days: Option<f64> = None;
     let mut query_parts: Vec<String> = Vec::new();
+
+    let parse_since = |v: &str| -> f64 {
+        match v.trim().parse::<f64>() {
+            Ok(d) if d.is_finite() && d > 0.0 => d,
+            _ => {
+                eprintln!("error: --since must be a positive number of days");
+                process::exit(2);
+            }
+        }
+    };
 
     let mut i = 0usize;
     while i < args.len() {
         let s = args[i].to_string_lossy().to_string();
+        if s == "--json" {
+            json_output = true;
+            i += 1;
+            continue;
+        }
+        if s == "--since" {
+            i += 1;
+            since_days = Some(parse_since(&arg_value(args, i, "--since")));
+            i += 1;
+            continue;
+        }
+        if let Some(v) = s.strip_prefix("--since=") {
+            since_days = Some(parse_since(v));
+            i += 1;
+            continue;
+        }
         if s == "--limit" {
             i += 1;
             let v = arg_value(args, i, "--limit");
@@ -8797,6 +9553,10 @@ fn run_search_cmd(args: &[OsString]) {
         eprintln!("error: --view must be one of: projects, files");
         process::exit(2);
     }
+    if since_days.is_some() && view != "files" {
+        eprintln!("error: --since requires --view files");
+        process::exit(2);
+    }
     if query_parts.is_empty() {
         eprintln!("error: query is empty");
         process::exit(2);
@@ -8806,6 +9566,7 @@ fn run_search_cmd(args: &[OsString]) {
     }
 
     let query = query_parts.join(" ");
+    let search_started = Instant::now();
     let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let cfg_path = config_path(&cwd);
     let cfg = ConfigValues::from_map(load_config_values(&cfg_path));
@@ -8829,10 +9590,18 @@ fn run_search_cmd(args: &[OsString]) {
     });
 
     if view == "files" {
-        let rows = rank_files_native(&conn, &cfg, &query, limit).unwrap_or_else(|e| {
+        let opts = RankOptions {
+            since_days,
+            ..RankOptions::default()
+        };
+        let rows = rank_files_native_with(&conn, &cfg, &query, limit, opts).unwrap_or_else(|e| {
             eprintln!("error: {}", e);
             process::exit(1);
         });
+        if json_output {
+            println!("{}", search_files_response_json(&query, &rows, search_started));
+            return;
+        }
         if rows.is_empty() {
             println!("No file results found.");
             return;
@@ -8845,6 +9614,10 @@ fn run_search_cmd(args: &[OsString]) {
         eprintln!("error: {}", e);
         process::exit(1);
     });
+    if json_output {
+        println!("{}", search_projects_response_json(&query, &rows, search_started));
+        return;
+    }
     if rows.is_empty() {
         println!("No results found.");
         return;
@@ -8995,17 +9768,20 @@ fn watch_path_relevant(path: &Path) -> bool {
     is_indexable_suffix(&format!(".{}", ext))
 }
 
+/// Map changed paths onto what to index: a path inside a known project forces that project
+/// (as a project, never as a root to discover); a path under a tracked root but outside every
+/// known project (a new directory) sends discovery to that root.
 fn derive_watch_targets(
     pending_paths: &HashSet<PathBuf>,
     tracked_roots: &[TrackedRoot],
-) -> (Vec<PathBuf>, HashSet<PathBuf>) {
+) -> (IndexScope, HashSet<PathBuf>) {
     if pending_paths.is_empty() || tracked_roots.is_empty() {
-        return (Vec::new(), HashSet::new());
+        return (IndexScope::projects(Vec::new()), HashSet::new());
     }
     let known_projects = discover_projects(tracked_roots);
     let root_paths: Vec<PathBuf> = tracked_roots.iter().map(|r| r.path.clone()).collect();
-    let mut scope_set: HashSet<String> = HashSet::new();
-    let mut force_set: HashSet<String> = HashSet::new();
+    let mut root_set: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
+    let mut project_set: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
 
     for raw in pending_paths {
         let path = normalize_watch_path(raw);
@@ -9016,18 +9792,18 @@ fn derive_watch_targets(
             continue;
         };
         if let Some(project) = longest_prefix_match(&path, &known_projects) {
-            let key = project.to_string_lossy().to_string();
-            scope_set.insert(key.clone());
-            force_set.insert(key);
+            project_set.insert(normalize_path(&project.to_string_lossy()));
         } else {
-            scope_set.insert(root.to_string_lossy().to_string());
+            root_set.insert(normalize_path(&root.to_string_lossy()));
         }
     }
 
-    let mut scope_roots: Vec<PathBuf> = scope_set.into_iter().map(|v| normalize_path(&v)).collect();
-    scope_roots.sort();
-    let force_paths: HashSet<PathBuf> = force_set.into_iter().map(|v| normalize_path(&v)).collect();
-    (scope_roots, force_paths)
+    let force_paths: HashSet<PathBuf> = project_set.iter().cloned().collect();
+    let scope = IndexScope::Targets {
+        roots: root_set.into_iter().collect(),
+        projects: project_set.into_iter().collect(),
+    };
+    (scope, force_paths)
 }
 
 fn run_watch_event_loop(
@@ -9077,17 +9853,17 @@ fn run_watch_event_loop(
                 .map(|t| t.elapsed() >= debounce)
                 .unwrap_or(false)
         {
-            let (scope_roots, force_paths) = derive_watch_targets(&pending_paths, tracked_roots);
+            let (scope, force_paths) = derive_watch_targets(&pending_paths, tracked_roots);
             pending_paths.clear();
             last_event_at = None;
-            if scope_roots.is_empty() {
+            if scope.is_empty() {
                 continue;
             }
             ensure_retrieval_backend_ready(cfg, true, "watch events")?;
             let stats = run_native_index(
                 cwd,
                 cfg,
-                Some(scope_roots),
+                scope,
                 false,
                 force_paths,
                 false,
@@ -9102,7 +9878,7 @@ fn run_watch_event_loop(
             let stats = run_native_index(
                 cwd,
                 cfg,
-                None,
+                IndexScope::AllRoots,
                 false,
                 HashSet::new(),
                 true,
@@ -9127,7 +9903,7 @@ fn run_watch_polling_loop(cwd: &Path, cfg: &ConfigValues, interval_seconds: f64,
         let stats = run_native_index(
             cwd,
             cfg,
-            None,
+            IndexScope::AllRoots,
             false,
             HashSet::new(),
             true,
@@ -9209,6 +9985,7 @@ fn run_watch_cmd(args: &[OsString]) {
     let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let cfg_path = config_path(&cwd);
     let cfg = ConfigValues::from_map(load_config_values(&cfg_path));
+    set_extra_skip_dirs(&cfg);
     ensure_native_embed_backend(&cfg, "watch").unwrap_or_else(|e| {
         eprintln!("error: {}", e);
         eprintln!(
@@ -9247,7 +10024,7 @@ fn run_watch_cmd(args: &[OsString]) {
     let bootstrap = run_native_index(
         &cwd,
         &cfg,
-        None,
+        IndexScope::AllRoots,
         false,
         HashSet::new(),
         true,
@@ -12354,6 +13131,12 @@ fn parse_limit(raw: Option<&String>, default: usize, max_limit: usize) -> usize 
     parsed.max(1).min(max_limit)
 }
 
+/// `since_days` query parameter: a positive finite number of days, otherwise no filter.
+fn parse_since_days(raw: Option<&String>) -> Option<f64> {
+    raw.and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|d| d.is_finite() && *d > 0.0)
+}
+
 fn parse_bool_flag(raw: Option<&String>) -> bool {
     let Some(v) = raw else {
         return false;
@@ -13202,106 +13985,23 @@ fn handle_api_request(req: ApiRequest) -> (u16, Value) {
                 Ok(v) => v,
                 Err(e) => return (500, serde_json::json!({"error": e})),
             };
+            let since_days = parse_since_days(req.query.get("since_days"));
             if view == "files" {
-                let rows = match rank_files_native(&conn, &cfg, &q, limit) {
+                let opts = RankOptions {
+                    since_days,
+                    ..RankOptions::default()
+                };
+                let rows = match rank_files_native_with(&conn, &cfg, &q, limit, opts) {
                     Ok(v) => v,
                     Err(e) => return (503, serde_json::json!({"error": e})),
                 };
-                let results: Vec<Value> = rows
-                    .into_iter()
-                    .map(|item| {
-                        let evidence: Vec<Value> = item
-                            .evidence
-                            .into_iter()
-                            .map(|ev| {
-                                serde_json::json!({
-                                    "chunk_id": ev.chunk_id,
-                                    "chunk_index": ev.chunk_index,
-                                    "doc_path": ev.doc_path,
-                                    "doc_rel_path": ev.doc_rel_path,
-                                    "score": ev.score,
-                                    "semantic": ev.semantic,
-                                    "lexical": ev.lexical,
-                                    "graph": ev.graph,
-                                    "relation": ev.relation,
-                                    "quality": ev.quality,
-                                    "excerpt": ev.excerpt,
-                                })
-                            })
-                            .collect();
-                        serde_json::json!({
-                            "path": item.path,
-                            "project_path": item.project_path,
-                            "doc_rel_path": item.doc_rel_path,
-                            "chunk_id": item.chunk_id,
-                            "chunk_index": item.chunk_index,
-                            "score": item.score,
-                            "semantic": item.semantic,
-                            "lexical": item.lexical,
-                            "graph": item.graph,
-                            "relation": item.relation,
-                            "quality": item.quality,
-                            "excerpt": item.excerpt,
-                            "evidence": evidence,
-                        })
-                    })
-                    .collect();
-                return (
-                    200,
-                    serde_json::json!({
-                        "query": q,
-                        "view": "files",
-                        "results": results,
-                        "timing_ms": search_started.elapsed().as_secs_f64() * 1000.0
-                    }),
-                );
+                return (200, search_files_response_json(&q, &rows, search_started));
             }
             let rows = match rank_projects_native(&conn, &cfg, &q, limit) {
                 Ok(v) => v,
                 Err(e) => return (503, serde_json::json!({"error": e})),
             };
-            let results: Vec<Value> = rows
-                .into_iter()
-                .map(|item| {
-                    let evidence: Vec<Value> = item
-                        .evidence
-                        .into_iter()
-                        .map(|ev| {
-                            serde_json::json!({
-                                "chunk_id": ev.chunk_id,
-                                "chunk_index": ev.chunk_index,
-                                "doc_path": ev.doc_path,
-                                "doc_rel_path": ev.doc_rel_path,
-                                "score": ev.score,
-                                "semantic": ev.semantic,
-                                "lexical": ev.lexical,
-                                "graph": ev.graph,
-                                "relation": ev.relation,
-                                "quality": ev.quality,
-                                "excerpt": ev.excerpt,
-                            })
-                        })
-                        .collect();
-                    serde_json::json!({
-                        "path": item.path,
-                        "score": item.score,
-                        "semantic": item.semantic,
-                        "lexical": item.lexical,
-                        "frecency": item.frecency,
-                        "graph": item.graph,
-                        "evidence": evidence,
-                    })
-                })
-                .collect();
-            return (
-                200,
-                serde_json::json!({
-                    "query": q,
-                    "view": "projects",
-                    "results": results,
-                    "timing_ms": search_started.elapsed().as_secs_f64() * 1000.0
-                }),
-            );
+            return (200, search_projects_response_json(&q, &rows, search_started));
         }
         ("GET", "/chunks/search") => {
             let query = req.query.get("q").cloned().unwrap_or_default();
@@ -13313,6 +14013,7 @@ fn handle_api_request(req: ApiRequest) -> (u16, Value) {
                 );
             }
             let limit = parse_limit(req.query.get("limit"), 30, 300);
+            let since_days = parse_since_days(req.query.get("since_days"));
             let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
             let cfg = ConfigValues::from_map(load_config_values(&config_path(&cwd)));
             if let Err(e) = ensure_native_embed_backend(&cfg, "api chunks/search") {
@@ -13325,7 +14026,7 @@ fn handle_api_request(req: ApiRequest) -> (u16, Value) {
                 Ok(v) => v,
                 Err(e) => return (500, serde_json::json!({"error": e})),
             };
-            let rows = match rank_chunks_native(&conn, &cfg, &q, limit) {
+            let rows = match rank_chunks_native_with(&conn, &cfg, &q, limit, since_days) {
                 Ok(v) => v,
                 Err(e) => return (503, serde_json::json!({"error": e})),
             };
@@ -13948,7 +14649,7 @@ fn handle_api_request(req: ApiRequest) -> (u16, Value) {
                 run_native_index(
                     &cwd,
                     &cfg,
-                    None,
+                    IndexScope::AllRoots,
                     true,
                     HashSet::new(),
                     true,
@@ -13956,20 +14657,28 @@ fn handle_api_request(req: ApiRequest) -> (u16, Value) {
                     "api refresh",
                 )
             } else {
-                let roots = unique_valid_dirs(&raw_paths);
-                if roots.is_empty() {
+                let dirs = unique_valid_dirs(&raw_paths);
+                if dirs.is_empty() {
                     return (
                         400,
                         serde_json::json!({"error": "No valid directory paths provided."}),
                     );
                 }
-                let force_paths: HashSet<PathBuf> = roots.iter().cloned().collect();
+                let conn = match open_db_rw(&db_path(&cwd)) {
+                    Ok(v) => v,
+                    Err(e) => return (500, serde_json::json!({"error": e})),
+                };
+                let scope = match plan_scoped_refresh(&conn, &cfg, &dirs) {
+                    Ok(v) => v,
+                    Err(e) => return (400, serde_json::json!({"error": e})),
+                };
+                drop(conn);
                 run_native_index(
                     &cwd,
                     &cfg,
-                    Some(roots),
+                    scope,
                     true,
-                    force_paths,
+                    HashSet::new(),
                     false,
                     false,
                     "api refresh",
@@ -14731,24 +15440,26 @@ fn mcp_tool_specs() -> Vec<Value> {
         }),
         serde_json::json!({
             "name": "search_files",
-            "description": "Semantic search across indexed files (with project context).",
+            "description": "Semantic search across indexed files (with project context). Results carry content_date, age_days, freshness_tier and is_record.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "query": {"type": "string"},
-                    "limit": {"type": "integer", "default": 20}
+                    "limit": {"type": "integer", "default": 20},
+                    "since_days": {"type": "number", "description": "Only return files whose content date is within this many days."}
                 },
                 "required": ["query"]
             }
         }),
         serde_json::json!({
             "name": "search_chunks",
-            "description": "Semantic+keyword search across indexed chunks/segments.",
+            "description": "Semantic+keyword search across indexed chunks/segments. Results carry content_date, age_days, freshness_tier and is_record.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "query": {"type": "string"},
-                    "limit": {"type": "integer", "default": 30}
+                    "limit": {"type": "integer", "default": 30},
+                    "since_days": {"type": "number", "description": "Only return chunks whose content date is within this many days."}
                 },
                 "required": ["query"]
             }
@@ -14976,6 +15687,13 @@ fn mcp_tool_needs_rw(name: &str) -> bool {
     )
 }
 
+/// Optional `since_days` MCP argument: a positive number of days, otherwise no filter.
+fn mcp_since_days(args: &Value) -> Option<f64> {
+    args.get("since_days")
+        .and_then(|v| v.as_f64())
+        .filter(|d| d.is_finite() && *d > 0.0)
+}
+
 fn mcp_tool_call(name: &str, args: &Value) -> Result<Value, String> {
     let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let cfg = ConfigValues::from_map(load_config_values(&config_path(&cwd)));
@@ -15006,39 +15724,7 @@ fn mcp_tool_call(name: &str, args: &Value) -> Result<Value, String> {
             ensure_native_embed_backend(&cfg, "mcp search_projects")?;
             ensure_retrieval_backend_ready(&cfg, true, "mcp search_projects")?;
             let rows = rank_projects_native(&conn, &cfg, &query, limit)?;
-            let results: Vec<Value> = rows
-                .into_iter()
-                .map(|item| {
-                    let evidence: Vec<Value> = item
-                        .evidence
-                        .into_iter()
-                        .map(|ev| {
-                            serde_json::json!({
-                                "chunk_id": ev.chunk_id,
-                                "chunk_index": ev.chunk_index,
-                                "doc_path": ev.doc_path,
-                                "doc_rel_path": ev.doc_rel_path,
-                                "score": ev.score,
-                                "semantic": ev.semantic,
-                                "lexical": ev.lexical,
-                                "graph": ev.graph,
-                                "relation": ev.relation,
-                                "quality": ev.quality,
-                                "excerpt": ev.excerpt,
-                            })
-                        })
-                        .collect();
-                    serde_json::json!({
-                        "path": item.path,
-                        "score": item.score,
-                        "semantic": item.semantic,
-                        "lexical": item.lexical,
-                        "frecency": item.frecency,
-                        "graph": item.graph,
-                        "evidence": evidence,
-                    })
-                })
-                .collect();
+            let results: Vec<Value> = rows.iter().map(ranked_project_result_json).collect();
             Ok(serde_json::json!({"query": query, "count": results.len(), "results": results}))
         }
         "search_files" => {
@@ -15056,48 +15742,15 @@ fn mcp_tool_call(name: &str, args: &Value) -> Result<Value, String> {
                 .and_then(|v| v.as_i64())
                 .unwrap_or(20)
                 .clamp(1, 100) as usize;
+            let since_days = mcp_since_days(args);
             ensure_native_embed_backend(&cfg, "mcp search_files")?;
             ensure_retrieval_backend_ready(&cfg, true, "mcp search_files")?;
-            let rows = rank_files_native(&conn, &cfg, &query, limit)?;
-            let results: Vec<Value> = rows
-                .into_iter()
-                .map(|item| {
-                    let evidence: Vec<Value> = item
-                        .evidence
-                        .into_iter()
-                        .map(|ev| {
-                            serde_json::json!({
-                                "chunk_id": ev.chunk_id,
-                                "chunk_index": ev.chunk_index,
-                                "doc_path": ev.doc_path,
-                                "doc_rel_path": ev.doc_rel_path,
-                                "score": ev.score,
-                                "semantic": ev.semantic,
-                                "lexical": ev.lexical,
-                                "graph": ev.graph,
-                                "relation": ev.relation,
-                                "quality": ev.quality,
-                                "excerpt": ev.excerpt,
-                            })
-                        })
-                        .collect();
-                    serde_json::json!({
-                        "path": item.path,
-                        "project_path": item.project_path,
-                        "doc_rel_path": item.doc_rel_path,
-                        "chunk_id": item.chunk_id,
-                        "chunk_index": item.chunk_index,
-                        "score": item.score,
-                        "semantic": item.semantic,
-                        "lexical": item.lexical,
-                        "graph": item.graph,
-                        "relation": item.relation,
-                        "quality": item.quality,
-                        "excerpt": item.excerpt,
-                        "evidence": evidence,
-                    })
-                })
-                .collect();
+            let opts = RankOptions {
+                since_days,
+                ..RankOptions::default()
+            };
+            let rows = rank_files_native_with(&conn, &cfg, &query, limit, opts)?;
+            let results: Vec<Value> = rows.iter().map(ranked_file_result_json).collect();
             Ok(serde_json::json!({"query": query, "count": results.len(), "results": results}))
         }
         "search_chunks" => {
@@ -15115,9 +15768,10 @@ fn mcp_tool_call(name: &str, args: &Value) -> Result<Value, String> {
                 .and_then(|v| v.as_i64())
                 .unwrap_or(30)
                 .clamp(1, 200) as usize;
+            let since_days = mcp_since_days(args);
             ensure_native_embed_backend(&cfg, "mcp search_chunks")?;
             ensure_retrieval_backend_ready(&cfg, true, "mcp search_chunks")?;
-            let rows = rank_chunks_native(&conn, &cfg, &query, limit)?;
+            let rows = rank_chunks_native_with(&conn, &cfg, &query, limit, since_days)?;
             let results: Vec<Value> = rows.iter().map(ranked_chunk_result_json).collect();
             Ok(serde_json::json!({
                 "schema": chunk_search_schema(),
@@ -15549,7 +16203,7 @@ fn mcp_tool_call(name: &str, args: &Value) -> Result<Value, String> {
                 let stats = run_native_index(
                     &cwd,
                     &cfg,
-                    Some(vec![root.clone()]),
+                    IndexScope::roots(vec![root.clone()]),
                     true,
                     force_paths,
                     false,
@@ -15584,7 +16238,7 @@ fn mcp_tool_call(name: &str, args: &Value) -> Result<Value, String> {
                 let stats = run_native_index(
                     &cwd,
                     &cfg,
-                    None,
+                    IndexScope::AllRoots,
                     false,
                     HashSet::new(),
                     true,
@@ -15602,7 +16256,7 @@ fn mcp_tool_call(name: &str, args: &Value) -> Result<Value, String> {
             let stats = run_native_index(
                 &cwd,
                 &cfg,
-                None,
+                IndexScope::AllRoots,
                 false,
                 HashSet::new(),
                 true,
@@ -15627,7 +16281,7 @@ fn mcp_tool_call(name: &str, args: &Value) -> Result<Value, String> {
                 let stats = run_native_index(
                     &cwd,
                     &cfg,
-                    None,
+                    IndexScope::AllRoots,
                     true,
                     HashSet::new(),
                     true,
@@ -15638,28 +16292,38 @@ fn mcp_tool_call(name: &str, args: &Value) -> Result<Value, String> {
                     serde_json::json!({"mode": "forced_all", "stats": stats_payload_json(&stats)}),
                 );
             }
-            let roots = unique_valid_dirs(&paths);
-            if roots.is_empty() {
+            let dirs = unique_valid_dirs(&paths);
+            if dirs.is_empty() {
                 return Err("no valid directory paths provided".to_string());
             }
-            let force_paths: HashSet<PathBuf> = roots.iter().cloned().collect();
+            let scope = plan_scoped_refresh(&conn, &cfg, &dirs)?;
+            let (scope_roots, scope_projects) = match &scope {
+                IndexScope::Targets { roots, projects } => (roots.clone(), projects.clone()),
+                IndexScope::AllRoots => (Vec::new(), Vec::new()),
+            };
+            let as_strings = |v: &[PathBuf]| -> Vec<String> {
+                v.iter().map(|p| p.to_string_lossy().to_string()).collect()
+            };
+            let paths_out = as_strings(&scope.target_paths());
+            let roots_out = as_strings(&scope_roots);
+            let projects_out = as_strings(&scope_projects);
             let stats = run_native_index(
                 &cwd,
                 &cfg,
-                Some(roots.clone()),
+                scope,
                 true,
-                force_paths,
+                HashSet::new(),
                 false,
                 false,
                 "mcp forced refresh",
             )?;
-            let paths_out: Vec<String> = roots
-                .into_iter()
-                .map(|p| p.to_string_lossy().to_string())
-                .collect();
-            Ok(
-                serde_json::json!({"mode": "forced_scoped", "paths": paths_out, "stats": stats_payload_json(&stats)}),
-            )
+            Ok(serde_json::json!({
+                "mode": "forced_scoped",
+                "paths": paths_out,
+                "roots": roots_out,
+                "projects": projects_out,
+                "stats": stats_payload_json(&stats)
+            }))
         }
         _ => Err(format!("unknown tool '{}'", name)),
     }
@@ -16049,7 +16713,7 @@ fn run_self_test_daemon_probe(cwd: &Path, timeout_s: u64) -> Result<(u16, u32), 
 fn run_index_with_strategy(
     cwd: &Path,
     cfg: &ConfigValues,
-    scope_roots: Option<Vec<PathBuf>>,
+    scope: IndexScope,
     force_all: bool,
     force_paths: Option<HashSet<PathBuf>>,
     remove_missing: bool,
@@ -16061,7 +16725,7 @@ fn run_index_with_strategy(
     let stats = run_native_index(
         cwd,
         cfg,
-        scope_roots,
+        scope,
         force_all,
         force_paths.unwrap_or_default(),
         remove_missing,
@@ -16084,6 +16748,8 @@ struct IndexStats {
     graph_edges: i64,
     chunk_rows: i64,
     chunk_vectors: i64,
+    pruned_chunks: i64,
+    pruned_files: i64,
     retrieval_backend: String,
     retrieval_synced_chunks: i64,
     retrieval_error: String,
@@ -16353,7 +17019,7 @@ impl Drop for LiveProgressReporter {
 fn run_native_index(
     cwd: &Path,
     cfg: &ConfigValues,
-    scope_roots: Option<Vec<PathBuf>>,
+    scope: IndexScope,
     force_all: bool,
     force_paths: HashSet<PathBuf>,
     remove_missing: bool,
@@ -16362,16 +17028,21 @@ fn run_native_index(
 ) -> Result<IndexStats, String> {
     let t_start = Instant::now();
     reset_embed_runtime_metrics();
+    set_extra_skip_dirs(cfg);
     let dbp = db_path(cwd);
     let conn = open_db_rw(&dbp)?;
     if reason != "reembed" {
         ensure_reembed_ready(&conn, cfg, &format!("{} indexing", reason))?;
     }
-    let roots = resolve_roots(&conn, cfg, scope_roots)?;
+    // `remove_missing` drops every project row not visited by this run; on a scoped run that
+    // would delete every project outside the scope.
+    if remove_missing && scope != IndexScope::AllRoots {
+        return Err("internal error: remove_missing requires the all-roots scope".to_string());
+    }
+    let (roots, projects) = resolve_index_targets(&conn, cfg, &scope)?;
     if roots.is_empty() {
         return Err("No tracked roots configured. Add one with `retrivio add <path>`.".to_string());
     }
-    let projects = discover_projects(&roots);
     let embedder = build_embedder(cfg)?;
     let model_key = embedder.model_key();
     let mode = if force_all {
@@ -16603,7 +17274,7 @@ fn run_native_index(
                 }
             }
 
-            let (rows, vecs, failures) = reindex_project_chunks(
+            let reindex = reindex_project_chunks(
                 cwd,
                 &conn,
                 project_id,
@@ -16613,9 +17284,23 @@ fn run_native_index(
                 now,
                 Some(&live_progress),
             )?;
+            let (rows, vecs, failures) = (reindex.rows, reindex.vectors, reindex.failures);
             stats.chunk_rows += rows;
             stats.chunk_vectors += vecs;
             stats.vector_failures += failures;
+            stats.pruned_chunks += reindex.pruned.chunks as i64;
+            stats.pruned_files += reindex.pruned.files as i64;
+            if emit_progress && reindex.pruned.chunks > 0 {
+                progress_clear_line();
+                println!(
+                    "[{}/{}] pruned {} chunks from {} files in {}",
+                    idx + 1,
+                    projects.len(),
+                    reindex.pruned.chunks,
+                    reindex.pruned.files,
+                    project_name
+                );
+            }
 
             // Extract symbols and imports from code files via AST.
             // Iterates over unique doc_paths in the chunks to avoid re-parsing.
@@ -16755,6 +17440,10 @@ fn print_index_stats(stats: &IndexStats, cfg: &ConfigValues) {
     println!("vectors refreshed: {}", stats.vectorized_projects);
     println!("chunks indexed: {}", stats.chunk_rows);
     println!("chunk vectors refreshed: {}", stats.chunk_vectors);
+    println!(
+        "stale chunks pruned: {} (from {} files)",
+        stats.pruned_chunks, stats.pruned_files
+    );
     println!("graph edges refreshed: {}", stats.graph_edges);
     println!("retrieval backend: {}", stats.retrieval_backend);
     println!("retrieval chunks synced: {}", stats.retrieval_synced_chunks);
@@ -16785,6 +17474,13 @@ struct EvidenceHit {
     relation: String,
     quality: f64,
     excerpt: String,
+    // Freshness (spec §4)
+    content_date: f64,
+    date_source: &'static str,
+    age_days: f64,
+    freshness_tier: String,
+    is_record: bool,
+    recency: f64,
 }
 
 #[derive(Clone)]
@@ -16795,24 +17491,36 @@ struct RankedResult {
     semantic: f64,
     frecency: f64,
     graph: f64,
+    /// Relevance-weighted mean recency of the project's evidence (spec §4).
+    recency: f64,
     evidence: Vec<EvidenceHit>,
 }
 
 #[derive(Clone)]
-struct RankedFileResult {
-    path: String,
-    project_path: String,
-    doc_rel_path: String,
-    chunk_id: i64,
-    chunk_index: i64,
-    score: f64,
-    semantic: f64,
-    lexical: f64,
-    graph: f64,
-    relation: String,
-    quality: f64,
-    excerpt: String,
-    evidence: Vec<EvidenceHit>,
+pub(crate) struct RankedFileResult {
+    pub(crate) path: String,
+    pub(crate) project_path: String,
+    pub(crate) doc_rel_path: String,
+    pub(crate) chunk_id: i64,
+    pub(crate) chunk_index: i64,
+    /// Final ranking score (relevance blended with recency).
+    pub(crate) score: f64,
+    /// Relevance before the recency blend; `retrivio recall` thresholds on this.
+    pub(crate) base_score: f64,
+    pub(crate) semantic: f64,
+    pub(crate) lexical: f64,
+    pub(crate) graph: f64,
+    pub(crate) relation: String,
+    pub(crate) quality: f64,
+    pub(crate) excerpt: String,
+    pub(crate) evidence: Vec<EvidenceHit>,
+    // Freshness (spec §4)
+    pub(crate) doc_mtime: f64,
+    pub(crate) content_date: f64,
+    pub(crate) date_source: &'static str,
+    pub(crate) age_days: f64,
+    pub(crate) freshness_tier: String,
+    pub(crate) is_record: bool,
 }
 
 #[derive(Clone)]
@@ -16829,6 +17537,113 @@ struct RankedChunkResult {
     relation: String,
     quality: f64,
     excerpt: String,
+    // Freshness (spec §4)
+    doc_mtime: f64,
+    content_date: f64,
+    date_source: &'static str,
+    age_days: f64,
+    freshness_tier: String,
+    is_record: bool,
+}
+
+/// Optional knobs for the file/chunk ranking entry points.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct RankOptions {
+    /// Hard filter: drop results whose content date is older than `now - since_days`.
+    pub(crate) since_days: Option<f64>,
+    /// Skip embeddings entirely and rank from FTS5 lexical signals only (recall fallback).
+    pub(crate) lexical_only: bool,
+}
+
+/// Resolved freshness facts for one document (spec §4).
+#[derive(Clone)]
+struct FreshnessInfo {
+    doc_mtime: f64,
+    content_date: f64,
+    date_source: &'static str,
+    age_days: f64,
+    tier: &'static str,
+    is_record: bool,
+    recency: f64,
+}
+
+/// Per-query freshness context: config-derived half-lives, weights and record patterns,
+/// pinned to one `now` so every result in a response is judged against the same clock.
+struct FreshnessCtx {
+    now: f64,
+    record_patterns: Vec<String>,
+    living_half_life: f64,
+    record_half_life: f64,
+    living_weight: f64,
+    record_weight: f64,
+}
+
+impl FreshnessCtx {
+    fn new(cfg: &ConfigValues) -> Self {
+        Self::at(cfg, now_ts())
+    }
+
+    fn at(cfg: &ConfigValues, now: f64) -> Self {
+        Self {
+            now,
+            record_patterns: cfg.record_patterns(),
+            living_half_life: cfg.recency_half_life_days,
+            record_half_life: cfg.recency_record_half_life_days,
+            living_weight: cfg.rank_recency_weight,
+            record_weight: cfg.rank_recency_record_weight,
+        }
+    }
+
+    fn info(&self, path: &str, doc_mtime: f64) -> FreshnessInfo {
+        let (content_date, date_source) = freshness::content_date(path, doc_mtime, self.now);
+        let age = freshness::age_days(self.now, content_date);
+        let is_record = freshness::is_record(path, &self.record_patterns);
+        let half_life = if is_record {
+            self.record_half_life
+        } else {
+            self.living_half_life
+        };
+        FreshnessInfo {
+            doc_mtime,
+            content_date,
+            date_source,
+            age_days: age,
+            tier: freshness::tier(age, is_record),
+            is_record,
+            recency: freshness::recency_score(age, half_life),
+        }
+    }
+
+    fn weight(&self, is_record: bool) -> f64 {
+        if is_record {
+            self.record_weight
+        } else {
+            self.living_weight
+        }
+    }
+
+    /// Recency for an already-resolved age and class (avoids re-parsing the path).
+    fn recency_for(&self, age_days: f64, is_record: bool) -> f64 {
+        let half_life = if is_record {
+            self.record_half_life
+        } else {
+            self.living_half_life
+        };
+        freshness::recency_score(age_days, half_life)
+    }
+
+    /// `final = (1 - w) * score + w * recency`, with `w` chosen by document class.
+    fn blend(&self, score: f64, info: &FreshnessInfo) -> f64 {
+        freshness::blend(score, info.recency, self.weight(info.is_record))
+    }
+
+    /// True unless `since_days` is set and the content date is older than that window.
+    fn within_since(&self, content_date: f64, since_days: Option<f64>) -> bool {
+        match since_days {
+            None => true,
+            Some(days) => content_date >= self.now - days.max(0.0) * freshness::DAY_SECS,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -16850,7 +17665,7 @@ struct RelatedChunkResult {
 }
 
 fn chunk_search_schema() -> &'static str {
-    "chunk-search-v1"
+    "chunk-search-v2"
 }
 
 fn chunk_related_schema() -> &'static str {
@@ -16879,6 +17694,95 @@ fn ranked_chunk_result_json(item: &RankedChunkResult) -> Value {
         "relation": item.relation,
         "quality": item.quality,
         "excerpt": item.excerpt,
+        "doc_mtime": item.doc_mtime,
+        "content_date": item.content_date,
+        "date_source": item.date_source,
+        "age_days": item.age_days,
+        "freshness_tier": item.freshness_tier,
+        "is_record": item.is_record,
+    })
+}
+
+fn evidence_hit_json(ev: &EvidenceHit) -> Value {
+    serde_json::json!({
+        "chunk_id": ev.chunk_id,
+        "chunk_index": ev.chunk_index,
+        "doc_path": ev.doc_path,
+        "doc_rel_path": ev.doc_rel_path,
+        "score": ev.score,
+        "semantic": ev.semantic,
+        "lexical": ev.lexical,
+        "graph": ev.graph,
+        "relation": ev.relation,
+        "quality": ev.quality,
+        "excerpt": ev.excerpt,
+        "content_date": ev.content_date,
+        "date_source": ev.date_source,
+        "age_days": ev.age_days,
+        "freshness_tier": ev.freshness_tier,
+        "is_record": ev.is_record,
+    })
+}
+
+fn ranked_file_result_json(item: &RankedFileResult) -> Value {
+    let evidence: Vec<Value> = item.evidence.iter().map(evidence_hit_json).collect();
+    serde_json::json!({
+        "path": item.path,
+        "project_path": item.project_path,
+        "doc_rel_path": item.doc_rel_path,
+        "chunk_id": item.chunk_id,
+        "chunk_index": item.chunk_index,
+        "score": item.score,
+        "base_score": item.base_score,
+        "semantic": item.semantic,
+        "lexical": item.lexical,
+        "graph": item.graph,
+        "relation": item.relation,
+        "quality": item.quality,
+        "excerpt": item.excerpt,
+        "doc_mtime": item.doc_mtime,
+        "content_date": item.content_date,
+        "date_source": item.date_source,
+        "age_days": item.age_days,
+        "freshness_tier": item.freshness_tier,
+        "is_record": item.is_record,
+        "evidence": evidence,
+    })
+}
+
+fn ranked_project_result_json(item: &RankedResult) -> Value {
+    let evidence: Vec<Value> = item.evidence.iter().map(evidence_hit_json).collect();
+    serde_json::json!({
+        "path": item.path,
+        "score": item.score,
+        "semantic": item.semantic,
+        "lexical": item.lexical,
+        "frecency": item.frecency,
+        "graph": item.graph,
+        "recency": item.recency,
+        "evidence": evidence,
+    })
+}
+
+/// Payload of `GET /search?view=files`; also emitted by `retrivio search --json`.
+fn search_files_response_json(query: &str, rows: &[RankedFileResult], started: Instant) -> Value {
+    let results: Vec<Value> = rows.iter().map(ranked_file_result_json).collect();
+    serde_json::json!({
+        "query": query,
+        "view": "files",
+        "results": results,
+        "timing_ms": started.elapsed().as_secs_f64() * 1000.0
+    })
+}
+
+/// Payload of `GET /search?view=projects`; also emitted by `retrivio search --json`.
+fn search_projects_response_json(query: &str, rows: &[RankedResult], started: Instant) -> Value {
+    let results: Vec<Value> = rows.iter().map(ranked_project_result_json).collect();
+    serde_json::json!({
+        "query": query,
+        "view": "projects",
+        "results": results,
+        "timing_ms": started.elapsed().as_secs_f64() * 1000.0
     })
 }
 
@@ -16908,6 +17812,7 @@ struct ChunkSignal {
     project_path: String,
     doc_path: String,
     doc_rel_path: String,
+    doc_mtime: f64,
     semantic: f64,
     lexical: f64,
     graph: f64,
@@ -16919,14 +17824,15 @@ struct ChunkSignal {
 fn print_project_results(results: &[RankedResult]) {
     for (idx, item) in results.iter().enumerate() {
         println!(
-            "{:>2}. {}\n    score={:.3} semantic={:.3} lexical={:.3} frecency={:.3} graph={:.3}",
+            "{:>2}. {}\n    score={:.3} semantic={:.3} lexical={:.3} frecency={:.3} graph={:.3} recency={:.3}",
             idx + 1,
             item.path,
             item.score,
             item.semantic,
             item.lexical,
             item.frecency,
-            item.graph
+            item.graph,
+            item.recency
         );
         for ev in item.evidence.iter().take(4) {
             println!(
@@ -16949,7 +17855,7 @@ fn print_project_results(results: &[RankedResult]) {
 fn print_file_results(results: &[RankedFileResult]) {
     for (idx, item) in results.iter().enumerate() {
         println!(
-            "{:>2}. {}\n    project={}\n    chunk_id={} chunk_index={}\n    score={:.3} semantic={:.3} lexical={:.3} graph={:.3} relation={} quality={:.2}\n    {}",
+            "{:>2}. {}\n    project={}\n    chunk_id={} chunk_index={}\n    score={:.3} semantic={:.3} lexical={:.3} graph={:.3} relation={} quality={:.2} date={} age={}d tier={} src={}\n    {}",
             idx + 1,
             item.path,
             item.project_path,
@@ -16961,6 +17867,10 @@ fn print_file_results(results: &[RankedFileResult]) {
             item.graph,
             item.relation,
             item.quality,
+            freshness::format_ymd(item.content_date),
+            item.age_days.round() as i64,
+            item.freshness_tier,
+            item.date_source,
             item.excerpt
         );
         for ev in item.evidence.iter().take(4) {
@@ -17191,11 +18101,13 @@ fn rank_projects_native(
         lex_limit,
     )?;
     apply_graph_chunk_expansion(conn, &mut fused, cfg)?;
-    let project_evidence = project_evidence(&fused, cfg);
+    let fx = FreshnessCtx::new(cfg);
+    let project_evidence = project_evidence(&fused, cfg, &fx);
     let project_content = project_content_scores(&project_evidence);
     let frecency = frecency_scores(conn)?;
     let graph = graph_scores(conn)?;
     let path_keywords = path_keyword_scores(&existing_paths, q);
+    let project_mtimes = project_mtimes(conn)?;
 
     let existing_set: HashSet<String> = existing_paths.iter().cloned().collect();
     let mut all_paths: HashSet<String> = HashSet::new();
@@ -17256,6 +18168,22 @@ fn rank_projects_native(
         if is_generic_container(&path) && path_kw < 0.4 {
             score *= 0.82;
         }
+        // Freshness (spec §4): relevance-weighted mean of the evidence recency, falling back
+        // to the project's own mtime when no chunk evidence was retrieved. Blended once.
+        let weight_sum: f64 = evidence.iter().map(|e| e.score.max(0.0)).sum();
+        let recency = if weight_sum > 0.0 {
+            evidence
+                .iter()
+                .map(|e| e.score.max(0.0) * e.recency)
+                .sum::<f64>()
+                / weight_sum
+        } else {
+            project_mtimes
+                .get(&path)
+                .map(|mt| fx.info(&path, *mt).recency)
+                .unwrap_or(0.0)
+        };
+        score = freshness::blend(score, recency, fx.weight(false));
         out.push(RankedResult {
             path,
             score,
@@ -17263,11 +18191,28 @@ fn rank_projects_native(
             semantic,
             frecency: fr,
             graph: gscore,
+            recency,
             evidence: evidence.into_iter().take(4).collect(),
         });
     }
     out.sort_by(|a, b| b.score.total_cmp(&a.score));
     out.truncate(limit.max(1));
+    Ok(out)
+}
+
+/// `project_mtime` per project path, used as the recency fallback for projects without evidence.
+fn project_mtimes(conn: &Connection) -> Result<HashMap<String, f64>, String> {
+    let mut stmt = conn
+        .prepare("SELECT path, project_mtime FROM projects")
+        .map_err(|e| format!("failed preparing project mtime query: {}", e))?;
+    let rows = stmt
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?)))
+        .map_err(|e| format!("failed querying project mtimes: {}", e))?;
+    let mut out = HashMap::new();
+    for row in rows {
+        let (path, mtime) = row.map_err(|e| format!("failed reading project mtime row: {}", e))?;
+        out.insert(path, mtime);
+    }
     Ok(out)
 }
 
@@ -17277,7 +18222,22 @@ fn rank_files_native(
     query: &str,
     limit: usize,
 ) -> Result<Vec<RankedFileResult>, String> {
-    ensure_reembed_ready(conn, cfg, "search")?;
+    rank_files_native_with(conn, cfg, query, limit, RankOptions::default())
+}
+
+/// File ranking with options: `since_days` hard filter and `lexical_only` (no embeddings;
+/// FTS5 signals only, used by `retrivio recall` when the embedding backend is unavailable).
+/// The recency blend (spec §4) is applied once per file after base scoring, before truncation.
+pub(crate) fn rank_files_native_with(
+    conn: &Connection,
+    cfg: &ConfigValues,
+    query: &str,
+    limit: usize,
+    opts: RankOptions,
+) -> Result<Vec<RankedFileResult>, String> {
+    if !opts.lexical_only {
+        ensure_reembed_ready(conn, cfg, "search")?;
+    }
     let q = query.trim();
     if q.is_empty() {
         return Ok(Vec::new());
@@ -17288,25 +18248,32 @@ fn rank_files_native(
         cfg.vector_candidates.max(1) as usize,
         cfg.lexical_candidates.max(1) as usize,
     );
-    let (model_key, query_vector) = embed_query_cached(cfg, q)?;
-
-    let project_semantic = project_semantic_scores(
-        conn,
-        &model_key,
-        &query_vector,
-        std::cmp::max(120, sem_limit * 2),
-    )?;
-    let mut fused = hybrid_search_lance(
-        conn,
-        &model_key,
-        q,
-        &query_vector,
-        std::cmp::max(160, sem_limit * 4),
-        std::cmp::max(120, lex_limit * 2),
-    )?;
+    let (project_semantic, mut fused) = if opts.lexical_only {
+        let fused =
+            search_lexical_chunks_sqlite(conn, q, std::cmp::max(160, lex_limit * 2))?;
+        (HashMap::new(), fused)
+    } else {
+        let (model_key, query_vector) = embed_query_cached(cfg, q)?;
+        let project_semantic = project_semantic_scores(
+            conn,
+            &model_key,
+            &query_vector,
+            std::cmp::max(120, sem_limit * 2),
+        )?;
+        let fused = hybrid_search_lance(
+            conn,
+            &model_key,
+            q,
+            &query_vector,
+            std::cmp::max(160, sem_limit * 4),
+            std::cmp::max(120, lex_limit * 2),
+        )?;
+        (project_semantic, fused)
+    };
     if fused.is_empty() {
         return Ok(Vec::new());
     }
+    let fx = FreshnessCtx::new(cfg);
     // For Symbol and PathQuery types, boost path-based matching signals
     if query_type == QueryType::Symbol || query_type == QueryType::PathQuery {
         let path_signals = keyword_path_chunk_scores(conn, q, std::cmp::max(220, lex_limit * 3))?;
@@ -17366,6 +18333,13 @@ fn rank_files_native(
             score *= 0.40;
         }
         score *= path_noise_penalty(&row.doc_rel_path);
+        // Freshness (spec §4): blend once per candidate; the file keeps its best chunk.
+        let fresh = fx.info(&row.doc_path, row.doc_mtime);
+        if !fx.within_since(fresh.content_date, opts.since_days) {
+            continue;
+        }
+        let base_score = score;
+        score = fx.blend(score, &fresh);
         let candidate = RankedFileResult {
             path: row.doc_path.clone(),
             project_path: row.project_path.clone(),
@@ -17373,6 +18347,7 @@ fn rank_files_native(
             chunk_id: row.chunk_id,
             chunk_index: row.chunk_index,
             score,
+            base_score,
             semantic: row.semantic,
             lexical: row.lexical,
             graph: row.graph,
@@ -17380,6 +18355,12 @@ fn rank_files_native(
             quality: row.quality,
             excerpt: row.excerpt.clone(),
             evidence: Vec::new(),
+            doc_mtime: fresh.doc_mtime,
+            content_date: fresh.content_date,
+            date_source: fresh.date_source,
+            age_days: fresh.age_days,
+            freshness_tier: fresh.tier.to_string(),
+            is_record: fresh.is_record,
         };
         let prev = by_file.get(&row.doc_path);
         if prev.is_none() || candidate.score > prev.map(|p| p.score).unwrap_or(0.0) {
@@ -17397,7 +18378,7 @@ fn rank_files_native(
             if !include {
                 continue;
             }
-            support.push(evidence_hit_from_chunk(row, chunk_base_score(row, cfg)));
+            support.push(evidence_hit_from_chunk(row, chunk_base_score(row, cfg), &fx));
         }
         support.sort_by(|a, b| {
             b.score
@@ -17553,6 +18534,18 @@ fn rank_chunks_native(
     query: &str,
     limit: usize,
 ) -> Result<Vec<RankedChunkResult>, String> {
+    rank_chunks_native_with(conn, cfg, query, limit, None)
+}
+
+/// Chunk ranking with an optional `since_days` hard filter on content date. The recency blend
+/// (spec §4) is applied exactly once, after the cross-encoder reranker blend.
+fn rank_chunks_native_with(
+    conn: &Connection,
+    cfg: &ConfigValues,
+    query: &str,
+    limit: usize,
+    since_days: Option<f64>,
+) -> Result<Vec<RankedChunkResult>, String> {
     ensure_reembed_ready(conn, cfg, "search")?;
     let q = query.trim();
     if q.is_empty() {
@@ -17633,8 +18626,13 @@ fn rank_chunks_native(
     apply_graph_chunk_expansion(conn, &mut fused, cfg)?;
 
     let frecency = frecency_scores(conn)?;
+    let fx = FreshnessCtx::new(cfg);
     let mut out: Vec<RankedChunkResult> = Vec::new();
     for row in fused.values() {
+        let fresh = fx.info(&row.doc_path, row.doc_mtime);
+        if !fx.within_since(fresh.content_date, since_days) {
+            continue;
+        }
         let content = chunk_base_score(row, cfg);
         let project_sem = *project_semantic.get(&row.project_path).unwrap_or(&0.0);
         let fr = *frecency.get(&row.project_path).unwrap_or(&0.0);
@@ -17684,6 +18682,12 @@ fn rank_chunks_native(
             relation: row.relation.clone(),
             quality: row.quality,
             excerpt: row.excerpt.clone(),
+            doc_mtime: fresh.doc_mtime,
+            content_date: fresh.content_date,
+            date_source: fresh.date_source,
+            age_days: fresh.age_days,
+            freshness_tier: fresh.tier.to_string(),
+            is_record: fresh.is_record,
         });
     }
     out.sort_by(|a, b| b.score.total_cmp(&a.score));
@@ -17707,6 +18711,13 @@ fn rank_chunks_native(
             out[..pool].sort_by(|a, b| b.score.total_cmp(&a.score));
         }
     }
+
+    // Freshness (spec §4): blend recency exactly once, after the reranker, then re-sort.
+    for item in out.iter_mut() {
+        let recency = fx.recency_for(item.age_days, item.is_record);
+        item.score = freshness::blend(item.score, recency, fx.weight(item.is_record));
+    }
+    out.sort_by(|a, b| b.score.total_cmp(&a.score));
 
     out.truncate(limit.max(1));
     Ok(out)
@@ -18031,6 +19042,158 @@ mod chunk_contract_tests {
     use super::*;
 
     #[test]
+    fn freshness_and_recall_config_defaults() {
+        let cfg = ConfigValues::from_map(std::collections::HashMap::new());
+        assert!((cfg.rank_recency_weight - 0.12).abs() < 1e-12);
+        assert!((cfg.rank_recency_record_weight - 0.04).abs() < 1e-12);
+        assert_eq!(cfg.recency_half_life_days, 21.0);
+        assert_eq!(cfg.recency_record_half_life_days, 90.0);
+        assert_eq!(
+            cfg.record_patterns(),
+            vec![
+                "transcript",
+                "customer-signals",
+                "docs/sessions",
+                "HANDOFF",
+                "meeting",
+                "call-notes",
+                ".srt"
+            ]
+        );
+        assert!(cfg.skip_dir_name_set().is_empty());
+        assert_eq!(cfg.recall_max_leads, 3);
+        assert_eq!(cfg.recall_min_score_ratio, 0.80);
+        assert_eq!(cfg.recall_min_abs_score, 0.40);
+        assert_eq!(cfg.recall_band_ratio, 0.90);
+        assert_eq!(cfg.recall_roots, "");
+        assert!(cfg.recall_root_list().is_empty());
+        assert!(cfg.recall_excerpts);
+        assert!(!cfg.recall_system_message);
+        assert_eq!(cfg.recall_semantic, "auto");
+        assert_eq!(cfg.recall_session_ttl_days, 3.0);
+    }
+
+    #[test]
+    fn freshness_and_recall_config_clamps_set_show_and_roundtrip() {
+        let mut map = std::collections::HashMap::new();
+        map.insert("rank_recency_weight".to_string(), "0.9".to_string());
+        map.insert("recency_half_life_days".to_string(), "0".to_string());
+        map.insert("recall_max_leads".to_string(), "99".to_string());
+        map.insert("recall_semantic".to_string(), "sometimes".to_string());
+        map.insert("recall_excerpts".to_string(), "no".to_string());
+        let cfg = ConfigValues::from_map(map);
+        assert_eq!(cfg.rank_recency_weight, 0.5);
+        assert_eq!(cfg.recency_half_life_days, 1.0);
+        assert_eq!(cfg.recall_max_leads, 5);
+        assert_eq!(cfg.recall_semantic, "auto");
+        assert!(!cfg.recall_excerpts);
+
+        let mut cfg = ConfigValues::from_map(std::collections::HashMap::new());
+        for key in [
+            "rank_recency_weight",
+            "rank_recency_record_weight",
+            "recency_half_life_days",
+            "recency_record_half_life_days",
+            "recency_record_patterns",
+            "skip_dir_names",
+            "recall_max_leads",
+            "recall_min_score_ratio",
+            "recall_min_abs_score",
+            "recall_band_ratio",
+            "recall_roots",
+            "recall_excerpts",
+            "recall_system_message",
+            "recall_semantic",
+            "recall_session_ttl_days",
+            "hyde_enabled",
+            "reranker_enabled",
+            "reranker_model",
+            "reranker_pool_size",
+            "reranker_batch_size",
+            "reranker_timeout_ms",
+        ] {
+            assert!(
+                config_rows().iter().any(|(k, _)| *k == key),
+                "config_rows missing {}",
+                key
+            );
+            assert!(
+                config_value_string(&cfg, key).is_some(),
+                "config_value_string missing {}",
+                key
+            );
+        }
+        config_set_value(&mut cfg, "skip_dir_names", " demo-data, tmp ,marketplaces ").unwrap();
+        assert_eq!(
+            config_value_string(&cfg, "skip_dir_names").unwrap(),
+            "demo-data,tmp,marketplaces"
+        );
+        assert!(config_set_value(&mut cfg, "skip_dir_names", "a/b").is_err());
+        config_set_value(&mut cfg, "recall_semantic", "OFF").unwrap();
+        assert_eq!(cfg.recall_semantic, "off");
+        assert!(config_set_value(&mut cfg, "recall_semantic", "maybe").is_err());
+        config_set_value(&mut cfg, "recall_excerpts", "false").unwrap();
+        assert!(!cfg.recall_excerpts);
+        assert!(config_set_value(&mut cfg, "recall_excerpts", "maybe").is_err());
+        config_set_value(&mut cfg, "rank_recency_weight", "2").unwrap();
+        assert_eq!(cfg.rank_recency_weight, 0.5);
+        config_set_value(&mut cfg, "reranker_enabled", "0").unwrap();
+        assert!(!cfg.reranker_enabled);
+        config_set_value(&mut cfg, "recall_roots", "~/a, ~/b").unwrap();
+        assert_eq!(cfg.recall_root_list().len(), 2);
+
+        // write_config_file -> load_config_values -> from_map preserves the new keys.
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tmp")
+            .join(format!("test-config-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("create tmp config dir");
+        let path = dir.join("config.toml");
+        write_config_file(&path, &cfg).expect("write config");
+        let back = ConfigValues::from_map(load_config_values(&path));
+        assert_eq!(back.skip_dir_names, "demo-data,tmp,marketplaces");
+        assert_eq!(back.recall_semantic, "off");
+        assert!(!back.recall_excerpts);
+        assert_eq!(back.rank_recency_weight, 0.5);
+        assert!(!back.reranker_enabled);
+        assert_eq!(back.recency_record_patterns, cfg.recency_record_patterns);
+        assert_eq!(back.recall_roots, cfg.recall_roots);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn freshness_ctx_blends_by_class_and_filters_since() {
+        let cfg = ConfigValues::from_map(std::collections::HashMap::new());
+        let now = 1_800_000_000.0;
+        let fx = FreshnessCtx::at(&cfg, now);
+        let living = fx.info("/p/notes/plan.md", now - 21.0 * 86_400.0);
+        assert_eq!(living.date_source, "mtime");
+        assert!(!living.is_record);
+        assert_eq!(living.tier, "aging");
+        assert!((living.recency - 0.5).abs() < 1e-9);
+        assert!((fx.blend(1.0, &living) - (0.88 + 0.12 * 0.5)).abs() < 1e-9);
+        let record = fx.info("/p/transcripts/call.md", now - 90.0 * 86_400.0);
+        assert!(record.is_record);
+        assert_eq!(record.tier, "record");
+        assert!((record.recency - 0.5).abs() < 1e-9);
+        assert!((fx.blend(1.0, &record) - (0.96 + 0.04 * 0.5)).abs() < 1e-9);
+        assert!((fx.recency_for(record.age_days, true) - record.recency).abs() < 1e-12);
+        assert!(fx.within_since(now - 5.0 * 86_400.0, Some(7.0)));
+        assert!(!fx.within_since(now - 8.0 * 86_400.0, Some(7.0)));
+        assert!(fx.within_since(now - 800.0 * 86_400.0, None));
+        assert_eq!(
+            fts_or_query(&[
+                "intuit".to_string(),
+                "con\"text".to_string(),
+                " ".to_string()
+            ]),
+            "\"intuit\" OR \"con\"\"text\""
+        );
+        assert_eq!(parse_since_days(Some(&"30".to_string())), Some(30.0));
+        assert_eq!(parse_since_days(Some(&"-1".to_string())), None);
+        assert_eq!(parse_since_days(None), None);
+    }
+
+    #[test]
     fn terminal_escape_sequences_are_stripped_from_prompt_input() {
         assert_eq!(strip_terminal_control_sequences("\u{1b}[A\u{1b}[A1"), "1");
         assert_eq!(strip_terminal_control_sequences("\u{1b}[B"), "");
@@ -18054,7 +19217,7 @@ mod chunk_contract_tests {
 
     #[test]
     fn chunk_schema_constants_are_stable() {
-        assert_eq!(chunk_search_schema(), "chunk-search-v1");
+        assert_eq!(chunk_search_schema(), "chunk-search-v2");
         assert_eq!(chunk_related_schema(), "chunk-related-v1");
         assert_eq!(chunk_get_schema(), "chunk-get-v1");
         assert_eq!(doc_read_schema(), "doc-read-v1");
@@ -18076,10 +19239,16 @@ mod chunk_contract_tests {
             relation: "direct".to_string(),
             quality: 1.0,
             excerpt: "hello".to_string(),
+            doc_mtime: 1_700_000_000.0,
+            content_date: 1_700_000_000.0,
+            date_source: "mtime",
+            age_days: 3.5,
+            freshness_tier: "fresh".to_string(),
+            is_record: false,
         };
         let json = ranked_chunk_result_json(&item);
         let obj = json.as_object().expect("expected object");
-        assert_eq!(obj.len(), 12);
+        assert_eq!(obj.len(), 18);
         for key in [
             "chunk_id",
             "chunk_index",
@@ -18093,6 +19262,12 @@ mod chunk_contract_tests {
             "relation",
             "quality",
             "excerpt",
+            "doc_mtime",
+            "content_date",
+            "date_source",
+            "age_days",
+            "freshness_tier",
+            "is_record",
         ] {
             assert!(obj.contains_key(key), "missing key: {}", key);
         }
@@ -18964,6 +20139,12 @@ fn build_context_pack_native(
             "graph": entry.seed.graph,
             "relation": entry.seed.relation,
             "quality": entry.seed.quality,
+            "doc_mtime": entry.seed.doc_mtime,
+            "content_date": entry.seed.content_date,
+            "date_source": entry.seed.date_source,
+            "age_days": entry.seed.age_days,
+            "freshness_tier": entry.seed.freshness_tier,
+            "is_record": entry.seed.is_record,
             "text_chars": text_chars,
             "returned_chars": returned_chars,
             "truncated": truncated,
@@ -19104,6 +20285,92 @@ fn search_lexical_chunks_sqlite(
     if fts.is_empty() {
         return Ok(HashMap::new());
     }
+    lexical_chunk_signals_for_match(conn, &fts, limit)
+}
+
+/// FTS5 MATCH expression that ORs quoted terms (double quotes escaped by doubling).
+fn fts_or_query(terms: &[String]) -> String {
+    terms
+        .iter()
+        .map(|t| t.trim())
+        .filter(|t| !t.is_empty())
+        .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" OR ")
+}
+
+/// Lexical-only file candidates for `retrivio recall` when embeddings are unavailable.
+///
+/// Runs one `chunk_fts` query ORing the quoted `terms`, keeps the best chunk per file, fills
+/// the freshness fields and scores each file by bm25 normalised to 0..1 (1 = best match),
+/// blended once with recency exactly like [`rank_files_native_with`]. Errors yield an empty list.
+pub(crate) fn lexical_file_candidates(
+    conn: &Connection,
+    cfg: &ConfigValues,
+    terms: &[String],
+    limit: usize,
+) -> Vec<RankedFileResult> {
+    let fts = fts_or_query(terms);
+    if fts.is_empty() {
+        return Vec::new();
+    }
+    let chunk_limit = (limit.max(1) * 8).clamp(40, 600);
+    let Ok(signals) = lexical_chunk_signals_for_match(conn, &fts, chunk_limit) else {
+        return Vec::new();
+    };
+    let fx = FreshnessCtx::new(cfg);
+    let mut by_file: HashMap<String, RankedFileResult> = HashMap::new();
+    for row in signals.values() {
+        let fresh = fx.info(&row.doc_path, row.doc_mtime);
+        let score = fx.blend(row.lexical, &fresh);
+        let replace = by_file
+            .get(&row.doc_path)
+            .map(|prev| score > prev.score)
+            .unwrap_or(true);
+        if !replace {
+            continue;
+        }
+        by_file.insert(
+            row.doc_path.clone(),
+            RankedFileResult {
+                path: row.doc_path.clone(),
+                project_path: row.project_path.clone(),
+                doc_rel_path: row.doc_rel_path.clone(),
+                chunk_id: row.chunk_id,
+                chunk_index: row.chunk_index,
+                score,
+                base_score: row.lexical,
+                semantic: 0.0,
+                lexical: row.lexical,
+                graph: 0.0,
+                relation: "lexical".to_string(),
+                quality: row.quality,
+                excerpt: row.excerpt.clone(),
+                evidence: Vec::new(),
+                doc_mtime: fresh.doc_mtime,
+                content_date: fresh.content_date,
+                date_source: fresh.date_source,
+                age_days: fresh.age_days,
+                freshness_tier: fresh.tier.to_string(),
+                is_record: fresh.is_record,
+            },
+        );
+    }
+    let mut out: Vec<RankedFileResult> = by_file.into_values().collect();
+    out.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    out.truncate(limit.max(1));
+    out
+}
+
+fn lexical_chunk_signals_for_match(
+    conn: &Connection,
+    fts: &str,
+    limit: usize,
+) -> Result<HashMap<i64, ChunkSignal>, String> {
     let mut stmt = conn
         .prepare(
             r#"
@@ -19114,7 +20381,8 @@ SELECT
     pc.doc_rel_path,
     pc.chunk_index,
     pc.text,
-    bm25(chunk_fts) AS lexical_bm25
+    bm25(chunk_fts) AS lexical_bm25,
+    pc.doc_mtime
 FROM chunk_fts
 JOIN project_chunks pc ON pc.id = chunk_fts.rowid
 JOIN projects p ON p.id = pc.project_id
@@ -19133,6 +20401,7 @@ LIMIT ?2
             let chunk_index: i64 = row.get(4)?;
             let text: String = row.get(5)?;
             let bm25: f64 = row.get(6)?;
+            let doc_mtime: f64 = row.get(7)?;
             Ok((
                 chunk_id,
                 project_path,
@@ -19141,11 +20410,12 @@ LIMIT ?2
                 chunk_index,
                 text,
                 bm25,
+                doc_mtime,
             ))
         })
         .map_err(|e| format!("failed querying lexical chunks: {}", e))?;
 
-    let mut raw: Vec<(i64, String, String, String, i64, String, f64)> = Vec::new();
+    let mut raw: Vec<(i64, String, String, String, i64, String, f64, f64)> = Vec::new();
     for row in rows {
         raw.push(row.map_err(|e| format!("failed reading lexical chunk row: {}", e))?);
     }
@@ -19156,7 +20426,8 @@ LIMIT ?2
     let hi = raw.iter().map(|r| r.6).fold(f64::NEG_INFINITY, f64::max);
     let span = hi - lo;
     let mut out: HashMap<i64, ChunkSignal> = HashMap::new();
-    for (chunk_id, project_path, doc_path, doc_rel_path, chunk_index, text, bm25) in raw {
+    for (chunk_id, project_path, doc_path, doc_rel_path, chunk_index, text, bm25, doc_mtime) in raw
+    {
         let lexical = if span.abs() < f64::EPSILON {
             1.0
         } else {
@@ -19170,6 +20441,7 @@ LIMIT ?2
                 project_path,
                 doc_path,
                 doc_rel_path: doc_rel_path.clone(),
+                doc_mtime,
                 semantic: 0.0,
                 lexical: lexical.clamp(0.0, 1.0),
                 graph: 0.0,
@@ -19182,12 +20454,44 @@ LIMIT ?2
     Ok(out)
 }
 
+type PathChunkRow = (i64, String, String, String, i64, String, f64);
+
+fn map_path_chunk_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PathChunkRow> {
+    Ok((
+        row.get::<_, i64>(0)?,
+        row.get::<_, String>(1)?,
+        row.get::<_, String>(2)?,
+        row.get::<_, String>(3)?,
+        row.get::<_, i64>(4)?,
+        row.get::<_, String>(5)?,
+        row.get::<_, f64>(6)?,
+    ))
+}
+
+/// Path-keyword signal for Symbol and PathQuery searches: chunks whose file path or project
+/// path contains the query's path words.
+///
+/// Bounded on purpose. Only words that look like paths (`query_path_like_tokens`) drive the
+/// scans; a Symbol-shaped query (at most two words, none a path) is itself the pattern, and
+/// prose never scans the table. Matching files are found through the covering index on
+/// `doc_path` (no row reads), capped at `MAX_PATHS_PER_TOKEN` files per word, and the chunk
+/// rows are then fetched by exact path; project-path matches are resolved in memory.
 fn keyword_path_chunk_scores(
     conn: &Connection,
     query: &str,
     keep_top: usize,
 ) -> Result<HashMap<i64, ChunkSignal>, String> {
-    let q_tokens: Vec<String> = all_word_tokens(query)
+    const MAX_PATHS_PER_TOKEN: usize = 400;
+    let path_tokens = query_path_like_tokens(query);
+    let word_count = query.split_whitespace().count();
+    let source: String = if !path_tokens.is_empty() {
+        path_tokens.join(" ")
+    } else if word_count <= 2 {
+        query.to_string()
+    } else {
+        return Ok(HashMap::new());
+    };
+    let q_tokens: Vec<String> = all_word_tokens(&source)
         .into_iter()
         .filter(|t| t.len() >= 2)
         .collect();
@@ -19196,7 +20500,18 @@ fn keyword_path_chunk_scores(
     }
     let mut out: HashMap<i64, ChunkSignal> = HashMap::new();
     let per_token_limit = (keep_top.max(1) * 3).clamp(50, 2500);
-    let mut stmt = conn
+    // File matches take at most three quarters of a word's budget so project-path matches
+    // still get a share.
+    let doc_budget = (per_token_limit * 3 / 4).max(1);
+
+    // Files whose path contains the word: covering scan of idx_project_chunks_doc.
+    // doc_rel_path is a suffix of doc_path, so one pattern covers both columns.
+    let mut doc_stmt = conn
+        .prepare(
+            "SELECT DISTINCT doc_path FROM project_chunks WHERE doc_path LIKE ?1 ORDER BY doc_path LIMIT ?2",
+        )
+        .map_err(|e| format!("failed preparing keyword path doc query: {}", e))?;
+    let mut by_doc_stmt = conn
         .prepare(
             r#"
 SELECT
@@ -19205,71 +20520,128 @@ SELECT
     pc.doc_path,
     pc.doc_rel_path,
     pc.chunk_index,
-    pc.text
+    pc.text,
+    pc.doc_mtime
 FROM project_chunks pc
 JOIN projects p ON p.id = pc.project_id
-WHERE lower(pc.doc_path) LIKE ?1
-   OR lower(pc.doc_rel_path) LIKE ?2
-   OR lower(p.path) LIKE ?3
-LIMIT ?4
+WHERE pc.doc_path = ?1
 "#,
         )
         .map_err(|e| format!("failed preparing keyword path chunk query: {}", e))?;
+    let mut by_project_stmt = conn
+        .prepare(
+            r#"
+SELECT
+    pc.id AS chunk_id,
+    p.path AS project_path,
+    pc.doc_path,
+    pc.doc_rel_path,
+    pc.chunk_index,
+    pc.text,
+    pc.doc_mtime
+FROM project_chunks pc
+JOIN projects p ON p.id = pc.project_id
+WHERE pc.project_id = ?1
+LIMIT ?2
+"#,
+        )
+        .map_err(|e| format!("failed preparing keyword project chunk query: {}", e))?;
+    let projects: Vec<(i64, String)> = {
+        let mut stmt = conn
+            .prepare("SELECT id, lower(path) FROM projects")
+            .map_err(|e| format!("failed preparing project path list: {}", e))?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))
+            .map_err(|e| format!("failed listing project paths: {}", e))?;
+        let mut v = Vec::new();
+        for row in rows {
+            v.push(row.map_err(|e| format!("failed reading project path row: {}", e))?);
+        }
+        v
+    };
 
     let q_n = q_tokens.len() as f64;
+    let mut absorb = |row: PathChunkRow| {
+        let (chunk_id, project_path, doc_path, doc_rel_path, chunk_index, text, doc_mtime) = row;
+        let doc_rel_lower = doc_rel_path.to_lowercase();
+        let project_lower = project_path.to_lowercase();
+        let doc_hits = q_tokens
+            .iter()
+            .filter(|tok| doc_rel_lower.contains(tok.as_str()))
+            .count() as f64;
+        let proj_hits = q_tokens
+            .iter()
+            .filter(|tok| project_lower.contains(tok.as_str()))
+            .count() as f64;
+        let lexical = ((doc_hits / q_n).max(0.65 * (proj_hits / q_n))).clamp(0.0, 1.0);
+        if lexical <= 0.0 {
+            return;
+        }
+        let entry = out.entry(chunk_id).or_insert_with(|| ChunkSignal {
+            chunk_id,
+            chunk_index,
+            project_path: project_path.clone(),
+            doc_path: doc_path.clone(),
+            doc_rel_path: doc_rel_path.clone(),
+            doc_mtime,
+            semantic: 0.0,
+            lexical,
+            graph: 0.0,
+            relation: "path_keyword".to_string(),
+            quality: content_quality(&doc_rel_path, &text),
+            excerpt: clip_text(&text, 190),
+        });
+        if lexical > entry.lexical {
+            entry.lexical = lexical;
+            entry.relation = "path_keyword".to_string();
+        }
+    };
+
     for token in &q_tokens {
-        let pattern = format!("%{}%", token.to_lowercase());
-        let rows = stmt
-            .query_map(
-                params![pattern, pattern, pattern, per_token_limit as i64],
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, i64>(4)?,
-                        row.get::<_, String>(5)?,
-                    ))
-                },
-            )
-            .map_err(|e| format!("failed querying keyword path chunks: {}", e))?;
-        for row in rows {
-            let (chunk_id, project_path, doc_path, doc_rel_path, chunk_index, text) =
-                row.map_err(|e| format!("failed reading keyword path chunk row: {}", e))?;
-            let doc_rel_lower = doc_rel_path.to_lowercase();
-            let project_lower = project_path.to_lowercase();
-            let doc_hits = q_tokens
-                .iter()
-                .filter(|tok| doc_rel_lower.contains(tok.as_str()))
-                .count() as f64;
-            let proj_hits = q_tokens
-                .iter()
-                .filter(|tok| project_lower.contains(tok.as_str()))
-                .count() as f64;
-            let lexical = ((doc_hits / q_n).max(0.65 * (proj_hits / q_n))).clamp(0.0, 1.0);
-            if lexical <= 0.0 {
+        let pattern = format!("%{}%", token);
+        let mut rows_for_token = 0usize;
+        let doc_paths: Vec<String> = {
+            let rows = doc_stmt
+                .query_map(params![pattern, MAX_PATHS_PER_TOKEN as i64], |row| {
+                    row.get::<_, String>(0)
+                })
+                .map_err(|e| format!("failed querying keyword path docs: {}", e))?;
+            let mut v = Vec::new();
+            for row in rows {
+                v.push(row.map_err(|e| format!("failed reading keyword path doc: {}", e))?);
+            }
+            v
+        };
+        for doc_path in &doc_paths {
+            if rows_for_token >= doc_budget {
+                break;
+            }
+            let rows = by_doc_stmt
+                .query_map(params![doc_path], map_path_chunk_row)
+                .map_err(|e| format!("failed querying keyword path chunks: {}", e))?;
+            for row in rows {
+                absorb(row.map_err(|e| format!("failed reading keyword path chunk row: {}", e))?);
+                rows_for_token += 1;
+            }
+        }
+        for (project_id, project_lower) in &projects {
+            if rows_for_token >= per_token_limit {
+                break;
+            }
+            if !project_lower.contains(token.as_str()) {
                 continue;
             }
-            let entry = out.entry(chunk_id).or_insert_with(|| ChunkSignal {
-                chunk_id,
-                chunk_index,
-                project_path: project_path.clone(),
-                doc_path: doc_path.clone(),
-                doc_rel_path: doc_rel_path.clone(),
-                semantic: 0.0,
-                lexical,
-                graph: 0.0,
-                relation: "path_keyword".to_string(),
-                quality: content_quality(&doc_rel_path, &text),
-                excerpt: clip_text(&text, 190),
-            });
-            if lexical > entry.lexical {
-                entry.lexical = lexical;
-                entry.relation = "path_keyword".to_string();
+            let remaining = (per_token_limit - rows_for_token) as i64;
+            let rows = by_project_stmt
+                .query_map(params![project_id, remaining], map_path_chunk_row)
+                .map_err(|e| format!("failed querying keyword project chunks: {}", e))?;
+            for row in rows {
+                absorb(row.map_err(|e| format!("failed reading keyword project chunk row: {}", e))?);
+                rows_for_token += 1;
             }
         }
     }
+    drop(absorb);
 
     if out.len() <= keep_top.max(1) {
         return Ok(out);
@@ -19301,7 +20673,8 @@ SELECT
     pc.chunk_index,
     pc.text,
     pcv.norm,
-    pcv.vector
+    pcv.vector,
+    pc.doc_mtime
 FROM project_chunks pc
 JOIN projects p ON p.id = pc.project_id
 JOIN project_chunk_vectors pcv ON pcv.chunk_id = pc.id
@@ -19319,6 +20692,7 @@ WHERE pcv.model = ?1
             let text: String = row.get(5)?;
             let norm: f64 = row.get(6)?;
             let blob: Vec<u8> = row.get(7)?;
+            let doc_mtime: f64 = row.get(8)?;
             Ok((
                 chunk_id,
                 project_path,
@@ -19328,13 +20702,14 @@ WHERE pcv.model = ?1
                 text,
                 norm,
                 blob,
+                doc_mtime,
             ))
         })
         .map_err(|e| format!("failed querying semantic chunks: {}", e))?;
 
-    let mut scored: Vec<(f64, i64, String, String, String, i64, String)> = Vec::new();
+    let mut scored: Vec<(f64, i64, String, String, String, i64, String, f64)> = Vec::new();
     for row in rows {
-        let (chunk_id, project_path, doc_path, doc_rel_path, chunk_index, text, vnorm, blob) =
+        let (chunk_id, project_path, doc_path, doc_rel_path, chunk_index, text, vnorm, blob, doc_mtime) =
             row.map_err(|e| format!("failed reading semantic chunk row: {}", e))?;
         if vnorm == 0.0 {
             continue;
@@ -19349,6 +20724,7 @@ WHERE pcv.model = ?1
             doc_rel_path,
             chunk_index,
             text,
+            doc_mtime,
         ));
     }
     if scored.is_empty() {
@@ -19360,7 +20736,9 @@ WHERE pcv.model = ?1
     let hi = scored.iter().map(|r| r.0).fold(f64::NEG_INFINITY, f64::max);
     let span = hi - lo;
     let mut out = HashMap::new();
-    for (score, chunk_id, project_path, doc_path, doc_rel_path, chunk_index, text) in scored {
+    for (score, chunk_id, project_path, doc_path, doc_rel_path, chunk_index, text, doc_mtime) in
+        scored
+    {
         let semantic = if span.abs() < f64::EPSILON {
             1.0
         } else {
@@ -19374,6 +20752,7 @@ WHERE pcv.model = ?1
                 project_path,
                 doc_path,
                 doc_rel_path: doc_rel_path.clone(),
+                doc_mtime,
                 semantic: semantic.clamp(0.0, 1.0),
                 lexical: 0.0,
                 graph: 0.0,
@@ -19492,7 +20871,8 @@ fn apply_graph_chunk_expansion(
     Ok(())
 }
 
-fn evidence_hit_from_chunk(row: &ChunkSignal, score: f64) -> EvidenceHit {
+fn evidence_hit_from_chunk(row: &ChunkSignal, score: f64, fx: &FreshnessCtx) -> EvidenceHit {
+    let fresh = fx.info(&row.doc_path, row.doc_mtime);
     EvidenceHit {
         chunk_id: row.chunk_id,
         chunk_index: row.chunk_index,
@@ -19505,6 +20885,12 @@ fn evidence_hit_from_chunk(row: &ChunkSignal, score: f64) -> EvidenceHit {
         relation: row.relation.clone(),
         quality: row.quality,
         excerpt: row.excerpt.clone(),
+        content_date: fresh.content_date,
+        date_source: fresh.date_source,
+        age_days: fresh.age_days,
+        freshness_tier: fresh.tier.to_string(),
+        is_record: fresh.is_record,
+        recency: fresh.recency,
     }
 }
 
@@ -19538,7 +20924,8 @@ SELECT
     pc.doc_path,
     pc.doc_rel_path,
     pc.chunk_index,
-    pc.text
+    pc.text,
+    pc.doc_mtime
 FROM project_chunks pc
 JOIN projects p ON p.id = pc.project_id
 WHERE pc.id IN ({})
@@ -19556,6 +20943,7 @@ WHERE pc.id IN ({})
                 let doc_rel_path: String = row.get(3)?;
                 let chunk_index: i64 = row.get(4)?;
                 let text: String = row.get(5)?;
+                let doc_mtime: f64 = row.get(6)?;
                 Ok((
                     chunk_id,
                     project_path,
@@ -19563,11 +20951,12 @@ WHERE pc.id IN ({})
                     doc_rel_path,
                     chunk_index,
                     text,
+                    doc_mtime,
                 ))
             })
             .map_err(|e| format!("failed querying chunk metadata lookup: {}", e))?;
         for row in rows {
-            let (chunk_id, project_path, doc_path, doc_rel_path, chunk_index, text) =
+            let (chunk_id, project_path, doc_path, doc_rel_path, chunk_index, text, doc_mtime) =
                 row.map_err(|e| format!("failed reading chunk metadata lookup row: {}", e))?;
             out.insert(
                 chunk_id,
@@ -19577,6 +20966,7 @@ WHERE pc.id IN ({})
                     project_path,
                     doc_path,
                     doc_rel_path: doc_rel_path.clone(),
+                    doc_mtime,
                     semantic: *semantic_scores.get(&chunk_id).unwrap_or(&0.0),
                     lexical: *lexical_scores.get(&chunk_id).unwrap_or(&0.0),
                     graph: 0.0,
@@ -19593,6 +20983,7 @@ WHERE pc.id IN ({})
 fn project_evidence(
     fused_chunks: &HashMap<i64, ChunkSignal>,
     cfg: &ConfigValues,
+    fx: &FreshnessCtx,
 ) -> HashMap<String, Vec<EvidenceHit>> {
     let mut by_project: HashMap<String, Vec<&ChunkSignal>> = HashMap::new();
     for chunk in fused_chunks.values() {
@@ -19606,7 +20997,7 @@ fn project_evidence(
     for (project_path, rows) in by_project {
         let mut hits: Vec<EvidenceHit> = Vec::new();
         for row in rows {
-            hits.push(evidence_hit_from_chunk(row, chunk_base_score(row, cfg)));
+            hits.push(evidence_hit_from_chunk(row, chunk_base_score(row, cfg), fx));
         }
         hits.sort_by(|a, b| {
             b.score
@@ -19710,6 +21101,7 @@ fn rank_by_frecency_only(conn: &Connection, limit: usize) -> Result<Vec<RankedRe
             semantic: 0.0,
             frecency: fr,
             graph: gscore,
+            recency: 0.0,
             evidence: Vec::new(),
         });
     }
@@ -19918,25 +21310,224 @@ struct QueryWeights {
     frecency: f64,
 }
 
+
+/// File extensions that mark a query word as a file name: the indexable suffixes plus
+/// common code/config extensions people type even though those files are not indexed.
+fn known_file_extension(ext: &str) -> bool {
+    let e = ext.to_ascii_lowercase();
+    if e.is_empty() || e.len() > 10 || !e.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return false;
+    }
+    is_indexable_suffix(&format!(".{}", e))
+        || matches!(
+            e.as_str(),
+            "rb" | "kt"
+                | "kts"
+                | "swift"
+                | "scala"
+                | "php"
+                | "cs"
+                | "css"
+                | "scss"
+                | "less"
+                | "xml"
+                | "csv"
+                | "tsv"
+                | "ini"
+                | "cfg"
+                | "conf"
+                | "env"
+                | "lock"
+                | "proto"
+                | "tf"
+                | "hcl"
+                | "ipynb"
+                | "pdf"
+                | "log"
+                | "mjs"
+                | "cjs"
+                | "vue"
+                | "svelte"
+                | "dart"
+                | "lua"
+                | "pl"
+                | "pm"
+                | "gradle"
+                | "cmake"
+                | "mk"
+                | "bat"
+                | "ps1"
+                | "psm1"
+                | "wasm"
+                | "sol"
+        )
+}
+
+/// Directory names common enough in repositories that `name/other` reads as a path even in
+/// the middle of a sentence ("look in docs/sessions"), unlike prose slashes ("update/enhance").
+const PATH_LIKE_DIR_NAMES: &[&str] = &[
+    "src",
+    "docs",
+    "doc",
+    "lib",
+    "libs",
+    "bin",
+    "test",
+    "tests",
+    "spec",
+    "crates",
+    "pkg",
+    "cmd",
+    "app",
+    "apps",
+    "api",
+    "config",
+    "configs",
+    "scripts",
+    "internal",
+    "examples",
+    "assets",
+    "static",
+    "public",
+    "include",
+    "build",
+    "dist",
+    "target",
+    "tmp",
+    "sessions",
+    "notes",
+    "packages",
+    "modules",
+    "components",
+    "utils",
+    "core",
+    "data",
+    "etc",
+    "usr",
+    "var",
+    "home",
+    "opt",
+    "users",
+    "vendor",
+    "node_modules",
+    "migrations",
+    "templates",
+    "fixtures",
+    "handoffs",
+];
+
+/// Returns the trimmed word when `token` (one whitespace-delimited word of a query) looks
+/// like a filesystem path, a file name or a glob rather than prose that happens to contain
+/// a slash. `short_query` is true when the token is the whole query, so "auth/token" alone
+/// counts while "update/enhance retrivio" or "update/enhance" inside a sentence does not.
+fn path_like_token(token: &str, short_query: bool) -> Option<&str> {
+    let mut t = token.trim_matches(|c: char| {
+        matches!(
+            c,
+            '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | ',' | ';' | ':'
+                | '!' | '?'
+        )
+    });
+    if t.len() > 1 && t.ends_with('.') {
+        t = &t[..t.len() - 1];
+    }
+    if t.is_empty() {
+        return None;
+    }
+    // Explicit path prefixes, UNC shares and Windows drive letters.
+    if t.starts_with('/')
+        || t.starts_with("./")
+        || t.starts_with("../")
+        || t.starts_with("~/")
+        || t.starts_with(".\\")
+        || t.starts_with("..\\")
+        || t.starts_with("\\\\")
+    {
+        return Some(t);
+    }
+    let b = t.as_bytes();
+    if b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/')
+    {
+        return Some(t);
+    }
+    let normalized = t.replace('\\', "/");
+    let trailing_slash = normalized.len() > 1 && normalized.ends_with('/');
+    let body = normalized.trim_end_matches('/');
+    let segments: Vec<&str> = body.split('/').collect();
+    let last = segments.last().copied().unwrap_or("");
+    // Globs and file names: "*.rs", ".md", "README.md", "middleware.ts", "src/auth/token.rs".
+    let ext = last.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
+    if !ext.is_empty() && known_file_extension(ext) {
+        return Some(t);
+    }
+    // Dotfiles: ".gitignore", ".npmrc" (lowercase, one leading dot, no other dot).
+    if segments.len() == 1
+        && last.len() >= 3
+        && last.starts_with('.')
+        && !last[1..].contains('.')
+        && last[1..]
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+    {
+        return Some(t);
+    }
+    // Slash-separated segments without an extension need real segment names ("1/IAM" and
+    // "w/o" are prose); "src/" keeps its trailing slash as the path signal.
+    if segments.len() < 2 && !trailing_slash {
+        return None;
+    }
+    if segments.iter().any(|s| s.len() < 2) {
+        return None;
+    }
+    // Dates and fractions: "09/19", "2026/09/19", "10/20".
+    if segments
+        .iter()
+        .all(|s| s.chars().all(|c| c.is_ascii_digit()))
+    {
+        return None;
+    }
+    if trailing_slash || segments.len() >= 3 {
+        return Some(t);
+    }
+    // Exactly one slash. Path-flavoured punctuation ("202609-ai-handoff/notes", "my_pkg/mod"),
+    // a well-known directory name ("docs/sessions") or a query that is just this token make
+    // it a path; two plain words ("update/enhance", "and/or", "AWS/S3") stay prose.
+    let plain_words = segments
+        .iter()
+        .all(|s| s.chars().all(|c| c.is_ascii_alphanumeric()));
+    if !plain_words || short_query {
+        return Some(t);
+    }
+    let known_dir = segments
+        .iter()
+        .any(|s| PATH_LIKE_DIR_NAMES.contains(&s.to_ascii_lowercase().as_str()));
+    if known_dir {
+        Some(t)
+    } else {
+        None
+    }
+}
+
+/// The words of `query` that look like paths, file names or globs (see `path_like_token`).
+fn query_path_like_tokens(query: &str) -> Vec<String> {
+    let words: Vec<&str> = query.split_whitespace().collect();
+    let short_query = words.len() == 1;
+    words
+        .iter()
+        .filter_map(|w| path_like_token(w, short_query))
+        .map(|s| s.to_string())
+        .collect()
+}
+
 impl QueryType {
     /// Classify a query string into a QueryType using heuristics.
     fn classify(query: &str) -> QueryType {
         let q = query.trim();
 
-        // PathQuery: contains path separators or file extensions
-        if q.contains('/') || q.contains('\\') {
-            return QueryType::PathQuery;
-        }
-        if q.starts_with("*.")
-            || q.contains(".rs")
-            || q.contains(".py")
-            || q.contains(".ts")
-            || q.contains(".js")
-            || q.contains(".go")
-            || q.contains(".java")
-            || q.contains(".cpp")
-            || q.contains(".c")
-        {
+        // PathQuery: some word looks like a path, a file name or a glob ("src/auth",
+        // "middleware.ts", "*.rs", ".md", "docs/sessions"). A slash inside prose
+        // ("update/enhance", "1/IAM") does not count; see `path_like_token`.
+        if !query_path_like_tokens(q).is_empty() {
             return QueryType::PathQuery;
         }
 
@@ -19981,16 +21572,23 @@ impl QueryType {
             "let ",
             "var ",
         ];
-        if code_keywords
-            .iter()
-            .any(|kw| lower.starts_with(kw) || lower.contains(&format!(" {}", kw.trim())))
-        {
+        // Whole-word match only: "lets" is not `let`, "users" is not `use`.
+        if code_keywords.iter().any(|kw| {
+            lower.starts_with(kw)
+                || lower.contains(&format!(" {}", kw))
+                || lower.ends_with(&format!(" {}", kw.trim()))
+        }) {
             return QueryType::CodePattern;
         }
 
         // Symbol: looks like an identifier (camelCase, snake_case, PascalCase, UPPER_CASE)
         // Heuristic: no spaces, or 1-2 tokens that look like identifiers
         let tokens: Vec<&str> = q.split_whitespace().collect();
+        // A slash that survived the path check is prose ("update/enhance", "1/IAM"): words,
+        // not an identifier, however short the query.
+        if tokens.iter().any(|t| t.contains('/')) {
+            return QueryType::NaturalLanguage;
+        }
         if tokens.len() <= 2 {
             let all_look_like_symbols = tokens.iter().all(|t| {
                 let has_case_transition = t
@@ -20065,6 +21663,145 @@ impl QueryType {
             QueryType::CodePattern => (base_semantic.max(120), base_lexical.max(120)),
             QueryType::PathQuery => (base_semantic.min(40), base_lexical.max(80)),
         }
+    }
+}
+
+#[cfg(test)]
+mod query_type_tests {
+    use super::*;
+
+    #[test]
+    fn prose_slashes_are_not_paths() {
+        assert_eq!(
+            QueryType::classify("update/enhance retrivio"),
+            QueryType::NaturalLanguage
+        );
+        assert_eq!(
+            QueryType::classify("ok well lets update/enhance retrivio to suit our needs"),
+            QueryType::NaturalLanguage
+        );
+        assert_ne!(QueryType::classify("1/IAM role"), QueryType::PathQuery);
+        assert_ne!(
+            QueryType::classify("compare AWS/S3 to GCS buckets"),
+            QueryType::PathQuery
+        );
+        assert_ne!(QueryType::classify("09/19"), QueryType::PathQuery);
+        assert_ne!(
+            QueryType::classify("meeting on 09/19 at noon"),
+            QueryType::PathQuery
+        );
+        assert_ne!(
+            QueryType::classify("3/4 of the fleet"),
+            QueryType::PathQuery
+        );
+        assert!(query_path_like_tokens("2026/09/19").is_empty());
+        assert!(query_path_like_tokens("see https://example.com/x for details").is_empty());
+        assert!(query_path_like_tokens("ok well lets update/enhance retrivio").is_empty());
+        assert!(query_path_like_tokens("either and/or both of them").is_empty());
+    }
+
+    #[test]
+    fn real_paths_globs_and_file_names_are_path_queries() {
+        assert_eq!(
+            QueryType::classify("fix src/auth/token.rs"),
+            QueryType::PathQuery
+        );
+        assert_eq!(QueryType::classify("docs/sessions"), QueryType::PathQuery);
+        assert_eq!(
+            QueryType::classify("look in docs/sessions for the handoff"),
+            QueryType::PathQuery
+        );
+        assert_eq!(QueryType::classify("*.rs"), QueryType::PathQuery);
+        assert_eq!(QueryType::classify(".md"), QueryType::PathQuery);
+        assert_eq!(QueryType::classify("middleware.ts"), QueryType::PathQuery);
+        assert_eq!(
+            QueryType::classify("~/.retrivio/config.toml"),
+            QueryType::PathQuery
+        );
+        assert_eq!(QueryType::classify("./scripts"), QueryType::PathQuery);
+        assert_eq!(QueryType::classify("auth/token"), QueryType::PathQuery);
+        assert_eq!(
+            QueryType::classify("see 202609-ai-handoff/notes please"),
+            QueryType::PathQuery
+        );
+        assert_eq!(
+            query_path_like_tokens("fix (src/auth/token.rs) now"),
+            vec!["src/auth/token.rs".to_string()]
+        );
+        assert_eq!(
+            QueryType::classify(r"\\server\share"),
+            QueryType::PathQuery
+        );
+        assert_eq!(QueryType::classify(r"C:\x\y"), QueryType::PathQuery);
+        assert_eq!(QueryType::classify(".gitignore"), QueryType::PathQuery);
+        assert_eq!(
+            QueryType::classify("open README.markdown"),
+            QueryType::PathQuery
+        );
+    }
+
+    #[test]
+    fn other_query_types_are_unchanged() {
+        assert_eq!(
+            QueryType::classify("reindex_project_chunks"),
+            QueryType::Symbol
+        );
+        assert_eq!(
+            QueryType::classify("how does auth work"),
+            QueryType::NaturalLanguage
+        );
+        assert_eq!(
+            QueryType::classify("fn keyword_path_chunk_scores"),
+            QueryType::CodePattern
+        );
+        assert_eq!(
+            QueryType::classify("impl Display for Foo"),
+            QueryType::CodePattern
+        );
+        assert_eq!(QueryType::classify("where is the struct"), QueryType::NaturalLanguage);
+        // Keyword prefixes inside ordinary words are not code keywords.
+        assert_eq!(
+            QueryType::classify("how do users log in"),
+            QueryType::NaturalLanguage
+        );
+        assert_eq!(
+            QueryType::classify("show me the types of storage classes"),
+            QueryType::NaturalLanguage
+        );
+    }
+
+    #[test]
+    fn keyword_path_scores_only_scan_for_path_words() {
+        let conn = Connection::open_in_memory().expect("open in-memory sqlite");
+        init_schema(&conn).expect("init schema");
+        conn.execute_batch(
+            r#"
+INSERT INTO projects(id, path, title, summary, project_mtime, last_indexed)
+VALUES (1, '/p/retrivio', 'retrivio', 'r', 0, 0), (2, '/p/other', 'other', 'o', 0, 0);
+INSERT INTO project_chunks(id, project_id, doc_path, doc_rel_path, doc_mtime, chunk_index, token_count, text_hash, text, updated_at)
+VALUES (1, 1, '/p/retrivio/docs/sessions/handoff.md', 'docs/sessions/handoff.md', 0, 0, 3, 'a', 'handoff', 0),
+       (2, 1, '/p/retrivio/src/main.rs', 'src/main.rs', 0, 0, 3, 'b', 'main', 0),
+       (3, 2, '/p/other/notes/update.md', 'notes/update.md', 0, 0, 3, 'c', 'update enhance', 0);
+"#,
+        )
+        .expect("seed");
+        // Prose with a slash: no path word, more than two words -> nothing scanned.
+        let none = keyword_path_chunk_scores(
+            &conn,
+            "ok well lets update/enhance retrivio to suit our needs",
+            50,
+        )
+        .expect("scores");
+        assert!(none.is_empty());
+        // A path word only matches files on that path.
+        let hits = keyword_path_chunk_scores(&conn, "open docs/sessions now", 50).expect("scores");
+        assert_eq!(hits.keys().copied().collect::<Vec<_>>(), vec![1]);
+        assert!((hits[&1].lexical - 1.0).abs() < 1e-9);
+        // Symbol-shaped queries still match by file and project path.
+        let sym = keyword_path_chunk_scores(&conn, "main", 50).expect("scores");
+        assert!(sym.contains_key(&2));
+        let proj = keyword_path_chunk_scores(&conn, "retrivio", 50).expect("scores");
+        assert!(proj.contains_key(&1) && proj.contains_key(&2) && !proj.contains_key(&3));
     }
 }
 
@@ -20251,6 +21988,51 @@ struct ConfigValues {
     reranker_pool_size: usize,
     reranker_batch_size: usize,
     reranker_timeout_ms: u64,
+    // Freshness model (spec §4): recency blend weights, half-lives and record patterns
+    rank_recency_weight: f64,
+    rank_recency_record_weight: f64,
+    recency_half_life_days: f64,
+    recency_record_half_life_days: f64,
+    recency_record_patterns: String,
+    // Hygiene (spec §7): extra directory names skipped at discovery and corpus walk
+    skip_dir_names: String,
+    // Proactive recall (spec §5)
+    recall_max_leads: usize,
+    recall_min_score_ratio: f64,
+    recall_min_abs_score: f64,
+    recall_band_ratio: f64,
+    recall_roots: String,
+    recall_excerpts: bool,
+    recall_system_message: bool,
+    recall_semantic: String,
+    recall_session_ttl_days: f64,
+}
+
+/// Default comma-separated path patterns that mark a document as a point-in-time record.
+const DEFAULT_RECENCY_RECORD_PATTERNS: &str =
+    "transcript,customer-signals,docs/sessions,HANDOFF,meeting,call-notes,.srt";
+
+fn parse_bool_config(map: &std::collections::HashMap<String, String>, key: &str, default: bool) -> bool {
+    map.get(key)
+        .map(|v| matches!(v.trim().to_lowercase().as_str(), "true" | "1" | "yes"))
+        .unwrap_or(default)
+}
+
+fn parse_bool_setting(key: &str, value: &str) -> Result<bool, String> {
+    match value.trim().to_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Ok(true),
+        "false" | "0" | "no" | "off" => Ok(false),
+        _ => Err(format!("{} must be true or false", key)),
+    }
+}
+
+/// Split a comma-separated config value into trimmed, non-empty items.
+fn split_csv_setting(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
 }
 
 fn default_config_root() -> PathBuf {
@@ -20480,6 +22262,78 @@ impl ConfigValues {
             .unwrap_or(3000)
             .clamp(500, 30_000);
 
+        // Freshness model (spec §4)
+        let rank_recency_weight = map
+            .get("rank_recency_weight")
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.12)
+            .clamp(0.0, 0.5);
+        let rank_recency_record_weight = map
+            .get("rank_recency_record_weight")
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.04)
+            .clamp(0.0, 0.5);
+        let recency_half_life_days = map
+            .get("recency_half_life_days")
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(21.0)
+            .clamp(1.0, 3650.0);
+        let recency_record_half_life_days = map
+            .get("recency_record_half_life_days")
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(90.0)
+            .clamp(1.0, 3650.0);
+        let recency_record_patterns = map
+            .get("recency_record_patterns")
+            .map(|v| v.trim().to_string())
+            .unwrap_or_else(|| DEFAULT_RECENCY_RECORD_PATTERNS.to_string());
+
+        // Hygiene (spec §7)
+        let skip_dir_names = map
+            .get("skip_dir_names")
+            .map(|v| v.trim().to_string())
+            .unwrap_or_default();
+
+        // Proactive recall (spec §5)
+        let recall_max_leads = map
+            .get("recall_max_leads")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(3)
+            .clamp(1, 5);
+        let recall_min_score_ratio = map
+            .get("recall_min_score_ratio")
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.80)
+            .clamp(0.1, 1.0);
+        let recall_min_abs_score = map
+            .get("recall_min_abs_score")
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.40)
+            .clamp(0.0, 1.0);
+        let recall_band_ratio = map
+            .get("recall_band_ratio")
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.90)
+            .clamp(0.5, 1.0);
+        let recall_roots = map
+            .get("recall_roots")
+            .map(|v| v.trim().to_string())
+            .unwrap_or_default();
+        let recall_excerpts = parse_bool_config(&map, "recall_excerpts", true);
+        let recall_system_message = parse_bool_config(&map, "recall_system_message", false);
+        let mut recall_semantic = map
+            .get("recall_semantic")
+            .map(|v| v.trim().to_lowercase())
+            .unwrap_or_else(|| "auto".to_string());
+        if !matches!(recall_semantic.as_str(), "auto" | "on" | "off") {
+            recall_semantic = "auto".to_string();
+        }
+        let recall_session_ttl_days = map
+            .get("recall_session_ttl_days")
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(3.0)
+            .clamp(1.0, 30.0);
+
         Self {
             root: map
                 .get("root")
@@ -20524,7 +22378,40 @@ impl ConfigValues {
             reranker_pool_size,
             reranker_batch_size,
             reranker_timeout_ms,
+            rank_recency_weight,
+            rank_recency_record_weight,
+            recency_half_life_days,
+            recency_record_half_life_days,
+            recency_record_patterns,
+            skip_dir_names,
+            recall_max_leads,
+            recall_min_score_ratio,
+            recall_min_abs_score,
+            recall_band_ratio,
+            recall_roots,
+            recall_excerpts,
+            recall_system_message,
+            recall_semantic,
+            recall_session_ttl_days,
         }
+    }
+
+    /// Path patterns (trimmed, non-empty) that classify a document as a record.
+    fn record_patterns(&self) -> Vec<String> {
+        split_csv_setting(&self.recency_record_patterns)
+    }
+
+    /// Extra directory names to skip during discovery and corpus walks.
+    fn skip_dir_name_set(&self) -> HashSet<String> {
+        split_csv_setting(&self.skip_dir_names).into_iter().collect()
+    }
+
+    /// Absolute roots that `retrivio recall` searches; empty means every tracked root.
+    pub(crate) fn recall_root_list(&self) -> Vec<PathBuf> {
+        split_csv_setting(&self.recall_roots)
+            .iter()
+            .map(|s| normalize_path(s))
+            .collect()
     }
 }
 
@@ -20653,6 +22540,30 @@ fn write_config_file(path: &Path, cfg: &ConfigValues) -> Result<(), String> {
         format!("reranker_pool_size = {}", cfg.reranker_pool_size),
         format!("reranker_batch_size = {}", cfg.reranker_batch_size),
         format!("reranker_timeout_ms = {}", cfg.reranker_timeout_ms),
+        format!("rank_recency_weight = {:.6}", cfg.rank_recency_weight),
+        format!(
+            "rank_recency_record_weight = {:.6}",
+            cfg.rank_recency_record_weight
+        ),
+        format!("recency_half_life_days = {:.6}", cfg.recency_half_life_days),
+        format!(
+            "recency_record_half_life_days = {:.6}",
+            cfg.recency_record_half_life_days
+        ),
+        format!(
+            "recency_record_patterns = \"{}\"",
+            toml_escape(&cfg.recency_record_patterns)
+        ),
+        format!("skip_dir_names = \"{}\"", toml_escape(&cfg.skip_dir_names)),
+        format!("recall_max_leads = {}", cfg.recall_max_leads),
+        format!("recall_min_score_ratio = {:.6}", cfg.recall_min_score_ratio),
+        format!("recall_min_abs_score = {:.6}", cfg.recall_min_abs_score),
+        format!("recall_band_ratio = {:.6}", cfg.recall_band_ratio),
+        format!("recall_roots = \"{}\"", toml_escape(&cfg.recall_roots)),
+        format!("recall_excerpts = {}", cfg.recall_excerpts),
+        format!("recall_system_message = {}", cfg.recall_system_message),
+        format!("recall_semantic = \"{}\"", toml_escape(&cfg.recall_semantic)),
+        format!("recall_session_ttl_days = {:.6}", cfg.recall_session_ttl_days),
         String::new(),
     ];
     fs::write(path, lines.join("\n")).map_err(|e| format!("failed writing config: {}", e))
@@ -21025,6 +22936,9 @@ fn open_db_rw(db_path: &Path) -> Result<Connection, String> {
         fs::create_dir_all(parent).map_err(|e| format!("failed creating db dir: {}", e))?;
     }
     let conn = Connection::open(db_path).map_err(|e| format!("failed opening database: {}", e))?;
+    // Wait briefly on SQLITE_BUSY so a concurrent watcher write never fails readers outright.
+    conn.busy_timeout(DB_BUSY_TIMEOUT)
+        .map_err(|e| format!("failed setting db busy timeout: {}", e))?;
     conn.execute_batch(
         r#"
 PRAGMA foreign_keys = ON;
@@ -21037,12 +22951,17 @@ PRAGMA synchronous = NORMAL;
     Ok(conn)
 }
 
+/// How long a connection waits on a locked database before returning SQLITE_BUSY.
+const DB_BUSY_TIMEOUT: Duration = Duration::from_millis(2000);
+
 fn open_db_read_only(db_path: &Path) -> Result<Connection, String> {
     let conn = Connection::open_with_flags(
         db_path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(|e| format!("failed opening database readonly: {}", e))?;
+    conn.busy_timeout(DB_BUSY_TIMEOUT)
+        .map_err(|e| format!("failed setting db busy timeout: {}", e))?;
     Ok(conn)
 }
 
@@ -21580,6 +23499,339 @@ ORDER BY path
     Ok(out)
 }
 
+/// What one indexing run covers.
+///
+/// Discovery (turning a root directory into project directories) only ever runs on roots.
+/// Project directories are taken as given: a project with several child directories and no
+/// marker file looks like a workspace to discovery and would otherwise be split into one
+/// duplicate "project" row per child.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum IndexScope {
+    /// Every tracked root with full discovery (sweeps, `index`, bare `refresh`).
+    AllRoots,
+    /// Discovery on exactly these root directories (tracked or ad hoc) plus exactly these
+    /// project directories, re-collected as they are.
+    Targets {
+        roots: Vec<PathBuf>,
+        projects: Vec<PathBuf>,
+    },
+}
+
+impl IndexScope {
+    fn roots(roots: Vec<PathBuf>) -> Self {
+        Self::Targets {
+            roots,
+            projects: Vec::new(),
+        }
+    }
+
+    fn projects(projects: Vec<PathBuf>) -> Self {
+        Self::Targets {
+            roots: Vec::new(),
+            projects,
+        }
+    }
+
+    /// True when a scoped run has nothing to do.
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::AllRoots => false,
+            Self::Targets { roots, projects } => roots.is_empty() && projects.is_empty(),
+        }
+    }
+
+    /// Every directory named by the scope, roots first.
+    fn target_paths(&self) -> Vec<PathBuf> {
+        match self {
+            Self::AllRoots => Vec::new(),
+            Self::Targets { roots, projects } => {
+                roots.iter().chain(projects.iter()).cloned().collect()
+            }
+        }
+    }
+}
+
+/// Resolve an [`IndexScope`] into the tracked roots (needed for per-project excludes) and the
+/// exact project directories the run covers.
+fn resolve_index_targets(
+    conn: &Connection,
+    cfg: &ConfigValues,
+    scope: &IndexScope,
+) -> Result<(Vec<TrackedRoot>, Vec<PathBuf>), String> {
+    let mut roots = resolve_roots(conn, cfg, None)?;
+    match scope {
+        IndexScope::AllRoots => {
+            let projects = discover_projects(&roots);
+            Ok((roots, projects))
+        }
+        IndexScope::Targets {
+            roots: root_paths,
+            projects: project_paths,
+        } => {
+            let scoped = resolve_roots(conn, cfg, Some(root_paths.clone()))?;
+            let mut projects = discover_projects(&scoped);
+            for root in scoped {
+                if !roots.iter().any(|t| t.path == root.path) {
+                    roots.push(root);
+                }
+            }
+            for raw in project_paths {
+                let project = normalize_path(&raw.to_string_lossy());
+                if project.is_dir() && !projects.contains(&project) {
+                    projects.push(project);
+                }
+            }
+            Ok((roots, projects))
+        }
+    }
+}
+
+/// Interpret the paths given to a scoped refresh (`retrivio refresh <path>`, `POST /refresh`,
+/// MCP `run_forced_refresh`).
+///
+/// A tracked root gets discovery, as a full run would. A project (discovery of its tracked
+/// root yields it, or a `projects` row exists for it) is re-collected as that one project and
+/// never discovered into sub-projects. Any other path is an error naming the project or root
+/// to refresh instead.
+fn plan_scoped_refresh(
+    conn: &Connection,
+    cfg: &ConfigValues,
+    paths: &[PathBuf],
+) -> Result<IndexScope, String> {
+    let tracked = resolve_roots(conn, cfg, None)?;
+    let root_paths: Vec<PathBuf> = tracked.iter().map(|r| r.path.clone()).collect();
+    let mut discovered_by_root: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
+    let mut roots: Vec<PathBuf> = Vec::new();
+    let mut projects: Vec<PathBuf> = Vec::new();
+
+    for raw in paths {
+        let path = normalize_path(&raw.to_string_lossy());
+        if !path.is_dir() {
+            return Err(format!("{} is not a directory", path.display()));
+        }
+        if root_paths.contains(&path) {
+            if !roots.contains(&path) {
+                roots.push(path);
+            }
+            continue;
+        }
+        let root = longest_prefix_match(&path, &root_paths).cloned();
+        let discovered: Vec<PathBuf> = match &root {
+            Some(r) => discovered_by_root
+                .entry(r.clone())
+                .or_insert_with(|| {
+                    tracked
+                        .iter()
+                        .find(|t| t.path == *r)
+                        .map(|t| discover_root_projects(&t.path, &t.absolute_excludes()))
+                        .unwrap_or_default()
+                })
+                .clone(),
+            None => Vec::new(),
+        };
+        if discovered.contains(&path) {
+            if !projects.contains(&path) {
+                projects.push(path);
+            }
+            continue;
+        }
+        let containing = discovered
+            .iter()
+            .filter(|q| path.starts_with(q))
+            .max_by_key(|q| path_depth(q))
+            .cloned();
+        if get_project_by_path(conn, &path.to_string_lossy())?.is_some() {
+            if let Some(q) = &containing {
+                eprintln!(
+                    "note: {} is indexed as its own project but discovery now places it inside {}; `retrivio prune` will remove the extra row",
+                    path.display(),
+                    q.display()
+                );
+            }
+            if !projects.contains(&path) {
+                projects.push(path);
+            }
+            continue;
+        }
+        let mut msg = format!(
+            "{} is neither a tracked root nor a discovered project",
+            path.display()
+        );
+        match (&root, &containing) {
+            (_, Some(q)) => msg.push_str(&format!(
+                "; it is part of project {0}. Run `retrivio refresh {0}` instead",
+                q.display()
+            )),
+            (Some(r), None) => msg.push_str(&format!(
+                " under tracked root {0}. Run `retrivio refresh {0}` to refresh that root",
+                r.display()
+            )),
+            (None, None) => msg.push_str(&format!(
+                ". It is not under any tracked root; run `retrivio add {}` to track it",
+                path.display()
+            )),
+        }
+        return Err(msg);
+    }
+    Ok(IndexScope::Targets { roots, projects })
+}
+
+#[cfg(test)]
+mod scoped_refresh_tests {
+    use super::*;
+
+    /// A workspace root under the repo `tmp/` with two projects, each holding two child
+    /// directories and no marker file, so discovery on a project would split it.
+    fn workspace(name: &str) -> PathBuf {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tmp")
+            .join(format!("refresh-{}-{}", name, std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        for (project, subs) in [("proj-a", ["notes", "reports"]), ("proj-b", ["src", "plans"])] {
+            for sub in subs {
+                let dir = root.join(project).join(sub);
+                fs::create_dir_all(&dir).expect("create sub dir");
+                fs::write(dir.join("readme.md"), format!("{} {}", project, sub)).expect("write");
+            }
+            fs::write(root.join(project).join("README.md"), project).expect("write readme");
+        }
+        normalize_path(&root.to_string_lossy())
+    }
+
+    fn conn_tracking(root: &Path) -> Connection {
+        let conn = Connection::open_in_memory().expect("open in-memory sqlite");
+        init_schema(&conn).expect("init schema");
+        ensure_tracked_root_conn(&conn, root, 0.0).expect("track root");
+        conn
+    }
+
+    fn cfg() -> ConfigValues {
+        ConfigValues::from_map(HashMap::new())
+    }
+
+    #[test]
+    fn refreshing_a_project_path_targets_exactly_that_project() {
+        let root = workspace("project");
+        let conn = conn_tracking(&root);
+        let a = root.join("proj-a");
+
+        let scope = plan_scoped_refresh(&conn, &cfg(), &[a.clone()]).expect("plan");
+        assert_eq!(scope, IndexScope::projects(vec![a.clone()]));
+        let (roots, projects) = resolve_index_targets(&conn, &cfg(), &scope).expect("resolve");
+        assert_eq!(projects, vec![a.clone()], "only the project itself, never its children");
+        assert_eq!(roots.len(), 1);
+
+        // prune's stale-row criterion: a row survives when discovery of the tracked roots
+        // yields its path. Every target here is such a path, so prune finds nothing to remove.
+        let discovered = discover_projects(&roots);
+        assert!(projects.iter().all(|p| discovered.contains(p)));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn refreshing_the_root_targets_both_projects() {
+        let root = workspace("root");
+        let conn = conn_tracking(&root);
+
+        let scope = plan_scoped_refresh(&conn, &cfg(), &[root.clone()]).expect("plan");
+        assert_eq!(scope, IndexScope::roots(vec![root.clone()]));
+        let (_, projects) = resolve_index_targets(&conn, &cfg(), &scope).expect("resolve");
+        assert_eq!(projects, vec![root.join("proj-a"), root.join("proj-b")]);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn refreshing_a_child_directory_or_untracked_path_is_an_error_naming_the_alternative() {
+        let root = workspace("errors");
+        let conn = conn_tracking(&root);
+        let a = root.join("proj-a");
+
+        let err = plan_scoped_refresh(&conn, &cfg(), &[a.join("reports")]).unwrap_err();
+        assert!(err.contains("neither a tracked root nor a discovered project"), "{}", err);
+        assert!(err.contains(&format!("retrivio refresh {}", a.display())), "{}", err);
+
+        let outside = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tmp")
+            .join(format!("refresh-outside-{}", std::process::id()));
+        fs::create_dir_all(&outside).expect("create outside dir");
+        let err = plan_scoped_refresh(&conn, &cfg(), &[outside.clone()]).unwrap_err();
+        assert!(err.contains("not under any tracked root"), "{}", err);
+        assert!(err.contains("retrivio add"), "{}", err);
+
+        let err = plan_scoped_refresh(&conn, &cfg(), &[root.join("missing")]).unwrap_err();
+        assert!(err.contains("is not a directory"), "{}", err);
+        let _ = fs::remove_dir_all(&outside);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_indexed_project_row_is_refreshed_even_when_discovery_does_not_list_it() {
+        let root = workspace("indexed");
+        let conn = conn_tracking(&root);
+        let stale = root.join("proj-a").join("reports");
+        upsert_project(&conn, &stale.to_string_lossy(), "reports", "", 0.0, 0.0).expect("row");
+
+        let scope = plan_scoped_refresh(&conn, &cfg(), &[stale.clone()]).expect("plan");
+        assert_eq!(scope, IndexScope::projects(vec![stale.clone()]));
+        let (_, projects) = resolve_index_targets(&conn, &cfg(), &scope).expect("resolve");
+        assert_eq!(projects, vec![stale]);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mixed_paths_keep_roots_and_projects_apart_and_deduplicate() {
+        let root = workspace("mixed");
+        let conn = conn_tracking(&root);
+        let a = root.join("proj-a");
+        let scope = plan_scoped_refresh(&conn, &cfg(), &[a.clone(), root.clone(), a.clone()])
+            .expect("plan");
+        assert_eq!(
+            scope,
+            IndexScope::Targets {
+                roots: vec![root.clone()],
+                projects: vec![a.clone()]
+            }
+        );
+        let (_, projects) = resolve_index_targets(&conn, &cfg(), &scope).expect("resolve");
+        assert_eq!(projects, vec![a, root.join("proj-b")]);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn watch_events_inside_a_project_target_that_project_not_its_children() {
+        let root = workspace("watch");
+        let conn = conn_tracking(&root);
+        let tracked = resolve_roots(&conn, &cfg(), None).expect("roots");
+        let a = root.join("proj-a");
+        let mut pending: HashSet<PathBuf> = HashSet::new();
+        pending.insert(a.join("reports").join("readme.md"));
+        pending.insert(a.join("notes").join("readme.md"));
+
+        let (scope, force) = derive_watch_targets(&pending, &tracked);
+        assert_eq!(scope, IndexScope::projects(vec![a.clone()]));
+        assert_eq!(force, HashSet::from([a.clone()]));
+        let (_, projects) = resolve_index_targets(&conn, &cfg(), &scope).expect("resolve");
+        assert_eq!(projects, vec![a]);
+
+        // A new directory is discovered at event time and targeted as a project itself.
+        let fresh = root.join("proj-c");
+        fs::create_dir_all(&fresh).expect("create proj-c");
+        let mut pending: HashSet<PathBuf> = HashSet::new();
+        pending.insert(fresh.join("readme.md"));
+        let (scope, force) = derive_watch_targets(&pending, &tracked);
+        assert_eq!(scope, IndexScope::projects(vec![fresh.clone()]));
+        assert_eq!(force, HashSet::from([fresh]));
+
+        // A file under the root but inside no project falls back to discovery on the root.
+        let mut pending: HashSet<PathBuf> = HashSet::new();
+        pending.insert(root.join("notes.md"));
+        let (scope, force) = derive_watch_targets(&pending, &tracked);
+        assert_eq!(scope, IndexScope::roots(vec![root.clone()]));
+        assert!(force.is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+}
+
 fn resolve_roots(
     conn: &Connection,
     _cfg: &ConfigValues,
@@ -21793,6 +24045,42 @@ mod project_discovery_tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn extra_skip_dirs_from_config_are_honoured() {
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            "skip_dir_names".to_string(),
+            " zz-skip-me , zz-tmp,, ".to_string(),
+        );
+        let cfg = ConfigValues::from_map(map);
+        let set = cfg.skip_dir_name_set();
+        assert_eq!(set.len(), 2);
+        assert!(set.contains("zz-skip-me") && set.contains("zz-tmp"));
+        set_extra_skip_dirs(&cfg);
+        assert!(is_skip_dir("zz-skip-me"));
+        assert!(is_skip_dir("zz-tmp"));
+        assert!(is_skip_dir("node_modules"), "built-ins still apply");
+        assert!(!is_skip_dir("src"));
+        // The set is process-global and first-call-wins.
+        set_extra_skip_dirs(&ConfigValues::from_map(std::collections::HashMap::new()));
+        assert!(is_skip_dir("zz-skip-me"));
+
+        // Discovery consults the same predicate.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tmp")
+            .join(format!("test-skipdirs-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("zz-skip-me")).expect("create skipped dir");
+        fs::create_dir_all(root.join("keep-me")).expect("create kept dir");
+        let children = list_project_child_dirs(&root, &HashSet::new());
+        let names: Vec<String> = children
+            .iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+            .collect();
+        assert_eq!(names, vec!["keep-me".to_string()]);
+        let _ = fs::remove_dir_all(&root);
+    }
 
     fn temp_dir(prefix: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
@@ -22651,15 +24939,6 @@ ON CONFLICT(project_id) DO UPDATE SET
     Ok(())
 }
 
-fn clear_project_chunks(conn: &Connection, project_id: i64) -> Result<(), String> {
-    conn.execute(
-        "DELETE FROM project_chunks WHERE project_id = ?1",
-        params![project_id],
-    )
-    .map_err(|e| format!("failed clearing project chunks: {}", e))?;
-    Ok(())
-}
-
 /// Store extracted symbols for a project. Clears existing symbols first.
 fn store_project_symbols(
     conn: &Connection,
@@ -22866,19 +25145,28 @@ fn upsert_project_chunk(
     chunk: &ProjectChunk,
     updated_at: f64,
 ) -> Result<i64, String> {
-    let existing: Option<i64> = conn
+    let existing: Option<(i64, String)> = conn
         .query_row(
             r#"
-SELECT id
+SELECT id, text_hash
 FROM project_chunks
 WHERE project_id = ?1 AND doc_path = ?2 AND chunk_index = ?3
 "#,
             params![project_id, chunk.doc_path, chunk.chunk_index],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()
         .map_err(|e| format!("failed checking project chunk row: {}", e))?;
-    if let Some(chunk_id) = existing {
+    if let Some((chunk_id, old_hash)) = existing {
+        // The row keeps its id (its LanceDB vector is updated in place), but relation
+        // feedback describes the old text: drop it when the content changed.
+        if old_hash != chunk.text_hash {
+            conn.execute(
+                "DELETE FROM chunk_relation_feedback WHERE src_chunk_id = ?1 OR dst_chunk_id = ?1",
+                params![chunk_id],
+            )
+            .map_err(|e| format!("failed clearing stale chunk relation feedback: {}", e))?;
+        }
         conn.execute(
             r#"
 UPDATE project_chunks
@@ -23061,12 +25349,8 @@ fn reindex_project_chunks(
     chunks: &[ProjectChunk],
     now: f64,
     live_progress: Option<&Arc<LiveIndexProgress>>,
-) -> Result<(i64, i64, i64), String> {
+) -> Result<ReindexOutcome, String> {
     const CHUNK_EMBED_BATCH: usize = 512;
-    clear_project_chunks(conn, project_id)?;
-    if chunks.is_empty() {
-        return Ok((0, 0, 0));
-    }
     let mut vectorized = 0i64;
     let mut batch_ids: Vec<i64> = Vec::with_capacity(CHUNK_EMBED_BATCH);
     let mut batch_texts: Vec<String> = Vec::with_capacity(CHUNK_EMBED_BATCH);
@@ -23139,38 +25423,609 @@ fn reindex_project_chunks(
         }
     }
 
-    Ok((chunks.len() as i64, vectorized, 0))
+    // Drop rows the freshly collected corpus no longer contains (deleted files, newly
+    // excluded or skipped directories, files past the caps, chunk indices past the end of a
+    // file that shrank). Runs after every upsert and embedding succeeded, so a failed run
+    // leaves the previous rows in place. Surviving chunks keep their ids, so their LanceDB
+    // rows are updated in place; only the pruned ids need a LanceDB delete.
+    let keep = PruneKeepSet::from_chunks(chunks);
+    let pruned = prune_stale_project_rows(conn, project_id, &keep, false)?;
+    if !pruned.chunk_ids.is_empty() && lance_store_is_open() {
+        if let Err(e) = delete_lance_vectors_for_chunks(&pruned.chunk_ids) {
+            eprintln!(
+                "warning: LanceDB delete of {} stale vectors failed ({}); run `retrivio prune` to retry",
+                pruned.chunk_ids.len(),
+                e
+            );
+        }
+    }
+    Ok(ReindexOutcome {
+        rows: chunks.len() as i64,
+        vectors: vectorized,
+        failures: 0,
+        pruned,
+    })
 }
 
 fn remove_projects_not_in(conn: &Connection, keep_paths: &[String]) -> Result<i64, String> {
-    if keep_paths.is_empty() {
-        let removed = conn
-            .execute("DELETE FROM projects", [])
-            .map_err(|e| format!("failed clearing projects table: {}", e))?;
-        return Ok(removed as i64);
-    }
     let keep_set: HashSet<String> = keep_paths.iter().cloned().collect();
-    let mut stmt = conn
-        .prepare("SELECT path FROM projects ORDER BY path")
-        .map_err(|e| format!("failed preparing project list query: {}", e))?;
-    let rows = stmt
-        .query_map([], |row| row.get::<_, String>(0))
-        .map_err(|e| format!("failed listing existing projects: {}", e))?;
-    let mut delete_paths: Vec<String> = Vec::new();
-    for row in rows {
-        let path = row.map_err(|e| format!("failed reading existing project row: {}", e))?;
-        if !keep_set.contains(&path) {
-            delete_paths.push(path);
+    let delete_ids: Vec<i64> = {
+        let mut stmt = conn
+            .prepare("SELECT id, path FROM projects ORDER BY path")
+            .map_err(|e| format!("failed preparing project list query: {}", e))?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))
+            .map_err(|e| format!("failed listing existing projects: {}", e))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, path) =
+                row.map_err(|e| format!("failed reading existing project row: {}", e))?;
+            if !keep_set.contains(&path) {
+                out.push(id);
+            }
         }
-    }
+        out
+    };
     let mut removed = 0i64;
-    for path in delete_paths {
+    let mut stale_chunk_ids: Vec<i64> = Vec::new();
+    for id in delete_ids {
+        // sqlite cascades the project row to its chunks and vectors; LanceDB needs the ids.
+        stale_chunk_ids.extend(project_chunk_ids(conn, id)?);
         removed += conn
-            .execute("DELETE FROM projects WHERE path = ?1", params![path])
+            .execute("DELETE FROM projects WHERE id = ?1", params![id])
             .map_err(|e| format!("failed deleting stale project row: {}", e))?
             as i64;
     }
+    if !stale_chunk_ids.is_empty() && lance_store_is_open() {
+        if let Err(e) = delete_lance_vectors_for_chunks(&stale_chunk_ids) {
+            eprintln!(
+                "warning: LanceDB delete of {} vectors from removed projects failed ({}); run `retrivio prune` to retry",
+                stale_chunk_ids.len(),
+                e
+            );
+        }
+    }
     Ok(removed)
+}
+
+// ── Stale-row pruning ─────────────────────────────────────────────────────────
+//
+// Re-indexing upserts `project_chunks` rows keyed by (project_id, doc_path, chunk_index).
+// Rows for files that left the corpus (deleted, newly excluded, under a `skip_dir_names`
+// directory, past the per-project caps) or chunk indices past the end of a file that shrank
+// would otherwise live forever. These helpers delete them from sqlite (vectors, relation
+// feedback and symbol maps cascade via FK) and hand back the chunk ids so callers can drop
+// the LanceDB vectors as well. Pruning only runs on a project whose corpus was actually
+// collected; incremental runs that skip an unchanged project never reach it.
+
+/// The rows a freshly collected corpus says should survive a prune pass.
+#[derive(Debug, Default, Clone)]
+struct PruneKeepSet {
+    /// doc_path -> chunk indices present in the corpus.
+    by_doc: HashMap<String, HashSet<i64>>,
+    /// doc_rel_path values present in the corpus (the `project_files` manifest key).
+    rel_paths: HashSet<String>,
+}
+
+impl PruneKeepSet {
+    fn from_chunks(chunks: &[ProjectChunk]) -> Self {
+        let mut keep = PruneKeepSet::default();
+        for chunk in chunks {
+            keep.by_doc
+                .entry(chunk.doc_path.clone())
+                .or_default()
+                .insert(chunk.chunk_index);
+            keep.rel_paths.insert(chunk.doc_rel_path.clone());
+        }
+        keep
+    }
+
+    fn keeps_chunk(&self, doc_path: &str, chunk_index: i64) -> bool {
+        self.by_doc
+            .get(doc_path)
+            .map_or(false, |idx| idx.contains(&chunk_index))
+    }
+
+    fn keeps_doc(&self, doc_path: &str) -> bool {
+        self.by_doc.contains_key(doc_path)
+    }
+}
+
+/// What a prune pass removed (or, with `dry_run`, would remove) for one project.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct PruneOutcome {
+    /// `project_chunks` rows.
+    chunks: usize,
+    /// Distinct doc_paths that lost at least one chunk.
+    files: usize,
+    /// `project_files` manifest rows.
+    manifest_rows: usize,
+    /// `symbols` rows.
+    symbol_rows: usize,
+    /// `file_imports` rows.
+    import_rows: usize,
+    /// `file_dependency_edges` rows (matched by source file).
+    edge_rows: usize,
+    /// Ids of the removed chunks, for the LanceDB delete.
+    chunk_ids: Vec<i64>,
+}
+
+impl PruneOutcome {
+    fn is_empty(&self) -> bool {
+        self.chunks == 0
+            && self.manifest_rows == 0
+            && self.symbol_rows == 0
+            && self.import_rows == 0
+            && self.edge_rows == 0
+    }
+
+    fn absorb(&mut self, other: PruneOutcome) {
+        self.chunks += other.chunks;
+        self.files += other.files;
+        self.manifest_rows += other.manifest_rows;
+        self.symbol_rows += other.symbol_rows;
+        self.import_rows += other.import_rows;
+        self.edge_rows += other.edge_rows;
+        self.chunk_ids.extend(other.chunk_ids);
+    }
+}
+
+/// Result of re-indexing one project: row/vector counts plus what was pruned.
+struct ReindexOutcome {
+    rows: i64,
+    vectors: i64,
+    failures: i64,
+    pruned: PruneOutcome,
+}
+
+fn project_chunk_ids(conn: &Connection, project_id: i64) -> Result<Vec<i64>, String> {
+    let mut stmt = conn
+        .prepare("SELECT id FROM project_chunks WHERE project_id = ?1")
+        .map_err(|e| format!("failed preparing project chunk id query: {}", e))?;
+    let rows = stmt
+        .query_map(params![project_id], |row| row.get::<_, i64>(0))
+        .map_err(|e| format!("failed querying project chunk ids: {}", e))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| format!("failed reading project chunk id: {}", e))?);
+    }
+    Ok(out)
+}
+
+/// Distinct values of `column` in `table` for one project. `table`/`column` are code
+/// constants, never user input.
+fn project_distinct_paths(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    project_id: i64,
+) -> Result<Vec<String>, String> {
+    let sql = format!(
+        "SELECT DISTINCT {} FROM {} WHERE project_id = ?1",
+        column, table
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| format!("failed preparing {} path query: {}", table, e))?;
+    let rows = stmt
+        .query_map(params![project_id], |row| row.get::<_, String>(0))
+        .map_err(|e| format!("failed querying {} paths: {}", table, e))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| format!("failed reading {} path: {}", table, e))?);
+    }
+    Ok(out)
+}
+
+/// Delete (or, with `dry_run`, count) rows of `table` whose `column` is one of `paths`.
+fn delete_project_rows_by_path(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    project_id: i64,
+    paths: &[String],
+    dry_run: bool,
+) -> Result<usize, String> {
+    if paths.is_empty() {
+        return Ok(0);
+    }
+    let sql = if dry_run {
+        format!(
+            "SELECT COUNT(*) FROM {} WHERE project_id = ?1 AND {} = ?2",
+            table, column
+        )
+    } else {
+        format!(
+            "DELETE FROM {} WHERE project_id = ?1 AND {} = ?2",
+            table, column
+        )
+    };
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| format!("failed preparing {} prune: {}", table, e))?;
+    let mut n = 0usize;
+    for path in paths {
+        if dry_run {
+            let count: i64 = stmt
+                .query_row(params![project_id, path], |row| row.get(0))
+                .map_err(|e| format!("failed counting {} rows: {}", table, e))?;
+            n += count.max(0) as usize;
+        } else {
+            n += stmt
+                .execute(params![project_id, path])
+                .map_err(|e| format!("failed pruning {} rows: {}", table, e))?;
+        }
+    }
+    Ok(n)
+}
+
+/// Remove the rows of `project_id` that `keep` (built from the freshly collected corpus) no
+/// longer covers: `project_chunks` whose (doc_path, chunk_index) is absent, and the per-file
+/// `project_files`, `symbols`, `file_imports` and `file_dependency_edges` rows of doc_paths
+/// that are absent altogether. `project_chunk_vectors`, `chunk_relation_feedback` and
+/// `symbol_chunk_map` follow through `ON DELETE CASCADE`. sqlite only: the returned
+/// `chunk_ids` are for the caller's LanceDB delete. With `dry_run` nothing is written and
+/// the counts describe what would be removed.
+fn prune_stale_project_rows(
+    conn: &Connection,
+    project_id: i64,
+    keep: &PruneKeepSet,
+    dry_run: bool,
+) -> Result<PruneOutcome, String> {
+    let mut out = PruneOutcome::default();
+
+    // Chunks the corpus no longer produces.
+    let mut touched_docs: HashSet<String> = HashSet::new();
+    {
+        let mut stmt = conn
+            .prepare("SELECT id, doc_path, chunk_index FROM project_chunks WHERE project_id = ?1")
+            .map_err(|e| format!("failed preparing stale chunk query: {}", e))?;
+        let rows = stmt
+            .query_map(params![project_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(|e| format!("failed querying stale chunks: {}", e))?;
+        for row in rows {
+            let (id, doc_path, chunk_index) =
+                row.map_err(|e| format!("failed reading stale chunk row: {}", e))?;
+            if keep.keeps_chunk(&doc_path, chunk_index) {
+                continue;
+            }
+            out.chunk_ids.push(id);
+            touched_docs.insert(doc_path);
+        }
+    }
+    out.chunks = out.chunk_ids.len();
+    out.files = touched_docs.len();
+
+    // Per-file rows for doc_paths that are gone entirely (not merely shorter). These tables
+    // are refreshed per file during indexing, so nothing else deletes rows for vanished files.
+    // Dependency edges are matched by source only: `target_doc_path` holds the resolver's
+    // relative form, not a doc_path, and edges are rebuilt when their source is re-indexed.
+    let stale_docs = |paths: Vec<String>| -> Vec<String> {
+        paths.into_iter().filter(|p| !keep.keeps_doc(p)).collect()
+    };
+    let stale_symbol_docs = stale_docs(project_distinct_paths(
+        conn, "symbols", "doc_path", project_id,
+    )?);
+    let stale_import_docs = stale_docs(project_distinct_paths(
+        conn,
+        "file_imports",
+        "source_doc_path",
+        project_id,
+    )?);
+    let stale_edge_docs = stale_docs(project_distinct_paths(
+        conn,
+        "file_dependency_edges",
+        "source_doc_path",
+        project_id,
+    )?);
+    let stale_manifest: Vec<String> =
+        project_distinct_paths(conn, "project_files", "rel_path", project_id)?
+            .into_iter()
+            .filter(|rel| !keep.rel_paths.contains(rel))
+            .collect();
+
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| format!("failed starting prune transaction: {}", e))?;
+    if !dry_run {
+        for batch in out.chunk_ids.chunks(500) {
+            let placeholders = vec!["?"; batch.len()].join(", ");
+            let sql = format!("DELETE FROM project_chunks WHERE id IN ({})", placeholders);
+            tx.execute(&sql, rusqlite::params_from_iter(batch.iter()))
+                .map_err(|e| format!("failed deleting stale chunks: {}", e))?;
+        }
+    }
+    out.symbol_rows = delete_project_rows_by_path(
+        &tx,
+        "symbols",
+        "doc_path",
+        project_id,
+        &stale_symbol_docs,
+        dry_run,
+    )?;
+    out.import_rows = delete_project_rows_by_path(
+        &tx,
+        "file_imports",
+        "source_doc_path",
+        project_id,
+        &stale_import_docs,
+        dry_run,
+    )?;
+    out.edge_rows = delete_project_rows_by_path(
+        &tx,
+        "file_dependency_edges",
+        "source_doc_path",
+        project_id,
+        &stale_edge_docs,
+        dry_run,
+    )?;
+    out.manifest_rows = delete_project_rows_by_path(
+        &tx,
+        "project_files",
+        "rel_path",
+        project_id,
+        &stale_manifest,
+        dry_run,
+    )?;
+    tx.commit()
+        .map_err(|e| format!("failed committing prune transaction: {}", e))?;
+    Ok(out)
+}
+
+/// Drop the LanceDB vectors of pruned chunks. Needs an open store (`get_or_open_lance`).
+fn delete_lance_vectors_for_chunks(chunk_ids: &[i64]) -> Result<usize, String> {
+    if chunk_ids.is_empty() {
+        return Ok(0);
+    }
+    with_lance_store(|store| lance_store::delete_chunks(store, chunk_ids))?;
+    Ok(chunk_ids.len())
+}
+
+/// LanceDB rows whose chunk id has no vector row in sqlite: left behind by builds that
+/// re-created chunk ids on every refresh, or by an inline delete that failed.
+fn lance_orphan_chunk_ids(conn: &Connection) -> Result<Vec<i64>, String> {
+    let lance_ids = with_lance_store(|store| lance_store::list_chunk_ids(store))?;
+    let mut stmt = conn
+        .prepare("SELECT chunk_id FROM project_chunk_vectors")
+        .map_err(|e| format!("failed preparing chunk vector id query: {}", e))?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, i64>(0))
+        .map_err(|e| format!("failed querying chunk vector ids: {}", e))?;
+    let mut known: HashSet<i64> = HashSet::with_capacity(lance_ids.len());
+    for row in rows {
+        known.insert(row.map_err(|e| format!("failed reading chunk vector id: {}", e))?);
+    }
+    Ok(lance_ids
+        .into_iter()
+        .filter(|id| !known.contains(id))
+        .collect())
+}
+
+#[cfg(test)]
+mod prune_tests {
+    use super::*;
+
+    const KEEP_DOC: &str = "/p/alpha/src/keep.rs";
+    const STALE_DOC: &str = "/p/alpha/tmp/stale.md";
+
+    fn seeded_conn() -> Connection {
+        let conn = Connection::open_in_memory().expect("open in-memory sqlite");
+        conn.execute_batch("PRAGMA foreign_keys = ON;")
+            .expect("enable foreign keys");
+        init_schema(&conn).expect("init schema");
+        conn.execute_batch(
+            r#"
+INSERT INTO projects(id, path, title, summary, project_mtime, last_indexed)
+VALUES (1, '/p/alpha', 'alpha', 'alpha', 0, 0), (2, '/p/beta', 'beta', 'beta', 0, 0);
+INSERT INTO project_chunks(id, project_id, doc_path, doc_rel_path, doc_mtime, chunk_index, token_count, text_hash, text, updated_at)
+VALUES (10, 1, '/p/alpha/src/keep.rs', 'src/keep.rs', 0, 0, 5, 'h10', 'keep zero', 0),
+       (11, 1, '/p/alpha/src/keep.rs', 'src/keep.rs', 0, 1, 5, 'h11', 'keep one', 0),
+       (12, 1, '/p/alpha/tmp/stale.md', 'tmp/stale.md', 0, 0, 5, 'h12', 'stale', 0),
+       (20, 2, '/p/beta/tmp/other.md', 'tmp/other.md', 0, 0, 5, 'h20', 'other project', 0);
+INSERT INTO project_chunk_vectors(chunk_id, model, dim, norm, vector)
+VALUES (10, 'm', 1, 1.0, x'00000000'), (11, 'm', 1, 1.0, x'00000000'),
+       (12, 'm', 1, 1.0, x'00000000'), (20, 'm', 1, 1.0, x'00000000');
+INSERT INTO project_files(project_id, rel_path, abs_path, file_size, file_mtime, content_hash, chunk_count, last_indexed)
+VALUES (1, 'src/keep.rs', '/p/alpha/src/keep.rs', 1, 0, 'x', 2, 0),
+       (1, 'tmp/stale.md', '/p/alpha/tmp/stale.md', 1, 0, 'y', 1, 0);
+INSERT INTO symbols(project_id, doc_path, doc_rel_path, name, kind, line_start, line_end, updated_at)
+VALUES (1, '/p/alpha/src/keep.rs', 'src/keep.rs', 'keep', 'function', 1, 2, 0),
+       (1, '/p/alpha/tmp/stale.md', 'tmp/stale.md', 'stale', 'function', 1, 2, 0);
+INSERT INTO file_imports(project_id, source_doc_path, import_kind, raw_specifier, updated_at)
+VALUES (1, '/p/alpha/tmp/stale.md', 'use', 'keep', 0);
+INSERT INTO file_dependency_edges(project_id, source_doc_path, target_doc_path, edge_kind, updated_at)
+VALUES (1, '/p/alpha/tmp/stale.md', '/p/alpha/src/keep.rs', 'import', 0),
+       (1, '/p/alpha/src/keep.rs', '/p/alpha/tmp/stale.md', 'import', 0);
+INSERT INTO chunk_relation_feedback(src_chunk_id, dst_chunk_id, relation, decision, created_at, updated_at)
+VALUES (12, 10, 'related', 'active', 0, 0);
+"#,
+        )
+        .expect("seed rows");
+        conn
+    }
+
+    fn count(conn: &Connection, sql: &str) -> i64 {
+        conn.query_row(sql, [], |row| row.get(0)).expect(sql)
+    }
+
+    fn chunk(doc_path: &str, rel: &str, index: i64) -> ProjectChunk {
+        ProjectChunk {
+            doc_path: doc_path.to_string(),
+            doc_rel_path: rel.to_string(),
+            doc_mtime: 0.0,
+            chunk_index: index,
+            token_count: 1,
+            text_hash: String::new(),
+            text: String::new(),
+            chunk_kind: "text_window".to_string(),
+            symbol_name: String::new(),
+            parent_context: String::new(),
+            line_start: 0,
+            line_end: 0,
+            context_header: String::new(),
+        }
+    }
+
+    #[test]
+    fn keep_set_groups_indices_by_doc_and_tracks_rel_paths() {
+        let keep = PruneKeepSet::from_chunks(&[
+            chunk(KEEP_DOC, "src/keep.rs", 0),
+            chunk(KEEP_DOC, "src/keep.rs", 1),
+        ]);
+        assert!(keep.keeps_chunk(KEEP_DOC, 0) && keep.keeps_chunk(KEEP_DOC, 1));
+        assert!(!keep.keeps_chunk(KEEP_DOC, 2));
+        assert!(keep.keeps_doc(KEEP_DOC) && !keep.keeps_doc(STALE_DOC));
+        assert!(keep.rel_paths.contains("src/keep.rs"));
+    }
+
+    #[test]
+    fn prune_removes_rows_for_paths_outside_corpus_and_keeps_survivors() {
+        let conn = seeded_conn();
+        let keep = PruneKeepSet::from_chunks(&[
+            chunk(KEEP_DOC, "src/keep.rs", 0),
+            chunk(KEEP_DOC, "src/keep.rs", 1),
+        ]);
+        let out = prune_stale_project_rows(&conn, 1, &keep, false).expect("prune");
+        assert_eq!(out.chunks, 1);
+        assert_eq!(out.files, 1);
+        assert_eq!(out.chunk_ids, vec![12]);
+        assert_eq!(out.manifest_rows, 1);
+        assert_eq!(out.symbol_rows, 1);
+        assert_eq!(out.import_rows, 1);
+        // Only the edge whose source vanished; the surviving file's edge to it stays until
+        // that file is re-indexed (targets are stored in the resolver's relative form).
+        assert_eq!(out.edge_rows, 1);
+
+        // Survivors are untouched, with their original ids.
+        let survivors: Vec<i64> = {
+            let mut stmt = conn
+                .prepare("SELECT id FROM project_chunks WHERE project_id = 1 ORDER BY id")
+                .unwrap();
+            stmt.query_map([], |r| r.get(0)).unwrap().map(|r| r.unwrap()).collect()
+        };
+        assert_eq!(survivors, vec![10, 11]);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM project_files WHERE project_id = 1"), 1);
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM project_files WHERE rel_path = 'src/keep.rs'"),
+            1
+        );
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM symbols WHERE project_id = 1"), 1);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM file_imports"), 0);
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM file_dependency_edges WHERE source_doc_path = '/p/alpha/src/keep.rs'"),
+            1
+        );
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM file_dependency_edges"), 1);
+        // FK cascade dropped the vector and the feedback row of chunk 12.
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM project_chunk_vectors WHERE chunk_id = 12"), 0);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM project_chunk_vectors"), 3);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM chunk_relation_feedback"), 0);
+        // The FTS shadow table dropped the stale row too.
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM chunk_fts WHERE chunk_fts MATCH 'stale'"),
+            0
+        );
+        // Other projects are never touched.
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM project_chunks WHERE project_id = 2"), 1);
+    }
+
+    #[test]
+    fn prune_trims_chunk_indices_past_the_end_of_a_shrunk_file() {
+        let conn = seeded_conn();
+        let keep = PruneKeepSet::from_chunks(&[
+            chunk(KEEP_DOC, "src/keep.rs", 0),
+            chunk(STALE_DOC, "tmp/stale.md", 0),
+        ]);
+        let out = prune_stale_project_rows(&conn, 1, &keep, false).expect("prune");
+        assert_eq!(out.chunk_ids, vec![11]);
+        assert_eq!(out.files, 1);
+        // The file is still in the corpus, so its per-file rows stay.
+        assert_eq!(out.manifest_rows, 0);
+        assert_eq!(out.symbol_rows, 0);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM project_chunks WHERE project_id = 1"), 2);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM project_files WHERE project_id = 1"), 2);
+    }
+
+    #[test]
+    fn prune_dry_run_reports_without_writing() {
+        let conn = seeded_conn();
+        let keep = PruneKeepSet::from_chunks(&[chunk(KEEP_DOC, "src/keep.rs", 0)]);
+        let out = prune_stale_project_rows(&conn, 1, &keep, true).expect("dry run");
+        assert_eq!(out.chunks, 2);
+        assert_eq!(out.files, 2);
+        assert_eq!(out.manifest_rows, 1);
+        assert_eq!(out.symbol_rows, 1);
+        assert_eq!(out.import_rows, 1);
+        assert_eq!(out.edge_rows, 1);
+        assert!(!out.is_empty());
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM project_chunks"), 4);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM project_files"), 2);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM symbols"), 2);
+    }
+
+    #[test]
+    fn prune_with_empty_corpus_clears_the_project() {
+        let conn = seeded_conn();
+        let out =
+            prune_stale_project_rows(&conn, 1, &PruneKeepSet::default(), false).expect("prune");
+        assert_eq!(out.chunks, 3);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM project_chunks WHERE project_id = 1"), 0);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM project_files WHERE project_id = 1"), 0);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM project_chunks WHERE project_id = 2"), 1);
+    }
+
+    #[test]
+    fn prune_is_a_no_op_when_the_corpus_matches() {
+        let conn = seeded_conn();
+        let keep = PruneKeepSet::from_chunks(&[
+            chunk(KEEP_DOC, "src/keep.rs", 0),
+            chunk(KEEP_DOC, "src/keep.rs", 1),
+            chunk(STALE_DOC, "tmp/stale.md", 0),
+        ]);
+        let out = prune_stale_project_rows(&conn, 1, &keep, false).expect("prune");
+        assert!(out.is_empty());
+        assert!(out.chunk_ids.is_empty());
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM project_chunks"), 4);
+    }
+
+    #[test]
+    fn upsert_keeps_chunk_id_but_drops_feedback_when_text_changes() {
+        let conn = seeded_conn();
+        let same = ProjectChunk {
+            text_hash: "h12".to_string(),
+            ..chunk(STALE_DOC, "tmp/stale.md", 0)
+        };
+        let id = upsert_project_chunk(&conn, 1, &same, 1.0).expect("upsert same hash");
+        assert_eq!(id, 12);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM chunk_relation_feedback"), 1);
+
+        let changed = ProjectChunk {
+            text_hash: "h12-changed".to_string(),
+            ..chunk(STALE_DOC, "tmp/stale.md", 0)
+        };
+        let id = upsert_project_chunk(&conn, 1, &changed, 2.0).expect("upsert new hash");
+        assert_eq!(id, 12, "the row keeps its id so its vector is updated in place");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM chunk_relation_feedback"), 0);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM project_chunk_vectors WHERE chunk_id = 12"), 1);
+    }
+
+    #[test]
+    fn remove_projects_not_in_cascades_chunks_and_vectors() {
+        let conn = seeded_conn();
+        let removed =
+            remove_projects_not_in(&conn, &["/p/alpha".to_string()]).expect("remove stale");
+        assert_eq!(removed, 1);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM projects"), 1);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM project_chunks WHERE project_id = 2"), 0);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM project_chunk_vectors WHERE chunk_id = 20"), 0);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM project_chunks"), 3);
+    }
 }
 
 fn rebuild_relationship_edges(
@@ -23401,7 +26256,30 @@ fn file_mtime(path: &Path) -> Option<f64> {
     Some(metadata_mtime(&meta))
 }
 
+/// Extra directory names from `skip_dir_names`, installed once per process by
+/// [`set_extra_skip_dirs`] before any discovery or corpus walk runs.
+static EXTRA_SKIP_DIRS: OnceLock<HashSet<String>> = OnceLock::new();
+
+/// Install the configured `skip_dir_names` so [`is_skip_dir`] honours them everywhere
+/// (add/index/refresh/reembed/watch, API and MCP refresh). The first call in a process wins;
+/// a later call with a different set is ignored, so long-running servers pick up config
+/// changes only on restart.
+pub(crate) fn set_extra_skip_dirs(cfg: &ConfigValues) {
+    let _ = EXTRA_SKIP_DIRS.set(cfg.skip_dir_name_set());
+}
+
+fn is_extra_skip_dir(name: &str) -> bool {
+    EXTRA_SKIP_DIRS
+        .get()
+        .map(|set| set.contains(name))
+        .unwrap_or(false)
+}
+
 fn is_skip_dir(name: &str) -> bool {
+    is_builtin_skip_dir(name) || is_extra_skip_dir(name)
+}
+
+fn is_builtin_skip_dir(name: &str) -> bool {
     matches!(
         name,
         ".git"
@@ -23412,6 +26290,7 @@ fn is_skip_dir(name: &str) -> bool {
             | ".mypy_cache"
             | ".pytest_cache"
             | "node_modules"
+            | "site-packages"
             | ".venv"
             | "venv"
             | ".idea"
@@ -23722,6 +26601,11 @@ fn run_refresh_command_once(cmd: &str) -> Result<(), String> {
     if trimmed.is_empty() {
         return Ok(());
     }
+    // `retrivio recall` runs as an editor hook: it must never spawn an (often interactive)
+    // credential refresh. The semantic path then fails fast and the lexical fallback runs.
+    if hook_mode_active() {
+        return Err("refresh disabled in hook mode".to_string());
+    }
 
     let always = bool_env("RETRIVIO_AWS_REFRESH_ALWAYS", false);
     if !always {
@@ -23892,6 +26776,10 @@ fn ollama_autostart_timeout() -> Duration {
 
 fn maybe_autostart_ollama(host: &str) -> Result<bool, String> {
     if !bool_env("RETRIVIO_OLLAMA_AUTOSTART", true) {
+        return Ok(false);
+    }
+    // An editor hook never starts daemons; the caller reports the server as unreachable.
+    if hook_mode_active() {
         return Ok(false);
     }
     if matches!(ollama_is_reachable(), Ok(true)) {
@@ -24275,6 +27163,89 @@ struct AwsCredentials {
     expires_at: Option<u64>,
 }
 
+/// Longest a non-interactive credential export may run inside `retrivio recall` (hook mode).
+const HOOK_CREDENTIAL_CMD_TIMEOUT: Duration = Duration::from_millis(2500);
+
+/// Run a credential-export command and capture its output. Stdin is always `/dev/null` (the
+/// command must never prompt). In hook mode the wait is bounded by
+/// [`HOOK_CREDENTIAL_CMD_TIMEOUT`]: the child is polled with `try_wait` and killed on timeout.
+fn credential_command_output(cmd: &mut Command) -> std::io::Result<std::process::Output> {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if !hook_mode_active() {
+        return cmd.output();
+    }
+    bounded_command_output(cmd, HOOK_CREDENTIAL_CMD_TIMEOUT)
+}
+
+/// Drain a child's pipe on a helper thread so a descendant that inherited the descriptor can
+/// never block the caller; the bytes arrive on the returned channel when the pipe closes.
+fn spawn_pipe_reader<R: Read + Send + 'static>(pipe: Option<R>) -> Receiver<Vec<u8>> {
+    let (tx, rx) = mpsc::channel();
+    match pipe {
+        Some(mut reader) => {
+            let _ = std::thread::Builder::new()
+                .name("cred-pipe".to_string())
+                .spawn(move || {
+                    let mut buf = Vec::new();
+                    let _ = reader.read_to_end(&mut buf);
+                    let _ = tx.send(buf);
+                });
+        }
+        None => {
+            let _ = tx.send(Vec::new());
+        }
+    }
+    rx
+}
+
+fn bounded_timeout_error(what: &str, timeout: Duration) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        format!(
+            "credential command {} exceeded {} ms in hook mode",
+            what,
+            timeout.as_millis()
+        ),
+    )
+}
+
+/// `Command::output()` with a wall-clock bound: `try_wait` polling, kill + reap on timeout, and
+/// pipe reads that also stop at the deadline (a grandchild holding the pipe cannot stall us).
+/// The caller has already configured stdio (stdin null, stdout/stderr piped).
+fn bounded_command_output(
+    cmd: &mut Command,
+    timeout: Duration,
+) -> std::io::Result<std::process::Output> {
+    let mut child = cmd.spawn()?;
+    let started = Instant::now();
+    let stdout_rx = spawn_pipe_reader(child.stdout.take());
+    let stderr_rx = spawn_pipe_reader(child.stderr.take());
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(bounded_timeout_error("(killed)", timeout));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let stdout = stdout_rx
+        .recv_timeout(timeout.saturating_sub(started.elapsed()))
+        .map_err(|_| bounded_timeout_error("stdout", timeout))?;
+    let stderr = stderr_rx
+        .recv_timeout(timeout.saturating_sub(started.elapsed()))
+        .map_err(|_| bounded_timeout_error("stderr", timeout))?;
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
 impl AwsCredentials {
     fn resolve(
         profile: Option<&str>,
@@ -24292,8 +27263,7 @@ impl AwsCredentials {
                 .ok_or_else(|| "aws_credential_cmd is empty".to_string())?;
             let mut cmd = Command::new(program);
             cmd.args(args);
-            let output = cmd
-                .output()
+            let output = credential_command_output(&mut cmd)
                 .map_err(|e| format!("aws_credential_cmd '{}': {}", program, e))?;
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
@@ -24312,8 +27282,7 @@ impl AwsCredentials {
             if let Some(p) = profile {
                 cmd.arg("--profile").arg(p);
             }
-            let output = cmd
-                .output()
+            let output = credential_command_output(&mut cmd)
                 .map_err(|e| format!("aws configure export-credentials: {}", e))?;
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
@@ -24758,6 +27727,10 @@ impl BedrockEmbedder {
     }
 
     fn invoke_model_cli(&self, payload: &Value) -> Result<Value, String> {
+        // The AWS CLI may block on an interactive login and is not deadline-aware.
+        if hook_mode_active() {
+            return Err("aws cli fallback disabled in hook mode".to_string());
+        }
         let temp = env::temp_dir();
         let nonce = format!(
             "{}-{}-{}",
