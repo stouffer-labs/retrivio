@@ -6,18 +6,24 @@
 //!
 //! Environment: `RETRIVIO_HOME`, when set, replaces the real home directory for every path this
 //! module touches (`~/.claude`, `~/.codex`, `~/Library/LaunchAgents`, `~/.retrivio/*.log`). It
-//! exists so the commands can be exercised against a scratch directory.
+//! exists so the commands can be exercised against a scratch directory. Without it, a set and
+//! non-empty `CODEX_HOME` relocates the Codex directory the way Codex itself does (see
+//! [`codex_dir`]).
 
 use std::env;
 use std::ffi::OsString;
 use std::fs;
-use std::io::{IsTerminal, Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, IsTerminal, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{self, Command};
+use std::process::{self, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Map, Value};
 
@@ -25,7 +31,7 @@ const LAUNCHD_LABEL: &str = "com.stouffer-labs.retrivio.watch";
 const HOOK_TIMEOUT_SECS: u64 = 5;
 const SESSION_START_MATCHER: &str = "compact|clear";
 const CODEX_DESCRIPTION: &str = "Retrivio proactive recall hooks";
-const CODEX_TRUST_REMINDER: &str = "Codex trusts the exact hook definition (hash-based). Run /hooks in Codex and trust the retrivio entries after installation AND after any change to them (for example a new binary path).";
+const CODEX_TRUST_REMINDER: &str = "Codex trusts the exact hook definition (hash-based). Run `retrivio hook trust --codex` (or /hooks inside Codex) after installation AND after any change to the hooks (for example a new binary path).";
 const WATCH_INTERVAL_SECS: &str = "300";
 const LAUNCHD_THROTTLE_SECS: u32 = 60;
 const BACKUP_SUFFIX: &str = ".bak-retrivio";
@@ -35,40 +41,68 @@ const LAUNCHD_PATH_ENV: &str = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin";
 /// installing shell's PATH (launchd starts agents with a minimal PATH, which hides credential
 /// helpers such as isengardcli or aws-sso tooling and makes the watcher fail on startup).
 fn service_path_env() -> String {
+    service_path_env_from(&std::env::var("PATH").unwrap_or_default())
+}
+
+/// [`service_path_env`] over an explicit PATH string: [`LAUNCHD_PATH_ENV`] first, then every
+/// entry of `current_path` that passes [`service_path_dir_ok`], once each.
+fn service_path_env_from(current_path: &str) -> String {
     let mut parts: Vec<String> = LAUNCHD_PATH_ENV.split(':').map(|s| s.to_string()).collect();
-    if let Ok(cur) = std::env::var("PATH") {
-        for seg in cur.split(':') {
-            let seg = seg.trim();
-            // Only stable, absolute, existing directories: no relative entries, no temp/shim dirs
-            // that vanish, nothing that could hijack a bare helper name.
-            if seg.starts_with('/')
-                && !seg.starts_with("/tmp")
-                && !seg.starts_with("/private/tmp")
-                && !seg.starts_with("/var/folders")
-                && Path::new(seg).is_dir()
-                && !parts.iter().any(|p| p == seg)
-            {
-                parts.push(seg.to_string());
-            }
+    for seg in current_path.split(':') {
+        let seg = seg.trim();
+        if service_path_dir_ok(seg) && !parts.iter().any(|p| p == seg) {
+            parts.push(seg.to_string());
         }
     }
     parts.join(":")
 }
+
+/// Whether one shell PATH entry may be baked into the agent's PATH. Only stable, absolute,
+/// existing directories that nobody else can write to qualify: no relative entries, no temp or
+/// shim directories that vanish (`/tmp`, `/var/folders`), nothing under `node_modules` or in a
+/// `.bin` directory (per-project tool shims), and nothing writable by group or others (a bare
+/// helper name such as `isengardcli` could be hijacked there).
+fn service_path_dir_ok(seg: &str) -> bool {
+    let trimmed = if seg.len() > 1 { seg.trim_end_matches('/') } else { seg };
+    if !trimmed.starts_with('/')
+        || trimmed.starts_with("/tmp")
+        || trimmed.starts_with("/private/tmp")
+        || trimmed.starts_with("/var/folders")
+        || trimmed.contains("/node_modules/")
+        || trimmed.ends_with("/node_modules")
+        || trimmed.ends_with("/.bin")
+    {
+        return false;
+    }
+    let Ok(meta) = fs::metadata(trimmed) else {
+        return false;
+    };
+    if !meta.is_dir() {
+        return false;
+    }
+    #[cfg(unix)]
+    if meta.permissions().mode() & 0o022 != 0 {
+        return false;
+    }
+    true
+}
 const SYSTEMD_UNIT_NAME: &str = "retrivio-watch.service";
 const TAIL_LINES: usize = 5;
 
-const HOOK_USAGE: &str = "usage: retrivio hook <install|uninstall|status> [--claude] [--codex] [--yes] [--bin <path>]
+const HOOK_USAGE: &str = "usage: retrivio hook <install|uninstall|status|trust> [--claude] [--codex] [--yes] [--bin <path>]
 
   install     add the retrivio recall hooks (UserPromptSubmit + SessionStart) to each detected CLI
   uninstall   remove only the retrivio entries, leaving every other hook untouched
   status      report detection, install state, referenced binary and the recall log tail
+  trust       mark the installed Codex hooks as trusted (what /hooks does), via `codex app-server`
 
   --claude / --codex   limit to one CLI (default: every detected CLI)
   --yes, -y            do not prompt before writing
   --bin <path>         binary to reference from the hooks (default: this executable)
 
 Files: ~/.claude/settings.json and ~/.codex/hooks.json (a .bak-retrivio copy is taken before writing).
-RETRIVIO_HOME overrides the home directory used to locate them.
+Codex trust state lives in ~/.codex/config.toml ([hooks.state]) and is written by Codex itself.
+RETRIVIO_HOME overrides the home directory used to locate them; otherwise CODEX_HOME, when set, relocates ~/.codex.
 ";
 
 const SERVICE_USAGE: &str = "usage: retrivio service <install|uninstall|status|run> [--bin <path>]
@@ -106,7 +140,11 @@ impl Cli {
     fn dir(self, home: &Path) -> PathBuf {
         match self {
             Cli::Claude => home.join(".claude"),
-            Cli::Codex => home.join(".codex"),
+            Cli::Codex => codex_dir(
+                home,
+                env::var("CODEX_HOME").ok().as_deref(),
+                env::var("RETRIVIO_HOME").ok().as_deref(),
+            ),
         }
     }
 
@@ -126,6 +164,23 @@ impl Cli {
             Cli::Claude => merge_claude_hooks(doc, bin),
             Cli::Codex => merge_codex_hooks(doc, bin),
         }
+    }
+}
+
+/// The Codex directory (`hooks.json`, `config.toml`). A set, non-empty `RETRIVIO_HOME` wins so
+/// scratch runs stay inside the scratch home (`home` is already that directory); otherwise a set,
+/// non-empty `CODEX_HOME` is used as given, the way Codex itself resolves it; otherwise
+/// `~/.codex`.
+fn codex_dir(home: &Path, env_codex_home: Option<&str>, retrivio_home: Option<&str>) -> PathBuf {
+    fn non_empty(v: Option<&str>) -> Option<&str> {
+        v.map(str::trim).filter(|s| !s.is_empty())
+    }
+    if non_empty(retrivio_home).is_some() {
+        return home.join(".codex");
+    }
+    match non_empty(env_codex_home) {
+        Some(dir) => PathBuf::from(dir),
+        None => home.join(".codex"),
     }
 }
 
@@ -179,6 +234,14 @@ impl HookKind {
         match self {
             HookKind::Prompt => "UserPromptSubmit",
             HookKind::Reset => "SessionStart",
+        }
+    }
+
+    /// The same event as the Codex app-server reports it (camelCase `eventName`).
+    fn codex_event(self) -> &'static str {
+        match self {
+            HookKind::Prompt => "userPromptSubmit",
+            HookKind::Reset => "sessionStart",
         }
     }
 
@@ -1044,7 +1107,7 @@ fn selected_clis(opts: &HookOpts) -> Vec<Cli> {
 }
 
 pub fn run_hook_cmd(args: &[OsString]) {
-    let opts = match parse_common(args, &["install", "uninstall", "status"], "status", true) {
+    let opts = match parse_common(args, &["install", "uninstall", "status", "trust"], "status", true) {
         Ok(o) => o,
         Err(e) => {
             eprintln!("error: {}", e);
@@ -1060,6 +1123,7 @@ pub fn run_hook_cmd(args: &[OsString]) {
     let result = match opts.sub.as_str() {
         "install" => hook_install(&opts),
         "uninstall" => hook_uninstall(&opts),
+        "trust" => hook_trust(&opts),
         _ => hook_status(&opts),
     };
     match result {
@@ -1087,6 +1151,9 @@ fn hook_install(opts: &HookOpts) -> Result<(), String> {
 
     let mut failures = 0usize;
     let mut saw_codex = false;
+    // True once the Codex hooks.json holds our hooks (freshly written or already there), i.e.
+    // the moment Codex could be asked to trust them.
+    let mut codex_ready = false;
     for cli in selected_clis(opts) {
         if !cli.detected(&home) {
             println!(
@@ -1100,12 +1167,13 @@ fn hook_install(opts: &HookOpts) -> Result<(), String> {
             saw_codex = true;
         }
         let file = cli.hooks_file(&home);
-        let outcome = (|| -> Result<(), String> {
+        // Ok(true) = the file now holds our hooks; Ok(false) = the user declined.
+        let outcome = (|| -> Result<bool, String> {
             let mut doc = read_json_file(&file)?.unwrap_or(Value::Null);
             let change = cli.merge(&mut doc, &bin_str)?;
             if change == ChangeKind::Unchanged {
                 println!("  {}: already installed ({})", cli.display(), file.display());
-                return Ok(());
+                return Ok(true);
             }
             let question = match change {
                 ChangeKind::Installed => {
@@ -1115,7 +1183,7 @@ fn hook_install(opts: &HookOpts) -> Result<(), String> {
             };
             if !confirm(opts.yes, &question) {
                 println!("  {}: skipped", cli.display());
-                return Ok(());
+                return Ok(false);
             }
             let mut backed_up = false;
             let bak = write_json_atomic(&file, &doc, &mut backed_up)?
@@ -1128,14 +1196,45 @@ fn hook_install(opts: &HookOpts) -> Result<(), String> {
                 file.display(),
                 bak
             );
-            Ok(())
+            Ok(true)
         })();
-        if let Err(e) = outcome {
-            eprintln!("  error: {}: {}", cli.display(), e);
-            failures += 1;
+        match outcome {
+            Ok(ready) => {
+                if cli == Cli::Codex {
+                    codex_ready = ready;
+                }
+            }
+            Err(e) => {
+                eprintln!("  error: {}: {}", cli.display(), e);
+                failures += 1;
+            }
         }
     }
-    if saw_codex {
+    if codex_ready {
+        // Installing is not enough for Codex: it ignores hooks until their exact definition is
+        // trusted. Do what /hooks does through the app-server; a failure here never changes the
+        // exit code because the install itself succeeded.
+        match codex_trust_hooks(&home, &bin_str, true) {
+            Ok(TrustOutcome::Trusted(_)) => {
+                println!("  Codex: hooks trusted automatically (via codex app-server)");
+            }
+            Ok(TrustOutcome::AlreadyTrusted(_)) => println!("  Codex: hooks already trusted"),
+            Ok(TrustOutcome::NotFound { codex_home }) => {
+                println!(
+                    "  Codex: automatic trust skipped: codex app-server lists no retrivio hooks for {} from {}{}",
+                    bin_str,
+                    Cli::Codex.hooks_file(&home).display(),
+                    describe_codex_home_mismatch(&home, codex_home.as_deref())
+                );
+                println!("  {}", CODEX_TRUST_REMINDER);
+            }
+            Ok(TrustOutcome::Declined) => println!("  {}", CODEX_TRUST_REMINDER),
+            Err(e) => {
+                println!("  Codex: automatic trust failed: {}", e);
+                println!("  {}", CODEX_TRUST_REMINDER);
+            }
+        }
+    } else if saw_codex {
         println!("  {}", CODEX_TRUST_REMINDER);
     }
     if failures > 0 {
@@ -1217,6 +1316,8 @@ fn hook_status(opts: &HookOpts) -> Result<(), String> {
             file.display(),
             if file.is_file() { "present" } else { "missing" }
         );
+        // Binaries our entries in the file reference; Codex is asked about exactly these below.
+        let mut installed_bins: Vec<String> = Vec::new();
         match read_json_file(&file) {
             Ok(Some(doc)) if !doc.is_null() => {
                 let status = retrivio_hook_status(&doc);
@@ -1232,8 +1333,9 @@ fn hook_status(opts: &HookOpts) -> Result<(), String> {
                     "no".to_string()
                 };
                 println!("  installed: {}", state);
-                for bin in status.bins() {
-                    let path = Path::new(&bin);
+                installed_bins = status.bins();
+                for bin in &installed_bins {
+                    let path = Path::new(bin);
                     let exists = path.is_file();
                     let executable = super::is_executable_file(path);
                     let matches = match (&current_bin, fs::canonicalize(path)) {
@@ -1257,11 +1359,697 @@ fn hook_status(opts: &HookOpts) -> Result<(), String> {
             Err(e) => println!("  installed: unknown ({})", e),
         }
         if cli == Cli::Codex {
-            println!("  note: {}", CODEX_TRUST_REMINDER);
+            let mut need_note = true;
+            if cli.detected(&home) {
+                if installed_bins.is_empty() {
+                    println!("  trust: none (no retrivio hooks in {})", file.display());
+                } else {
+                    match codex_hook_trust_report(&home, &installed_bins) {
+                        Ok((report, codex_home)) => {
+                            let mut any = false;
+                            let mut all_trusted = true;
+                            for (bin, hooks) in &report {
+                                if hooks.is_empty() {
+                                    println!(
+                                        "  trust: none for {} (codex app-server lists no exact retrivio hooks from {}{})",
+                                        bin,
+                                        file.display(),
+                                        describe_codex_home_mismatch(&home, codex_home.as_deref())
+                                    );
+                                    continue;
+                                }
+                                let which = if report.len() > 1 { format!(" ({})", bin) } else { String::new() };
+                                for h in hooks {
+                                    any = true;
+                                    all_trusted &= h.trust_status == "trusted";
+                                    println!("  trust: {} {}{}", h.event_name, h.trust_status, which);
+                                }
+                            }
+                            need_note = !any || !all_trusted;
+                        }
+                        Err(e) => println!("  trust: unknown (codex app-server unavailable: {})", e),
+                    }
+                }
+            }
+            if need_note {
+                println!("  note: {}", CODEX_TRUST_REMINDER);
+            }
         }
     }
     print_log_tail("recall log", &recall_log_path(&home));
     Ok(())
+}
+
+fn hook_trust(opts: &HookOpts) -> Result<(), String> {
+    let home = base_home()?;
+    if opts.claude {
+        println!("  Claude Code: nothing to do (Claude Code hooks need no trust step)");
+        if !opts.codex {
+            return Ok(());
+        }
+    }
+    if !Cli::Codex.detected(&home) {
+        println!(
+            "  Codex: skipped (not detected: {} missing)",
+            Cli::Codex.dir(&home).display()
+        );
+        return Ok(());
+    }
+    // Only hooks that are byte-exactly what `hook install` writes for this binary are trusted.
+    let bin = resolve_bin(opts.bin.as_deref())?;
+    let bin_str = bin.to_string_lossy().to_string();
+    println!("  bin: {}", bin_str);
+    match codex_trust_hooks(&home, &bin_str, opts.yes)? {
+        TrustOutcome::NotFound { codex_home } => {
+            println!(
+                "  Codex: no retrivio hooks for {} found (codex app-server lists none from {}{})",
+                bin_str,
+                Cli::Codex.hooks_file(&home).display(),
+                describe_codex_home_mismatch(&home, codex_home.as_deref())
+            );
+            println!("  hint: run `retrivio hook install --codex` first, or pass --bin <path> naming the binary the installed hooks reference");
+        }
+        TrustOutcome::AlreadyTrusted(n) => {
+            println!("  Codex: already trusted ({} retrivio hook(s))", n);
+        }
+        TrustOutcome::Declined => println!("  Codex: skipped"),
+        TrustOutcome::Trusted(n) => {
+            println!("  Codex: {} hook(s) trusted (via codex app-server)", n);
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Codex hook trust via `codex app-server` (JSON-RPC 2.0, one JSON object per line over stdio)
+// ---------------------------------------------------------------------------
+//
+// Codex only runs hooks whose exact definition the user has trusted. `/hooks` in the Codex TUI
+// stores a per-hook `trusted_hash` under `[hooks.state."<key>"]` in ~/.codex/config.toml; both
+// the key and the hash are computed by Codex, so we never write that file ourselves. The same
+// data comes from `codex app-server` (`hooks/list`) and the same write is `config/batchWrite`,
+// which is exactly what the `/hooks` UI does. The message builders and response readers are pure
+// functions (unit tested against fixtures shaped like the real replies); `AppServer` is the
+// stdio transport.
+
+const CODEX_APP_SERVER_TIMEOUT_SECS: u64 = 30;
+/// Characters that chain, redirect, substitute or escape in `sh`. We never write one into a
+/// hook command (an unusual binary path is single-quoted by [`shell_quote`], and even then such a
+/// path is not auto-trusted), so a command containing any of them is never ours.
+const SHELL_METACHARACTERS: &[char] = &[';', '&', '|', '<', '>', '$', '`', '(', ')', '\\', '\n', '\r'];
+const CODEX_APP_SERVER_STDERR_CAP: usize = 4096;
+
+pub fn build_initialize_request(id: u64) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "initialize",
+        "params": {
+            "clientInfo": {
+                "name": "retrivio",
+                "version": env!("CARGO_PKG_VERSION"),
+                "title": "retrivio hook install"
+            },
+            "capabilities": { "experimentalApi": true }
+        }
+    })
+}
+
+pub fn build_initialized_notification() -> Value {
+    json!({ "jsonrpc": "2.0", "method": "initialized", "params": {} })
+}
+
+pub fn build_hooks_list_request(id: u64, cwd: &Path) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "hooks/list",
+        "params": { "cwds": [cwd.to_string_lossy()] }
+    })
+}
+
+/// One of our hooks as the Codex app-server sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexHookTrust {
+    pub key: String,
+    pub event_name: String,
+    pub source_path: String,
+    pub current_hash: String,
+    /// `trusted`, `untrusted`, `modified` or `managed`.
+    pub trust_status: String,
+}
+
+/// Every hook entry in a `hooks/list` result (`result.data[].hooks[]`), across all cwds.
+fn hooks_in_list_result(list_result: &Value) -> impl Iterator<Item = &Value> {
+    list_result
+        .get("data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.get("hooks").and_then(Value::as_array))
+        .flatten()
+}
+
+fn is_null_or_absent(v: Option<&Value>) -> bool {
+    matches!(v, None | Some(Value::Null))
+}
+
+/// Whether one `hooks/list` entry is byte-exactly a hook `hook install` writes for `bin`:
+/// loaded from the hooks.json we manage (`sourcePath`), a plain user hook (`source == "user"`,
+/// no `pluginId`, handler `command`), for one of our two events, with exactly the command string
+/// [`HookKind::shell_command`] produces for `bin` (same binary path, same arguments, no shell
+/// metacharacters), our matcher (none for userPromptSubmit, `compact|clear` for sessionStart),
+/// our timeout and not async. Anything else - another binary named retrivio, extra arguments,
+/// a chained command, a wrapper, a different matcher - is somebody's own hook and never ours.
+fn is_exact_retrivio_codex_hook(hook: &Value, hooks_json_path: &Path, bin: &str) -> bool {
+    let field = |name: &str| hook.get(name).and_then(Value::as_str);
+    let (Some(event), Some(source_path), Some(command)) =
+        (field("eventName"), field("sourcePath"), field("command"))
+    else {
+        return false;
+    };
+    let Some(kind) = HookKind::ALL.iter().copied().find(|k| k.codex_event() == event) else {
+        return false;
+    };
+    if Path::new(source_path) != hooks_json_path {
+        return false;
+    }
+    if field("source") != Some("user") || !is_null_or_absent(hook.get("pluginId")) {
+        return false;
+    }
+    if let Some(handler) = hook.get("handlerType") {
+        if handler.as_str() != Some("command") {
+            return false;
+        }
+    }
+    if command != kind.shell_command(bin) || command.contains(SHELL_METACHARACTERS) {
+        return false;
+    }
+    let matcher_ok = match kind.matcher() {
+        None => is_null_or_absent(hook.get("matcher")),
+        Some(expected) => field("matcher") == Some(expected),
+    };
+    if !matcher_ok {
+        return false;
+    }
+    if hook.get("timeoutSec").and_then(Value::as_f64) != Some(HOOK_TIMEOUT_SECS as f64) {
+        return false;
+    }
+    matches!(hook.get("async"), None | Some(Value::Null) | Some(Value::Bool(false)))
+}
+
+/// Our hooks in a `hooks/list` result: every entry that passes
+/// [`is_exact_retrivio_codex_hook`] for `bin`, deduplicated by key (one hook is listed once per
+/// cwd). A user's own hook in the same file, or ours pointing at another binary, is not included.
+pub fn retrivio_codex_hooks(list_result: &Value, hooks_json_path: &Path, bin: &str) -> Vec<CodexHookTrust> {
+    let mut out: Vec<CodexHookTrust> = Vec::new();
+    for hook in hooks_in_list_result(list_result) {
+        if !is_exact_retrivio_codex_hook(hook, hooks_json_path, bin) {
+            continue;
+        }
+        let field = |name: &str| hook.get(name).and_then(Value::as_str);
+        let (Some(key), Some(event), Some(source_path), Some(hash), Some(status)) = (
+            field("key"),
+            field("eventName"),
+            field("sourcePath"),
+            field("currentHash"),
+            field("trustStatus"),
+        ) else {
+            continue;
+        };
+        if out.iter().any(|h| h.key == key) {
+            continue;
+        }
+        out.push(CodexHookTrust {
+            key: key.to_string(),
+            event_name: event.to_string(),
+            source_path: source_path.to_string(),
+            current_hash: hash.to_string(),
+            trust_status: status.to_string(),
+        });
+    }
+    out
+}
+
+/// What [`select_untrusted_retrivio_hooks`] decided.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct TrustSelection {
+    /// Hooks to write a `trusted_hash` for (`untrusted`, or `modified` after a definition
+    /// change): at most one per event.
+    pub pending: Vec<CodexHookTrust>,
+    /// Events skipped because more than one exact match was listed for them, naming the keys.
+    pub warnings: Vec<String>,
+}
+
+/// Our hooks that Codex will not run yet. `managed` and `trusted` hooks need nothing. An event
+/// with two or more exact matches (our merge never writes two, so somebody edited the file) gets
+/// nothing selected and a warning instead.
+pub fn select_untrusted_retrivio_hooks(
+    list_result: &Value,
+    hooks_json_path: &Path,
+    bin: &str,
+) -> TrustSelection {
+    let ours = retrivio_codex_hooks(list_result, hooks_json_path, bin);
+    let mut selection = TrustSelection::default();
+    for kind in HookKind::ALL {
+        let event = kind.codex_event();
+        let matches: Vec<&CodexHookTrust> = ours.iter().filter(|h| h.event_name == event).collect();
+        match matches.as_slice() {
+            [] => {}
+            [one] => {
+                if matches!(one.trust_status.as_str(), "untrusted" | "modified") {
+                    selection.pending.push((*one).clone());
+                }
+            }
+            many => {
+                let keys: Vec<&str> = many.iter().map(|h| h.key.as_str()).collect();
+                selection.warnings.push(format!(
+                    "{}: {} retrivio hooks match where one is expected; none trusted: {}",
+                    event,
+                    many.len(),
+                    keys.join(", ")
+                ));
+            }
+        }
+    }
+    selection
+}
+
+/// The `config/batchWrite` the `/hooks` UI sends: upsert `hooks.state.<key>.trusted_hash` for
+/// every hook and reload the user config so the running server sees it.
+pub fn build_trust_write_request(id: u64, hooks: &[CodexHookTrust]) -> Value {
+    let mut state = Map::new();
+    for hook in hooks {
+        state.insert(hook.key.clone(), json!({ "trusted_hash": hook.current_hash }));
+    }
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "config/batchWrite",
+        "params": {
+            "edits": [{
+                "keyPath": "hooks.state",
+                "value": Value::Object(state),
+                "mergeStrategy": "upsert"
+            }],
+            "reloadUserConfig": true
+        }
+    })
+}
+
+/// Outcome of re-checking one written hook against a fresh `hooks/list`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrustVerification {
+    /// Listed with the same key, hash, source path and event, and `trusted`.
+    Confirmed,
+    /// Same identity, but Codex still reports this other status.
+    NotTrusted(String),
+    /// The key is listed, but its hash, source path or event differs from what we selected:
+    /// the definition changed between list and re-list, so the trusted hash may belong to
+    /// something we never saw.
+    DefinitionChanged,
+    /// The key is no longer listed at all.
+    NotListed,
+}
+
+/// Confirm each of `expected` in a `hooks/list` result by identity (key and hash and source
+/// path and event), not by key alone.
+pub fn verify_trusted_hooks(
+    list_result: &Value,
+    expected: &[CodexHookTrust],
+) -> Vec<(CodexHookTrust, TrustVerification)> {
+    fn field<'a>(hook: &'a Value, name: &str) -> Option<&'a str> {
+        hook.get(name).and_then(Value::as_str)
+    }
+    expected
+        .iter()
+        .map(|want| {
+            let same_key: Vec<&Value> = hooks_in_list_result(list_result)
+                .filter(|h| field(h, "key") == Some(want.key.as_str()))
+                .collect();
+            let identical = same_key.iter().find(|h| {
+                field(h, "currentHash") == Some(want.current_hash.as_str())
+                    && field(h, "sourcePath") == Some(want.source_path.as_str())
+                    && field(h, "eventName") == Some(want.event_name.as_str())
+            });
+            let outcome = match identical {
+                Some(h) => match field(h, "trustStatus") {
+                    Some("trusted") => TrustVerification::Confirmed,
+                    other => TrustVerification::NotTrusted(other.unwrap_or("?").to_string()),
+                },
+                None if same_key.is_empty() => TrustVerification::NotListed,
+                None => TrustVerification::DefinitionChanged,
+            };
+            (want.clone(), outcome)
+        })
+        .collect()
+}
+
+/// `Some(Ok(result))` or `Some(Err(message))` when `msg` is the JSON-RPC response to request
+/// `id`; `None` for everything else (notifications, other ids, and server-to-client requests,
+/// which carry both `id` and `method`).
+pub fn match_response(msg: &Value, id: u64) -> Option<Result<Value, String>> {
+    if msg.get("method").is_some() || msg.get("id").and_then(Value::as_u64) != Some(id) {
+        return None;
+    }
+    if let Some(err) = msg.get("error") {
+        let message = err
+            .get("message")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| err.to_string());
+        return Some(Err(match err.get("code").and_then(Value::as_i64) {
+            Some(code) => format!("{} (code {})", message, code),
+            None => message,
+        }));
+    }
+    Some(Ok(msg.get("result").cloned().unwrap_or(Value::Null)))
+}
+
+/// Kills and reaps a freshly spawned child unless [`ChildGuard::into_inner`] hands it over
+/// first, so nothing between `spawn()` and the construction of [`AppServer`] (a failed pipe, a
+/// thread that could not start, a panic) leaks the process.
+struct ChildGuard(Option<process::Child>);
+
+impl ChildGuard {
+    fn into_inner(mut self) -> process::Child {
+        self.0.take().expect("child already taken")
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// A running `codex app-server` child. Stdout is drained by a thread into a channel so every
+/// wait can time out; the child is killed on drop (every error path included).
+struct AppServer {
+    child: process::Child,
+    stdin: process::ChildStdin,
+    lines: mpsc::Receiver<std::io::Result<String>>,
+    stderr: Arc<Mutex<String>>,
+    next_id: u64,
+}
+
+impl AppServer {
+    fn spawn(codex_home: Option<&Path>) -> Result<AppServer, String> {
+        let path_env = env::var("PATH").unwrap_or_default();
+        let codex = find_on_path("codex", &path_env).ok_or_else(|| "codex not found on PATH".to_string())?;
+        let mut cmd = Command::new(&codex);
+        cmd.arg("app-server")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(dir) = codex_home {
+            cmd.env("CODEX_HOME", dir);
+        }
+        // Until the AppServer owns it, the guard kills and reaps the child on every early return.
+        let mut guard = ChildGuard(Some(
+            cmd.spawn()
+                .map_err(|e| format!("cannot start `{} app-server`: {}", codex.display(), e))?,
+        ));
+        let child = guard.0.as_mut().expect("child just spawned");
+        let stdin = child.stdin.take().ok_or("codex app-server: no stdin")?;
+        let stdout = child.stdout.take().ok_or("codex app-server: no stdout")?;
+        let stderr_pipe = child.stderr.take().ok_or("codex app-server: no stderr")?;
+
+        let (tx, lines) = mpsc::channel();
+        thread::Builder::new()
+            .name("codex-app-server-stdout".to_string())
+            .spawn(move || {
+                let mut reader = BufReader::new(stdout);
+                loop {
+                    let mut line = String::new();
+                    match reader.read_line(&mut line) {
+                        Ok(0) => break,
+                        Ok(_) => {
+                            if tx.send(Ok(line)).is_err() {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Err(e));
+                            break;
+                        }
+                    }
+                }
+            })
+            .map_err(|e| format!("codex app-server: cannot start stdout reader: {}", e))?;
+        let stderr = Arc::new(Mutex::new(String::new()));
+        let sink = Arc::clone(&stderr);
+        thread::Builder::new()
+            .name("codex-app-server-stderr".to_string())
+            .spawn(move || {
+                let mut reader = BufReader::new(stderr_pipe);
+                let mut line = String::new();
+                while let Ok(n) = reader.read_line(&mut line) {
+                    if n == 0 {
+                        break;
+                    }
+                    if let Ok(mut buf) = sink.lock() {
+                        if buf.len() < CODEX_APP_SERVER_STDERR_CAP {
+                            buf.push_str(&line);
+                        }
+                    }
+                    line.clear();
+                }
+            })
+            .map_err(|e| format!("codex app-server: cannot start stderr reader: {}", e))?;
+        Ok(AppServer {
+            child: guard.into_inner(),
+            stdin,
+            lines,
+            stderr,
+            next_id: 1,
+        })
+    }
+
+    fn next_id(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+
+    fn stderr_tail(&self) -> String {
+        let text = self.stderr.lock().map(|b| b.trim().to_string()).unwrap_or_default();
+        if text.is_empty() {
+            String::new()
+        } else {
+            format!(" (stderr: {})", text.lines().last().unwrap_or(""))
+        }
+    }
+
+    fn notify(&mut self, msg: &Value) -> Result<(), String> {
+        let mut text = msg.to_string();
+        text.push('\n');
+        self.stdin
+            .write_all(text.as_bytes())
+            .and_then(|_| self.stdin.flush())
+            .map_err(|e| format!("codex app-server: write failed: {}{}", e, self.stderr_tail()))
+    }
+
+    /// Send `request` (which must carry an `id`) and wait up to
+    /// [`CODEX_APP_SERVER_TIMEOUT_SECS`] for its response, skipping notifications and anything
+    /// else on the way. Returns the `result`.
+    fn call(&mut self, request: &Value) -> Result<Value, String> {
+        let method = request
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or("?")
+            .to_string();
+        let id = request
+            .get("id")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| format!("codex app-server: request {} has no id", method))?;
+        self.notify(request)?;
+        let deadline = Instant::now() + Duration::from_secs(CODEX_APP_SERVER_TIMEOUT_SECS);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let timed_out = || {
+                format!(
+                    "codex app-server: no response to {} within {} s",
+                    method, CODEX_APP_SERVER_TIMEOUT_SECS
+                )
+            };
+            if remaining.is_zero() {
+                return Err(timed_out());
+            }
+            let line = match self.lines.recv_timeout(remaining) {
+                Ok(Ok(line)) => line,
+                Ok(Err(e)) => {
+                    return Err(format!("codex app-server: read failed: {}{}", e, self.stderr_tail()))
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => return Err(timed_out()),
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(format!(
+                        "codex app-server exited before answering {}{}",
+                        method,
+                        self.stderr_tail()
+                    ))
+                }
+            };
+            let Ok(msg) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            if let Some(outcome) = match_response(&msg, id) {
+                return outcome.map_err(|e| format!("codex app-server {}: {}", method, e));
+            }
+        }
+    }
+}
+
+impl Drop for AppServer {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// When `RETRIVIO_HOME` redirects this module to a scratch home, point the app-server at that
+/// home's `.codex` too (`CODEX_HOME`), so the whole flow stays inside the scratch directory.
+/// Otherwise the child inherits the environment, including any `CODEX_HOME` the user set, which
+/// is the same directory [`codex_dir`] resolves for this module.
+fn codex_home_override(home: &Path) -> Option<PathBuf> {
+    match env::var("RETRIVIO_HOME") {
+        Ok(v) if !v.trim().is_empty() => Some(Cli::Codex.dir(home)),
+        _ => None,
+    }
+}
+
+/// Explains an empty `hooks/list` when the app-server reads a different CODEX_HOME than the
+/// directory this module manages.
+fn describe_codex_home_mismatch(home: &Path, codex_home: Option<&str>) -> String {
+    match codex_home {
+        Some(reported) if Path::new(reported) != Cli::Codex.dir(home) => {
+            format!("; codex app-server uses CODEX_HOME={}", reported)
+        }
+        _ => String::new(),
+    }
+}
+
+/// Spawn, `initialize`, `initialized`. Returns the server and the `codexHome` it reported.
+fn codex_app_server_connect(home: &Path) -> Result<(AppServer, Option<String>), String> {
+    let override_home = codex_home_override(home);
+    let mut server = AppServer::spawn(override_home.as_deref())?;
+    let id = server.next_id();
+    let init = server.call(&build_initialize_request(id))?;
+    server.notify(&build_initialized_notification())?;
+    let codex_home = init
+        .get("codexHome")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    Ok((server, codex_home))
+}
+
+fn codex_list_hooks(server: &mut AppServer, home: &Path) -> Result<Value, String> {
+    let id = server.next_id();
+    server.call(&build_hooks_list_request(id, home))
+}
+
+/// Read-only: for each binary in `bins`, our exact hooks and their trust status as Codex sees
+/// them, plus the `codexHome` the app-server reported. `Err` = app-server unavailable (codex
+/// missing, too old, or not answering).
+fn codex_hook_trust_report(
+    home: &Path,
+    bins: &[String],
+) -> Result<(Vec<(String, Vec<CodexHookTrust>)>, Option<String>), String> {
+    let (mut server, codex_home) = codex_app_server_connect(home)?;
+    let listed = codex_list_hooks(&mut server, home)?;
+    let hooks_json = Cli::Codex.hooks_file(home);
+    let report = bins
+        .iter()
+        .map(|bin| (bin.clone(), retrivio_codex_hooks(&listed, &hooks_json, bin)))
+        .collect();
+    Ok((report, codex_home))
+}
+
+enum TrustOutcome {
+    /// Codex lists none of our hooks for this binary from the file we manage.
+    NotFound { codex_home: Option<String> },
+    AlreadyTrusted(usize),
+    Declined,
+    Trusted(usize),
+}
+
+/// The `/hooks` trust flow for the hooks `hook install` writes for `bin`: list, select our exact
+/// untrusted hooks, `config/batchWrite` their hashes, re-list and confirm each one by identity
+/// (key, hash, source path, event), printing one `Codex trust: <event> <status>` line per hook.
+/// `Err` when anything selected is not confirmed trusted, so `hook trust` exits non-zero.
+/// `auto_yes` skips the confirmation (used by `hook install`, where the user already confirmed
+/// the install).
+fn codex_trust_hooks(home: &Path, bin: &str, auto_yes: bool) -> Result<TrustOutcome, String> {
+    let hooks_json = Cli::Codex.hooks_file(home);
+    let (mut server, codex_home) = codex_app_server_connect(home)?;
+    let listed = codex_list_hooks(&mut server, home)?;
+    let ours = retrivio_codex_hooks(&listed, &hooks_json, bin);
+    if ours.is_empty() {
+        return Ok(TrustOutcome::NotFound { codex_home });
+    }
+    let TrustSelection { pending, warnings } = select_untrusted_retrivio_hooks(&listed, &hooks_json, bin);
+    for warning in &warnings {
+        println!("  Codex trust: warning: {}", warning);
+    }
+    if pending.is_empty() {
+        if warnings.is_empty() {
+            return Ok(TrustOutcome::AlreadyTrusted(ours.len()));
+        }
+        return Err(format!(
+            "{} event(s) list more than one retrivio hook in {}; nothing trusted (remove the duplicates, then rerun)",
+            warnings.len(),
+            hooks_json.display()
+        ));
+    }
+    if !auto_yes && !interactive_terminal() {
+        return Err(format!(
+            "{} hook(s) need trusting but this is not a terminal - rerun with --yes",
+            pending.len()
+        ));
+    }
+    let question = format!(
+        "  trust {} retrivio hook(s) in Codex (Codex writes [hooks.state] to {})?",
+        pending.len(),
+        Cli::Codex.dir(home).join("config.toml").display()
+    );
+    if !confirm(auto_yes, &question) {
+        return Ok(TrustOutcome::Declined);
+    }
+    let id = server.next_id();
+    server.call(&build_trust_write_request(id, &pending))?;
+    let relisted = codex_list_hooks(&mut server, home)?;
+    let mut failures = warnings.len();
+    for (hook, outcome) in verify_trusted_hooks(&relisted, &pending) {
+        let event = hook.event_name.as_str();
+        match outcome {
+            TrustVerification::Confirmed => println!("  Codex trust: {} trusted", event),
+            TrustVerification::NotTrusted(status) => {
+                println!("  Codex trust: {} {} (expected trusted)", event, status);
+                failures += 1;
+            }
+            TrustVerification::DefinitionChanged => {
+                println!(
+                    "  Codex trust: {} not confirmed (definition changed between list and re-list; rerun `retrivio hook trust --codex`)",
+                    event
+                );
+                failures += 1;
+            }
+            TrustVerification::NotListed => {
+                println!("  Codex trust: {} not listed after the write", event);
+                failures += 1;
+            }
+        }
+    }
+    if failures > 0 {
+        return Err(format!(
+            "{} retrivio hook(s) not confirmed trusted after config/batchWrite",
+            failures
+        ));
+    }
+    Ok(TrustOutcome::Trusted(pending.len()))
 }
 
 // ---------------------------------------------------------------------------
@@ -1334,8 +2122,7 @@ extern "C" fn service_on_signal(_sig: libc::c_int) {
 }
 
 fn service_run() -> Result<(), String> {
-    use std::sync::atomic::Ordering;
-    let bin = std::env::current_exe().map_err(|e| format!("current_exe: {}", e))?;
+    let bin = env::current_exe().map_err(|e| format!("current_exe: {}", e))?;
     // SAFETY: installing a minimal async-signal-safe handler that only stores a flag.
     unsafe {
         libc::signal(libc::SIGTERM, service_on_signal as usize);
@@ -1343,12 +2130,15 @@ fn service_run() -> Result<(), String> {
     }
     let mut backoff: u64 = 60;
     while !SERVICE_STOP.load(Ordering::SeqCst) {
-        let started = std::time::Instant::now();
+        let started = Instant::now();
         eprintln!("[{}] retrivio service: starting watch", unix_now());
-        let mut child = match std::process::Command::new(&bin)
-            .args(["watch", "--quiet", "--interval", WATCH_INTERVAL_SECS])
-            .spawn()
-        {
+        let mut cmd = Command::new(&bin);
+        cmd.args(["watch", "--quiet", "--interval", WATCH_INTERVAL_SECS]);
+        // The watch leads its own process group so a stop reaches everything it spawned
+        // (fswatch) in one signal instead of orphaning it under launchd.
+        #[cfg(unix)]
+        cmd.process_group(0);
+        let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("[{}] retrivio service: failed to start watch: {}; retry in {}s", unix_now(), e, backoff);
@@ -1357,33 +2147,60 @@ fn service_run() -> Result<(), String> {
                 continue;
             }
         };
-        // Poll the child so a TERM/INT to the supervisor is forwarded and the child is reaped.
-        let status = loop {
+        // Poll the child so a TERM/INT to the supervisor stops the whole watch process group
+        // (TERM, then KILL after 3 s) and the child is always reaped.
+        let outcome: Result<process::ExitStatus, String> = loop {
             if SERVICE_STOP.load(Ordering::SeqCst) {
-                let _ = child.kill();
-                let _ = child.wait();
+                terminate_process_group(&mut child);
                 eprintln!("[{}] retrivio service: stopped", unix_now());
                 return Ok(());
             }
             match child.try_wait() {
-                Ok(Some(st)) => break st,
-                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(500)),
+                Ok(Some(status)) => break Ok(status),
+                Ok(None) => thread::sleep(Duration::from_millis(500)),
                 Err(e) => {
-                    eprintln!("[{}] retrivio service: wait failed: {}", unix_now(), e);
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    break std::process::ExitStatus::default();
+                    // The child's state is unknown: stop its group and treat this as a failed
+                    // run, so the backoff applies rather than an immediate restart.
+                    terminate_process_group(&mut child);
+                    break Err(format!("watch wait failed: {}", e));
                 }
             }
         };
-        eprintln!("[{}] retrivio service: watch exited ({}); retry in {}s", unix_now(), status, backoff);
-        if started.elapsed() > std::time::Duration::from_secs(600) {
+        match outcome {
+            Ok(status) => eprintln!("[{}] retrivio service: watch exited ({}); retry in {}s", unix_now(), status, backoff),
+            Err(e) => eprintln!("[{}] retrivio service: {}; retry in {}s", unix_now(), e, backoff),
+        }
+        if started.elapsed() > Duration::from_secs(600) {
             backoff = 60;
         }
         service_sleep(backoff);
         backoff = (backoff * 2).min(900);
     }
     Ok(())
+}
+
+/// Stop `child` and everything in its process group: SIGTERM the group, wait up to 3 s for the
+/// leader to exit, then SIGKILL the group and reap the leader. `child` must have been spawned
+/// with `process_group(0)`, so its pid is the group id.
+fn terminate_process_group(child: &mut process::Child) {
+    let pgid = child.id() as libc::pid_t;
+    // SAFETY: kill(2) with a negative pid signals that process group; no memory is involved.
+    unsafe {
+        libc::kill(-pgid, libc::SIGTERM);
+    }
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(100)),
+            _ => break,
+        }
+    }
+    // SAFETY: as above.
+    unsafe {
+        libc::kill(-pgid, libc::SIGKILL);
+    }
+    let _ = child.wait();
 }
 
 /// Sleep in one-second slices so a stop signal interrupts the backoff.
@@ -1492,11 +2309,17 @@ fn service_status(_opts: &HookOpts) -> Result<(), String> {
         plist.display(),
         if plist.is_file() { "present" } else { "missing" }
     );
-    match find_on_path("fswatch", LAUNCHD_PATH_ENV) {
-        Some(p) => println!("  fswatch: {} (on the agent PATH)", p.display()),
+    // Resolve fswatch against the PATH the agent really gets: the one in the installed plist,
+    // or, without a plist, the one `service install` would write now.
+    let (agent_path, path_source) = match fs::read_to_string(&plist).ok().and_then(|t| plist_path_env(&t)) {
+        Some(p) => (p, "the plist's PATH"),
+        None => (service_path_env(), "the PATH `service install` would write"),
+    };
+    match find_on_path("fswatch", &agent_path) {
+        Some(p) => println!("  fswatch: {} (on {})", p.display(), path_source),
         None => println!(
-            "  fswatch: not found on the agent PATH ({}); the watcher falls back to polling",
-            LAUNCHD_PATH_ENV
+            "  fswatch: not found on {} ({}); the watcher falls back to polling",
+            path_source, agent_path
         ),
     }
     let log = watch_log_path(&home);
@@ -1534,6 +2357,24 @@ fn find_on_path(name: &str, path: &str) -> Option<PathBuf> {
         .filter(|d| !d.is_empty())
         .map(|d| Path::new(d).join(name))
         .find(|p| super::is_executable_file(p))
+}
+
+/// The `PATH` value inside a rendered launchd plist (`EnvironmentVariables` -> `PATH`), XML
+/// entities decoded; `None` when the plist carries none.
+pub fn plist_path_env(plist: &str) -> Option<String> {
+    const KEY: &str = "<key>PATH</key>";
+    let after = &plist[plist.find(KEY)? + KEY.len()..];
+    let start = after.find("<string>")? + "<string>".len();
+    let end = after[start..].find("</string>")? + start;
+    Some(xml_unescape(&after[start..end]))
+}
+
+/// Inverse of [`xml_escape`] (`&amp;` last, so `&amp;lt;` decodes to the literal `&lt;`).
+fn xml_unescape(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&amp;", "&")
 }
 
 /// "N seconds/minutes/hours/days ago" plus the raw unix timestamp.
@@ -2122,5 +2963,473 @@ mod tests {
         let bak = write_json_atomic(&cfg, &json!({ "keep": false }), &mut false).unwrap().unwrap();
         assert_eq!(fs::read_to_string(&bak).unwrap(), "{\"keep\":true}\n");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -- Codex trust via app-server --------------------------------------------------------
+
+    const CODEX_HOOKS_JSON: &str = "/Users/me/.codex/hooks.json";
+    const K_PROMPT: &str = "/Users/me/.codex/hooks.json:user_prompt_submit:0:0";
+    const K_RESET: &str = "/Users/me/.codex/hooks.json:session_start:0:0";
+
+    /// One `hooks/list` entry shaped like the real reply; `matcher` is what we write for the
+    /// event, `command` is taken verbatim.
+    fn codex_hook(key: &str, event: &str, command: &str, source_path: &str, status: &str, hash: &str) -> Value {
+        json!({
+            "key": key,
+            "eventName": event,
+            "handlerType": "command",
+            "command": command,
+            "async": false,
+            "matcher": if event == "sessionStart" { json!("compact|clear") } else { Value::Null },
+            "timeoutSec": 5,
+            "statusMessage": if event == "userPromptSubmit" { json!("retrivio recall") } else { Value::Null },
+            "additionalContextLimit": Value::Null,
+            "sourcePath": source_path,
+            "source": if status == "managed" { "managed" } else { "user" },
+            "pluginId": Value::Null,
+            "displayOrder": 0,
+            "enabled": true,
+            "isManaged": status == "managed",
+            "currentHash": hash,
+            "trustStatus": status
+        })
+    }
+
+    fn hooks_list(hooks: Vec<Value>) -> Value {
+        json!({ "data": [{ "cwd": "/Users/me", "hooks": hooks, "warnings": [], "errors": [] }] })
+    }
+
+    /// Exactly what `hook install` writes for BIN, as the app-server lists it.
+    fn our_prompt(status: &str, hash: &str) -> Value {
+        codex_hook(K_PROMPT, "userPromptSubmit", &format!("{} recall", BIN), CODEX_HOOKS_JSON, status, hash)
+    }
+
+    fn our_reset(status: &str, hash: &str) -> Value {
+        codex_hook(K_RESET, "sessionStart", &format!("{} recall --reset-session", BIN), CODEX_HOOKS_JSON, status, hash)
+    }
+
+    /// Shaped like a real `hooks/list` result: ours (one untrusted, one modified), a managed
+    /// hook, a user's own hook in our file, a retrivio-looking hook from another file and one
+    /// for an event we never install.
+    fn fixture_hooks_list() -> Value {
+        hooks_list(vec![
+            our_prompt("untrusted", "sha256:aaa"),
+            our_reset("modified", "sha256:bbb"),
+            codex_hook("/etc/codex/managed_hooks.json:user_prompt_submit:0:0", "userPromptSubmit",
+                "/opt/corp/audit --prompt", "/etc/codex/managed_hooks.json", "managed", "sha256:ccc"),
+            codex_hook("/Users/me/.codex/hooks.json:user_prompt_submit:1:0", "userPromptSubmit",
+                "/Users/me/bin/my-own-hook.sh", CODEX_HOOKS_JSON, "untrusted", "sha256:ddd"),
+            codex_hook("/Users/me/proj/.codex/hooks.json:user_prompt_submit:0:0", "userPromptSubmit",
+                &format!("{} recall", BIN), "/Users/me/proj/.codex/hooks.json", "untrusted", "sha256:eee"),
+            codex_hook("/Users/me/.codex/hooks.json:stop:0:0", "stop",
+                &format!("{} recall", BIN), CODEX_HOOKS_JSON, "untrusted", "sha256:fff"),
+        ])
+    }
+
+    fn selected_keys(sel: &TrustSelection) -> Vec<&str> {
+        sel.pending.iter().map(|h| h.key.as_str()).collect()
+    }
+
+    fn select_one(hook: Value, bin: &str) -> TrustSelection {
+        select_untrusted_retrivio_hooks(&hooks_list(vec![hook]), Path::new(CODEX_HOOKS_JSON), bin)
+    }
+
+    #[test]
+    fn initialize_request_matches_app_server_handshake() {
+        let req = build_initialize_request(1);
+        assert_eq!(req["jsonrpc"], "2.0");
+        assert_eq!(req["id"], 1);
+        assert_eq!(req["method"], "initialize");
+        assert_eq!(req["params"]["clientInfo"]["name"], "retrivio");
+        assert_eq!(req["params"]["clientInfo"]["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(req["params"]["clientInfo"]["title"], "retrivio hook install");
+        assert_eq!(req["params"]["capabilities"]["experimentalApi"], true);
+        let note = build_initialized_notification();
+        assert_eq!(note["method"], "initialized");
+        assert!(note.get("id").is_none(), "a notification has no id");
+        assert_eq!(note["params"], json!({}));
+    }
+
+    #[test]
+    fn hooks_list_request_carries_home_as_cwd() {
+        let req = build_hooks_list_request(2, Path::new("/Users/me"));
+        assert_eq!(req["id"], 2);
+        assert_eq!(req["method"], "hooks/list");
+        assert_eq!(req["params"], json!({ "cwds": ["/Users/me"] }));
+    }
+
+    #[test]
+    fn select_untrusted_picks_only_our_exact_untrusted_or_modified_hooks() {
+        let hooks_json = Path::new(CODEX_HOOKS_JSON);
+        let sel = select_untrusted_retrivio_hooks(&fixture_hooks_list(), hooks_json, BIN);
+        assert!(sel.warnings.is_empty(), "{:?}", sel.warnings);
+        assert_eq!(selected_keys(&sel), vec![K_PROMPT, K_RESET]);
+        assert_eq!(sel.pending[0].current_hash, "sha256:aaa");
+        assert_eq!(sel.pending[0].source_path, CODEX_HOOKS_JSON);
+        assert_eq!(sel.pending[0].event_name, "userPromptSubmit");
+        assert_eq!(sel.pending[1].current_hash, "sha256:bbb");
+        // Path comparison is by components, so a trailing slash in the home does not matter.
+        let via_join = PathBuf::from("/Users/me/").join(".codex").join("hooks.json");
+        assert_eq!(select_untrusted_retrivio_hooks(&fixture_hooks_list(), &via_join, BIN).pending.len(), 2);
+        // Another user's hooks.json, or hooks for a binary other than the one we install: none.
+        assert!(select_untrusted_retrivio_hooks(&fixture_hooks_list(), Path::new("/Users/other/.codex/hooks.json"), BIN).pending.is_empty());
+        assert!(select_untrusted_retrivio_hooks(&fixture_hooks_list(), hooks_json, BIN2).pending.is_empty());
+        assert!(retrivio_codex_hooks(&fixture_hooks_list(), hooks_json, BIN2).is_empty());
+        // Already trusted: nothing pending and no warning, but still reported as ours.
+        let trusted = hooks_list(vec![our_prompt("trusted", "sha256:aaa"), our_reset("trusted", "sha256:bbb")]);
+        let sel = select_untrusted_retrivio_hooks(&trusted, hooks_json, BIN);
+        assert!(sel.pending.is_empty() && sel.warnings.is_empty());
+        assert_eq!(retrivio_codex_hooks(&trusted, hooks_json, BIN).len(), 2);
+        // Malformed replies select nothing rather than panicking.
+        assert_eq!(select_untrusted_retrivio_hooks(&json!({}), hooks_json, BIN), TrustSelection::default());
+        assert_eq!(
+            select_untrusted_retrivio_hooks(&json!({ "data": [{ "hooks": [{ "key": 1 }] }] }), hooks_json, BIN),
+            TrustSelection::default()
+        );
+    }
+
+    /// Every deviation from the exact generated form is somebody else's hook: never trusted.
+    #[test]
+    fn select_untrusted_rejects_everything_but_the_exact_generated_forms() {
+        let prompt = |command: &str| codex_hook(K_PROMPT, "userPromptSubmit", command, CODEX_HOOKS_JSON, "untrusted", "sha256:aaa");
+        let reset = |command: &str| codex_hook(K_RESET, "sessionStart", command, CODEX_HOOKS_JSON, "untrusted", "sha256:bbb");
+        let exact_prompt = format!("{} recall", BIN);
+        let exact_reset = format!("{} recall --reset-session", BIN);
+        // Baseline: the two exact forms are selected.
+        assert_eq!(select_one(prompt(&exact_prompt), BIN).pending.len(), 1);
+        assert_eq!(select_one(reset(&exact_reset), BIN).pending.len(), 1);
+        // Another binary named retrivio.
+        assert!(select_one(prompt("/tmp/retrivio recall"), BIN).pending.is_empty());
+        assert!(select_one(prompt("retrivio recall"), BIN).pending.is_empty());
+        // A chained command whose first token is our binary, in either position.
+        assert!(select_one(prompt("/known/retrivio;/tmp/retrivio recall"), "/known/retrivio").pending.is_empty());
+        assert!(select_one(prompt("/known/retrivio recall; /tmp/retrivio recall"), "/known/retrivio").pending.is_empty());
+        assert!(select_one(prompt("/known/retrivio recall && rm -rf ~"), "/known/retrivio").pending.is_empty());
+        assert!(select_one(prompt("/known/retrivio recall $(id)"), "/known/retrivio").pending.is_empty());
+        // The reset command on userPromptSubmit, the plain one on sessionStart, extra or
+        // repeated arguments, and quoting or spacing we would not write.
+        assert!(select_one(prompt(&exact_reset), BIN).pending.is_empty());
+        assert!(select_one(reset(&exact_prompt), BIN).pending.is_empty());
+        assert!(select_one(prompt(&format!("{} recall --verbose", BIN)), BIN).pending.is_empty());
+        assert!(select_one(prompt(&format!("{} recall recall", BIN)), BIN).pending.is_empty());
+        assert!(select_one(prompt(&format!("'{}' recall", BIN)), BIN).pending.is_empty());
+        assert!(select_one(prompt(&format!("\"{}\" recall", BIN)), BIN).pending.is_empty());
+        assert!(select_one(prompt(&format!("{}  recall", BIN)), BIN).pending.is_empty());
+        assert!(select_one(prompt(&format!("{} recall ", BIN)), BIN).pending.is_empty());
+        assert!(select_one(prompt(&format!(" {} recall", BIN)), BIN).pending.is_empty());
+        // Matcher mismatch in either direction.
+        let mut h = prompt(&exact_prompt);
+        h["matcher"] = json!("compact|clear");
+        assert!(select_one(h, BIN).pending.is_empty());
+        let mut h = prompt(&exact_prompt);
+        h["matcher"] = json!("");
+        assert!(select_one(h, BIN).pending.is_empty());
+        let mut h = reset(&exact_reset);
+        h["matcher"] = Value::Null;
+        assert!(select_one(h.clone(), BIN).pending.is_empty());
+        h["matcher"] = json!("compact");
+        assert!(select_one(h.clone(), BIN).pending.is_empty());
+        h.as_object_mut().unwrap().remove("matcher");
+        assert!(select_one(h, BIN).pending.is_empty());
+        // Provenance and options: a plugin, a non-user source, another timeout, async, another
+        // handler type, a missing source path.
+        let mut h = prompt(&exact_prompt);
+        h["pluginId"] = json!("some.plugin");
+        assert!(select_one(h, BIN).pending.is_empty());
+        let mut h = prompt(&exact_prompt);
+        h["source"] = json!("project");
+        assert!(select_one(h, BIN).pending.is_empty());
+        let mut h = prompt(&exact_prompt);
+        h["source"] = json!("managed");
+        assert!(select_one(h, BIN).pending.is_empty());
+        let mut h = prompt(&exact_prompt);
+        h["timeoutSec"] = json!(10);
+        assert!(select_one(h, BIN).pending.is_empty());
+        let mut h = prompt(&exact_prompt);
+        h["timeoutSec"] = Value::Null;
+        assert!(select_one(h, BIN).pending.is_empty());
+        let mut h = prompt(&exact_prompt);
+        h["async"] = json!(true);
+        assert!(select_one(h, BIN).pending.is_empty());
+        let mut h = prompt(&exact_prompt);
+        h["handlerType"] = json!("prompt");
+        assert!(select_one(h, BIN).pending.is_empty());
+        let mut h = prompt(&exact_prompt);
+        h.as_object_mut().unwrap().remove("sourcePath");
+        assert!(select_one(h, BIN).pending.is_empty());
+        // Fields the app-server may omit are fine when they are absent rather than wrong.
+        let mut h = prompt(&exact_prompt);
+        for optional in ["async", "pluginId", "handlerType", "matcher", "statusMessage"] {
+            h.as_object_mut().unwrap().remove(optional);
+        }
+        assert_eq!(select_one(h, BIN).pending.len(), 1);
+        // Our own quoting of an unusual path is byte-exact and accepted; the unquoted form is not.
+        let spaced = "/Users/me/My Tools/retrivio";
+        let quoted = codex_hook(K_PROMPT, "userPromptSubmit", &format!("'{}' recall", spaced), CODEX_HOOKS_JSON, "untrusted", "sha256:aaa");
+        assert_eq!(select_one(quoted, spaced).pending.len(), 1);
+        let unquoted = codex_hook(K_PROMPT, "userPromptSubmit", &format!("{} recall", spaced), CODEX_HOOKS_JSON, "untrusted", "sha256:aaa");
+        assert!(select_one(unquoted, spaced).pending.is_empty());
+        // A binary path that itself carries a shell metacharacter is quoted by shell_quote when
+        // installed, but never auto-trusted.
+        let odd = "/Users/me/a;b/retrivio";
+        let odd_hook = codex_hook(K_PROMPT, "userPromptSubmit", &HookKind::Prompt.shell_command(odd), CODEX_HOOKS_JSON, "untrusted", "sha256:aaa");
+        assert!(select_one(odd_hook, odd).pending.is_empty());
+    }
+
+    #[test]
+    fn select_untrusted_skips_an_event_with_two_exact_matches_and_names_both() {
+        let hooks_json = Path::new(CODEX_HOOKS_JSON);
+        let dup_key = "/Users/me/.codex/hooks.json:session_start:1:0";
+        let list = hooks_list(vec![
+            our_prompt("untrusted", "sha256:aaa"),
+            our_reset("modified", "sha256:bbb"),
+            codex_hook(dup_key, "sessionStart", &format!("{} recall --reset-session", BIN), CODEX_HOOKS_JSON, "trusted", "sha256:ggg"),
+        ]);
+        let sel = select_untrusted_retrivio_hooks(&list, hooks_json, BIN);
+        assert_eq!(selected_keys(&sel), vec![K_PROMPT], "the unambiguous event is still selected");
+        assert_eq!(sel.warnings.len(), 1);
+        let w = &sel.warnings[0];
+        assert!(w.starts_with("sessionStart:"), "{}", w);
+        assert!(w.contains(K_RESET) && w.contains(dup_key), "{}", w);
+        // Both events duplicated: nothing selected at all, two warnings.
+        let list = hooks_list(vec![
+            our_prompt("untrusted", "sha256:aaa"),
+            codex_hook("/Users/me/.codex/hooks.json:user_prompt_submit:2:0", "userPromptSubmit",
+                &format!("{} recall", BIN), CODEX_HOOKS_JSON, "untrusted", "sha256:hhh"),
+            our_reset("untrusted", "sha256:bbb"),
+            codex_hook(dup_key, "sessionStart", &format!("{} recall --reset-session", BIN), CODEX_HOOKS_JSON, "untrusted", "sha256:ggg"),
+        ]);
+        let sel = select_untrusted_retrivio_hooks(&list, hooks_json, BIN);
+        assert!(sel.pending.is_empty());
+        assert_eq!(sel.warnings.len(), 2);
+        assert!(sel.warnings[0].starts_with("userPromptSubmit:"), "{}", sel.warnings[0]);
+        // A second hook for the same event that is NOT ours (other binary) is not a duplicate.
+        let list = hooks_list(vec![
+            our_reset("untrusted", "sha256:bbb"),
+            codex_hook(dup_key, "sessionStart", &format!("{} recall --reset-session", BIN2), CODEX_HOOKS_JSON, "untrusted", "sha256:ggg"),
+        ]);
+        let sel = select_untrusted_retrivio_hooks(&list, hooks_json, BIN);
+        assert_eq!(selected_keys(&sel), vec![K_RESET]);
+        assert!(sel.warnings.is_empty());
+        // The same hook listed under two cwds is one match, not a duplicate.
+        let mut doubled = fixture_hooks_list();
+        let entry = doubled["data"][0].clone();
+        doubled["data"].as_array_mut().unwrap().push(entry);
+        let sel = select_untrusted_retrivio_hooks(&doubled, hooks_json, BIN);
+        assert!(sel.warnings.is_empty());
+        assert_eq!(sel.pending.len(), 2);
+    }
+
+    #[test]
+    fn retrivio_codex_hooks_reports_status_and_dedupes_across_cwds() {
+        let ours = retrivio_codex_hooks(&fixture_hooks_list(), Path::new(CODEX_HOOKS_JSON), BIN);
+        let summary: Vec<(&str, &str)> = ours.iter().map(|h| (h.event_name.as_str(), h.trust_status.as_str())).collect();
+        assert_eq!(summary, vec![("userPromptSubmit", "untrusted"), ("sessionStart", "modified")]);
+        // The same hook listed under two cwds appears once.
+        let mut doubled = fixture_hooks_list();
+        let entry = doubled["data"][0].clone();
+        doubled["data"].as_array_mut().unwrap().push(entry);
+        assert_eq!(retrivio_codex_hooks(&doubled, Path::new(CODEX_HOOKS_JSON), BIN).len(), 2);
+    }
+
+    #[test]
+    fn trust_write_request_upserts_hooks_state() {
+        let sel = select_untrusted_retrivio_hooks(&fixture_hooks_list(), Path::new(CODEX_HOOKS_JSON), BIN);
+        let req = build_trust_write_request(3, &sel.pending);
+        assert_eq!(req["id"], 3);
+        assert_eq!(req["method"], "config/batchWrite");
+        assert_eq!(req["params"]["reloadUserConfig"], true);
+        let edits = req["params"]["edits"].as_array().unwrap();
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0]["keyPath"], "hooks.state");
+        assert_eq!(edits[0]["mergeStrategy"], "upsert");
+        assert_eq!(
+            edits[0]["value"],
+            json!({
+                K_PROMPT: { "trusted_hash": "sha256:aaa" },
+                K_RESET: { "trusted_hash": "sha256:bbb" }
+            })
+        );
+    }
+
+    #[test]
+    fn verify_trusted_hooks_confirms_by_identity_not_by_key() {
+        use TrustVerification::*;
+        let pending = select_untrusted_retrivio_hooks(&fixture_hooks_list(), Path::new(CODEX_HOOKS_JSON), BIN).pending;
+        assert_eq!(pending.len(), 2);
+        let outcomes = |relisted: &Value| -> Vec<TrustVerification> {
+            verify_trusted_hooks(relisted, &pending).into_iter().map(|(_, o)| o).collect()
+        };
+        // Same key, hash, source path and event, now trusted: confirmed.
+        let relisted = hooks_list(vec![our_prompt("trusted", "sha256:aaa"), our_reset("trusted", "sha256:bbb")]);
+        assert_eq!(outcomes(&relisted), vec![Confirmed, Confirmed]);
+        // Identity intact but Codex still reports another status.
+        let relisted = hooks_list(vec![our_prompt("trusted", "sha256:aaa"), our_reset("modified", "sha256:bbb")]);
+        assert_eq!(outcomes(&relisted), vec![Confirmed, NotTrusted("modified".to_string())]);
+        // The hash changed between list and re-list (hooks.json edited meanwhile): the key alone
+        // is not enough, even though Codex now says trusted.
+        let relisted = hooks_list(vec![our_prompt("trusted", "sha256:aaa"), our_reset("trusted", "sha256:zzz")]);
+        assert_eq!(outcomes(&relisted), vec![Confirmed, DefinitionChanged]);
+        // Same key and hash but another source path or event: also a changed definition.
+        let mut moved = our_reset("trusted", "sha256:bbb");
+        moved["sourcePath"] = json!("/Users/me/proj/.codex/hooks.json");
+        assert_eq!(outcomes(&hooks_list(vec![our_prompt("trusted", "sha256:aaa"), moved])), vec![Confirmed, DefinitionChanged]);
+        let mut renamed = our_reset("trusted", "sha256:bbb");
+        renamed["eventName"] = json!("stop");
+        assert_eq!(outcomes(&hooks_list(vec![our_prompt("trusted", "sha256:aaa"), renamed])), vec![Confirmed, DefinitionChanged]);
+        // Listed twice (two cwds), one of them identical: confirmed.
+        let relisted = hooks_list(vec![our_prompt("trusted", "sha256:aaa"), our_reset("trusted", "sha256:bbb"), our_reset("trusted", "sha256:bbb")]);
+        assert_eq!(outcomes(&relisted), vec![Confirmed, Confirmed]);
+        // Gone entirely.
+        let relisted = hooks_list(vec![our_prompt("trusted", "sha256:aaa")]);
+        assert_eq!(outcomes(&relisted), vec![Confirmed, NotListed]);
+        assert_eq!(outcomes(&json!({})), vec![NotListed, NotListed]);
+        // The verified hooks are handed back so the caller can name the event.
+        assert_eq!(verify_trusted_hooks(&relisted, &pending)[1].0.event_name, "sessionStart");
+    }
+
+    #[test]
+    fn match_response_skips_notifications_other_ids_and_server_requests() {
+        assert!(match_response(&json!({ "method": "remoteControl/status/changed", "params": {} }), 1).is_none());
+        assert!(match_response(&json!({ "id": 2, "result": {} }), 1).is_none());
+        // A server-to-client request carries both id and method: not our reply even if the id collides.
+        assert!(match_response(&json!({ "id": 1, "method": "item/commandExecution/requestApproval", "params": {} }), 1).is_none());
+        assert!(match_response(&json!("not an object"), 1).is_none());
+        assert_eq!(
+            match_response(&json!({ "id": 1, "result": { "codexHome": "/Users/me/.codex" } }), 1),
+            Some(Ok(json!({ "codexHome": "/Users/me/.codex" })))
+        );
+        assert_eq!(
+            match_response(&json!({ "id": 1, "error": { "code": -32601, "message": "method not found" } }), 1),
+            Some(Err("method not found (code -32601)".to_string()))
+        );
+        assert_eq!(
+            match_response(&json!({ "id": 1, "error": "boom" }), 1),
+            Some(Err("\"boom\"".to_string()))
+        );
+    }
+
+    #[test]
+    fn codex_dir_honours_codex_home_unless_retrivio_home_is_set() {
+        let home = Path::new("/Users/me");
+        assert_eq!(codex_dir(home, None, None), PathBuf::from("/Users/me/.codex"));
+        assert_eq!(codex_dir(home, Some(""), None), PathBuf::from("/Users/me/.codex"));
+        assert_eq!(codex_dir(home, Some("   "), None), PathBuf::from("/Users/me/.codex"));
+        assert_eq!(codex_dir(home, Some("/Volumes/work/codex-home"), None), PathBuf::from("/Volumes/work/codex-home"));
+        assert_eq!(codex_dir(home, Some(" /Volumes/work/codex-home "), None), PathBuf::from("/Volumes/work/codex-home"));
+        // A scratch RETRIVIO_HOME wins (home is already the scratch directory then).
+        let scratch = Path::new("/Users/me/proj/tmp/scratch-home2");
+        let rh = scratch.to_str();
+        assert_eq!(codex_dir(scratch, Some("/Volumes/work/codex-home"), rh), scratch.join(".codex"));
+        assert_eq!(codex_dir(scratch, None, rh), scratch.join(".codex"));
+        // An empty RETRIVIO_HOME is the same as unset.
+        assert_eq!(codex_dir(home, Some("/Volumes/work/codex-home"), Some("")), PathBuf::from("/Volumes/work/codex-home"));
+        assert_eq!(codex_dir(home, None, Some(" ")), PathBuf::from("/Users/me/.codex"));
+    }
+
+    // -- service: PATH policy, plist PATH, process group -----------------------------------
+
+    #[test]
+    fn service_path_skips_writable_shim_and_node_modules_dirs() {
+        let dir = scratch("path");
+        let mk = |name: &str, mode: u32| -> String {
+            let p = dir.join(name);
+            fs::create_dir_all(&p).unwrap();
+            fs::set_permissions(&p, fs::Permissions::from_mode(mode)).unwrap();
+            p.to_string_lossy().to_string()
+        };
+        let good = mk("bin", 0o755);
+        let good2 = mk("tools", 0o700);
+        let group_w = mk("group-writable", 0o775);
+        let world_w = mk("world-writable", 0o777);
+        let sticky = mk("sticky", 0o1777);
+        let node_bin = mk("proj/node_modules/.bin", 0o755);
+        let node_dir = mk("proj/node_modules", 0o755);
+        let dot_bin = mk("proj/.bin", 0o755);
+        let file = dir.join("not-a-dir");
+        fs::write(&file, "").unwrap();
+
+        assert!(service_path_dir_ok(&good));
+        assert!(service_path_dir_ok(&good2));
+        assert!(service_path_dir_ok(&format!("{}/", good)), "trailing slash is tolerated");
+        assert!(!service_path_dir_ok(&group_w), "group-writable");
+        assert!(!service_path_dir_ok(&world_w), "world-writable");
+        assert!(!service_path_dir_ok(&sticky), "sticky but still world-writable");
+        assert!(!service_path_dir_ok(&node_bin), "node_modules/.bin");
+        assert!(!service_path_dir_ok(&node_dir), "node_modules itself");
+        assert!(!service_path_dir_ok(&dot_bin), ".bin");
+        assert!(!service_path_dir_ok(&file.to_string_lossy()), "a file");
+        assert!(!service_path_dir_ok(&dir.join("missing").to_string_lossy()), "missing");
+        assert!(!service_path_dir_ok("relative/bin"));
+        assert!(!service_path_dir_ok(""));
+        assert!(!service_path_dir_ok("/tmp/x"));
+        assert!(!service_path_dir_ok("/private/tmp/x"));
+        assert!(!service_path_dir_ok("/var/folders/zz/x"));
+
+        let rendered = service_path_env_from(&format!(
+            "{}:{}:{}:{}:{}:/usr/bin::{}:{}",
+            good, group_w, node_bin, dot_bin, world_w, good, good2
+        ));
+        let parts: Vec<&str> = rendered.split(':').collect();
+        assert_eq!(&parts[..4], &["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]);
+        assert_eq!(&parts[4..], &[good.as_str(), good2.as_str()], "kept once each, nothing else");
+        assert_eq!(service_path_env_from(""), LAUNCHD_PATH_ENV);
+
+        // Make the scratch tree removable again.
+        for p in [&group_w, &world_w, &sticky] {
+            let _ = fs::set_permissions(p, fs::Permissions::from_mode(0o755));
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn plist_path_env_reads_back_the_rendered_path() {
+        let plist = render_launchd_plist("/Users/me/bin/retrivio", Path::new("/Users/me"));
+        assert_eq!(plist_path_env(&plist).as_deref(), Some(service_path_env().as_str()));
+        let snippet = "<dict><key>HOME</key><string>/Users/me</string>\n<key>PATH</key>\n<string>/a&amp;b/bin:/x&lt;y/bin:/usr/bin</string></dict>";
+        assert_eq!(plist_path_env(snippet).as_deref(), Some("/a&b/bin:/x<y/bin:/usr/bin"));
+        assert_eq!(plist_path_env("<dict><key>HOME</key><string>/x</string></dict>"), None);
+        assert_eq!(plist_path_env("<key>PATH</key><integer>3</integer>"), None);
+        assert_eq!(plist_path_env(""), None);
+        assert_eq!(xml_unescape("&amp;lt;"), "&lt;");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminate_process_group_terms_then_kills_the_group() {
+        use std::os::unix::process::ExitStatusExt;
+        // A group that honours TERM is gone well inside the 3 s grace period.
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "sleep 30"]).process_group(0);
+        let mut child = cmd.spawn().unwrap();
+        let t = Instant::now();
+        terminate_process_group(&mut child);
+        assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+        let status = child.try_wait().unwrap().expect("reaped");
+        assert!(!status.success());
+        // A leader that ignores TERM (its sleep children die, it loops on) is killed after 3 s.
+        // It reports readiness on stdout so the signal cannot race the trap being installed.
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "trap '' TERM; echo ready; while :; do sleep 1; done"])
+            .stdout(Stdio::piped())
+            .process_group(0);
+        let mut child = cmd.spawn().unwrap();
+        let mut ready = String::new();
+        BufReader::new(child.stdout.take().unwrap()).read_line(&mut ready).unwrap();
+        assert_eq!(ready.trim(), "ready");
+        let t = Instant::now();
+        terminate_process_group(&mut child);
+        let elapsed = t.elapsed();
+        assert!(elapsed >= Duration::from_secs(3) && elapsed < Duration::from_secs(10), "{:?}", elapsed);
+        let status = child.try_wait().unwrap().expect("reaped");
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+    }
+
+    #[test]
+    fn hook_usage_and_dispatch_accept_trust() {
+        assert!(HOOK_USAGE.contains("trust"));
+        let opts = parse_common(&[OsString::from("trust"), OsString::from("--codex"), OsString::from("--yes")], &["install", "uninstall", "status", "trust"], "status", true).unwrap();
+        assert_eq!(opts.sub, "trust");
+        assert!(opts.codex && opts.yes && !opts.claude);
     }
 }
