@@ -32,12 +32,21 @@ use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
 
+use super::dossier;
 use super::freshness;
 use super::roles::{self, Role};
 use super::{ConfigValues, RankOptions, RankedFileResult};
 
-/// Whole-run budget; the main thread exits 0 with no output when the worker misses it.
+/// Whole-run budget (the hook timeout in the CLIs is 5 s): the process must have printed its
+/// output and exited by then.
 const HARD_DEADLINE: Duration = Duration::from_millis(4000);
+/// Part of [`HARD_DEADLINE`] kept back for formatting the block, writing it, the best-effort
+/// session-state write and the log line; the worker's own deadline is what remains.
+const OUTPUT_RESERVE: Duration = Duration::from_millis(600);
+/// Bytes of hook input read from stdin at most; anything past it is dropped (and the run is
+/// logged with `stdin:truncated`). A 20 KB pasted prompt fits with room to spare; a truncated
+/// JSON envelope no longer parses and the run skips with `bad-input`.
+const STDIN_MAX_BYTES: usize = 64 * 1024;
 /// Sub-deadline for the semantic path in `auto` mode before falling back to lexical.
 const SEMANTIC_BUDGET: Duration = Duration::from_millis(3000);
 /// How long a tripped embedding breaker suppresses the semantic path.
@@ -47,24 +56,35 @@ const RETRIEVAL_LIMIT: usize = 60;
 /// Candidates whose dates are refined from front matter (file I/O) and whose text hash is read.
 const SHORTLIST: usize = 30;
 const QUERY_MAX_CHARS: usize = 1200;
+/// A long prompt keeps this many leading and trailing characters of the user's own text (cut
+/// at word boundaries) and pulls distinctive terms out of the middle.
+const QUERY_HEAD_CHARS: usize = 700;
+const QUERY_TAIL_CHARS: usize = 300;
+const QUERY_MIDDLE_TERMS: usize = 12;
+/// Quoted or fenced material is appended only when at least this much of the budget is left.
+const QUOTED_MIN_ROOM: usize = 40;
 const HINT_MAX_CHARS: usize = 100;
 const BLOCK_MAX_CHARS: usize = 1800;
 const HARD_MAX_LEADS: usize = 5;
+/// Projects a hook dossier lists at most (the block stays within 8 lines).
+const DOSSIER_MAX_PROJECTS: usize = 5;
 const MAX_TERMS: usize = 8;
-/// Upper bound after unioning the previous turn's terms into a short prompt's terms.
-const MAX_UNION_TERMS: usize = 12;
 const MIN_TERM_CHARS: usize = 3;
-/// Prompts shorter than this (in words) borrow the session's previous terms.
-const SHORT_PROMPT_WORDS: usize = 6;
 const SHOWN_CAP: usize = 200;
-const LAST_TERMS_MAX_CHARS: usize = 256;
+/// Term hashes kept per session at most.
+const TERM_HASHES_MAX: usize = 12;
 const LOG_MAX_BYTES: u64 = 1_000_000;
 const PRUNE_INTERVAL_SECS: f64 = 3600.0;
-const LOCK_RETRY: Duration = Duration::from_millis(100);
-const LOCK_ATTEMPTS: usize = 3;
-/// Session-state persistence and pruning are skipped when the run is already this far along, so
-/// the tail can never push the process past [`HARD_DEADLINE`] (the hook timeout is 5 s).
-const PERSIST_CUTOFF: Duration = Duration::from_millis(3600);
+/// Session-state persistence is skipped when the run is already this far along: the write is
+/// a few milliseconds (one lock attempt, no fsync), so the tail can never push the process
+/// past [`HARD_DEADLINE`].
+const PERSIST_CUTOFF: Duration = Duration::from_millis(3700);
+/// The session-state write runs on its own thread and is waited for until this point in the
+/// run at most; a stalled disk cannot hold the exit past [`HARD_DEADLINE`].
+const STATE_WRITE_CUTOFF: Duration = Duration::from_millis(3800);
+/// Pruning old session files (a directory scan) only runs when the retrieval finished early;
+/// otherwise it waits for a later run.
+const PRUNE_CUTOFF: Duration = Duration::from_millis(2000);
 /// A `.lock` older than this is treated as abandoned (a killed process) and removed.
 const LOCK_STALE_SECS: f64 = 60.0;
 const REDACTED: &str = "<redacted>";
@@ -93,7 +113,7 @@ RETRIVIO_HOOK=0, a `.retrivio/hook-off` file in cwd or a parent up to $HOME, sub
 /// Narrow acknowledgement list (spec §5); compared after normalisation.
 const ACKS: &[&str] = &[
     "y", "yes", "no", "ok", "k", "sure", "go", "go ahead", "continue", "proceed", "thanks",
-    "do it", "lgtm", "next",
+    "do it", "lgtm", "next", "will do",
 ];
 
 /// Small English stopword list for the lexical term extractor.
@@ -302,36 +322,49 @@ struct HookInput {
     hook_event_name: Option<String>,
 }
 
-/// A JSON object yields its fields; anything else is the prompt itself.
-fn parse_hook_input(raw: &str) -> HookInput {
+/// A JSON object yields its fields; plain text is the prompt itself. Input that starts with
+/// `{` but is not a JSON object is a broken hook envelope: `Err`, never a prompt (the envelope
+/// carries session ids and paths that must not be searched for or embedded).
+fn parse_hook_input(raw: &str) -> Result<HookInput, ()> {
     let trimmed = raw.trim();
     if trimmed.starts_with('{') {
-        if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(trimmed) {
-            let get = |k: &str| {
-                map.get(k)
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-                    .filter(|s| !s.trim().is_empty())
-            };
-            return HookInput {
-                prompt: get("prompt").unwrap_or_default(),
-                cwd: get("cwd"),
-                session_id: get("session_id"),
-                agent_id: get("agent_id"),
-                hook_event_name: get("hook_event_name"),
-            };
-        }
+        return match serde_json::from_str::<Value>(trimmed) {
+            Ok(Value::Object(map)) => {
+                let get = |k: &str| {
+                    map.get(k)
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .filter(|s| !s.trim().is_empty())
+                };
+                Ok(HookInput {
+                    prompt: get("prompt").unwrap_or_default(),
+                    cwd: get("cwd"),
+                    session_id: get("session_id"),
+                    agent_id: get("agent_id"),
+                    hook_event_name: get("hook_event_name"),
+                })
+            }
+            _ => Err(()),
+        };
     }
-    HookInput {
+    Ok(HookInput {
         prompt: trimmed.to_string(),
         ..HookInput::default()
-    }
+    })
 }
 
-fn read_all_stdin() -> String {
-    let mut buf = Vec::new();
-    let _ = std::io::stdin().read_to_end(&mut buf);
-    String::from_utf8_lossy(&buf).to_string()
+/// Stdin as (lossy) text, capped at [`STDIN_MAX_BYTES`]; the flag says whether input was
+/// dropped past the cap.
+fn read_all_stdin() -> (String, bool) {
+    read_capped(&mut std::io::stdin().lock(), STDIN_MAX_BYTES)
+}
+
+fn read_capped(reader: &mut dyn Read, max: usize) -> (String, bool) {
+    let mut buf = Vec::with_capacity(8192);
+    let _ = reader.take(max as u64 + 1).read_to_end(&mut buf);
+    let truncated = buf.len() > max;
+    buf.truncate(max);
+    (String::from_utf8_lossy(&buf).to_string(), truncated)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -410,6 +443,9 @@ fn skip_reason(prompt: &str, agent_id: Option<&str>, cwd: &Path) -> Option<&'sta
     if has_nr_prefix(prompt) {
         return Some("nr-prefix");
     }
+    if is_instruction_prompt(prompt) {
+        return Some("instruction");
+    }
     let home = env::var("HOME").ok().map(PathBuf::from);
     if hook_off_present(cwd, home.as_deref()) {
         return Some("hook-off");
@@ -430,9 +466,716 @@ fn truncate_chars(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
 }
 
-/// Whitespace-collapsed prompt (code fences kept), capped at [`QUERY_MAX_CHARS`].
+/// The user's own text and the pasted material of a prompt, separated: lines inside ``` or
+/// ~~~ fences and lines starting with `>` (quotes) are "quoted"; everything else is "own".
+fn split_own_and_quoted(prompt: &str) -> (String, String) {
+    let mut own = String::new();
+    let mut quoted = String::new();
+    let mut in_fence = false;
+    for line in prompt.lines() {
+        let t = line.trim_start();
+        if t.starts_with("```") || t.starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            quoted.push_str(line);
+            quoted.push(' ');
+        } else if let Some(q) = t.strip_prefix('>') {
+            quoted.push_str(q.trim_start_matches('>').trim_start());
+            quoted.push(' ');
+        } else {
+            own.push_str(line);
+            own.push(' ');
+        }
+    }
+    (own, quoted)
+}
+
+/// A capitalised name as typed ("Acme", "COA", "S3Tables"): first character upper case, three
+/// or more characters, not a stopword.
+fn is_capitalised_name(token: &str) -> bool {
+    let mut chars = token.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    first.is_uppercase()
+        && token.chars().count() >= 3
+        && token
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        && !is_stopword(&token.to_lowercase())
+}
+
+/// Terms worth carrying from the middle of a long prompt: capitalised names and distinctive
+/// tokens (paths, identifiers, error codes, versions), in order, without duplicates and
+/// without anything already present in `keep` (lowercase), at most `max`.
+fn distinctive_terms(text: &str, keep: &str, max: usize) -> Vec<String> {
+    let keep_lower = keep.to_lowercase();
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for raw in text.split_whitespace() {
+        let token = raw.trim_matches(|c: char| !(c.is_alphanumeric() || matches!(c, '/' | '_')));
+        if token.chars().count() < 3 || token.chars().all(|c| !c.is_alphanumeric()) {
+            continue;
+        }
+        let lower = token.to_lowercase();
+        if is_stopword(&lower) || seen.contains(&lower) || keep_lower.contains(&lower) {
+            continue;
+        }
+        if is_distinctive_term(token) || is_capitalised_name(token) {
+            seen.insert(lower);
+            out.push(token.to_string());
+            if out.len() >= max {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// First `max` characters of `s`, cut back to the last whitespace when one exists after the
+/// first half of the budget (so a word is not split), then trimmed.
+fn head_chars(s: &str, max: usize) -> String {
+    let taken: String = s.chars().take(max).collect();
+    if s.chars().count() <= max {
+        return taken;
+    }
+    match taken.rfind(char::is_whitespace) {
+        Some(idx) if idx >= max / 2 => taken[..idx].trim_end().to_string(),
+        _ => taken,
+    }
+}
+
+/// Last `max` characters of `s`, moved forward to the first whitespace when one exists in the
+/// first half of the window, then trimmed.
+fn tail_chars(s: &str, max: usize) -> String {
+    let total = s.chars().count();
+    if total <= max {
+        return s.to_string();
+    }
+    let taken: String = s.chars().skip(total - max).collect();
+    match taken.find(char::is_whitespace) {
+        Some(idx) if idx <= max / 2 => taken[idx..].trim_start().to_string(),
+        _ => taken,
+    }
+}
+
+/// The retrieval query for a prompt (slice 4). The user's own sentences come first: a prompt
+/// within [`QUERY_MAX_CHARS`] is used whole; a longer one keeps its head ([`QUERY_HEAD_CHARS`])
+/// and tail ([`QUERY_TAIL_CHARS`]) plus up to [`QUERY_MIDDLE_TERMS`] distinctive terms
+/// (capitalised names, paths, identifiers) from the middle, so the pointer sentence at the end
+/// of a long paste-and-ask prompt is never cut off. Fenced and quoted blocks (pasted output,
+/// code) only fill whatever budget is left, or the whole budget when the prompt is nothing but
+/// a paste. Whitespace is collapsed throughout.
 fn derive_query(prompt: &str) -> String {
-    truncate_chars(&collapse_ws(prompt), QUERY_MAX_CHARS)
+    let (own, quoted) = split_own_and_quoted(prompt);
+    let own = collapse_ws(&own);
+    let quoted = collapse_ws(&quoted);
+    let mut query = if own.chars().count() <= QUERY_MAX_CHARS {
+        own
+    } else {
+        let head = head_chars(&own, QUERY_HEAD_CHARS);
+        let tail = tail_chars(&own, QUERY_TAIL_CHARS);
+        let own_chars: Vec<char> = own.chars().collect();
+        let middle: String = own_chars
+            [head.chars().count()..own_chars.len().saturating_sub(tail.chars().count())]
+            .iter()
+            .collect();
+        let keep = format!("{} {}", head, tail);
+        let terms = distinctive_terms(&middle, &keep, QUERY_MIDDLE_TERMS);
+        collapse_ws(&format!("{} {} {}", head, terms.join(" "), tail))
+    };
+    if !quoted.is_empty() {
+        let used = query.chars().count();
+        let room = QUERY_MAX_CHARS.saturating_sub(if used == 0 { 0 } else { used + 1 });
+        if room >= QUOTED_MIN_ROOM {
+            if !query.is_empty() {
+                query.push(' ');
+            }
+            query.push_str(&truncate_chars(&quoted, room));
+        }
+    }
+    truncate_chars(&query, QUERY_MAX_CHARS)
+}
+
+/// Words about the agent's own work rather than about a topic: what a prompt says when it
+/// steers the current session ("read the handoff and tell me what to do next", "run the tests
+/// again and fix what breaks", "write a handoff doc with today's date"). Used only by the
+/// instruction gate below; a single word outside this list and the stopwords is a topic.
+const WORK_VOCAB: &[&str] = &[
+    "read",
+    "reread",
+    "re-read",
+    "review",
+    "look",
+    "check",
+    "think",
+    "thinking",
+    "brainstorm",
+    "ultrathink",
+    "tell",
+    "say",
+    "continue",
+    "proceed",
+    "resume",
+    "run",
+    "rerun",
+    "re-run",
+    "test",
+    "tests",
+    "testing",
+    "fix",
+    "fixes",
+    "break",
+    "breaks",
+    "broke",
+    "broken",
+    "summarize",
+    "summarise",
+    "summary",
+    "recap",
+    "write",
+    "draft",
+    "detailed",
+    "handoff",
+    "handoffs",
+    "doc",
+    "docs",
+    "document",
+    "date",
+    "today",
+    "todays",
+    "name",
+    "file",
+    "files",
+    "folder",
+    "work",
+    "working",
+    "come",
+    "back",
+    "deeply",
+    "next",
+    "again",
+    "ok",
+    "okay",
+    "go",
+    "ahead",
+    "please",
+    "just",
+    "did",
+    "done",
+    "make",
+    "sure",
+    "update",
+    "commit",
+    "push",
+    "finish",
+    "start",
+    "stop",
+    "try",
+    "see",
+    "show",
+    "explain",
+    "plan",
+    "step",
+    "steps",
+    "thing",
+    "things",
+    "stuff",
+    "should",
+    "would",
+    "could",
+    "want",
+    "need",
+    "keep",
+    "going",
+    "carry",
+    "move",
+    "take",
+    "over",
+    "pick",
+    "left",
+    "off",
+    "where",
+    "were",
+    "what",
+    "when",
+    "why",
+    "how",
+    "time",
+    "now",
+    "later",
+    "first",
+    "last",
+    "everything",
+    "all",
+    "then",
+    "also",
+    "yes",
+    "sounds",
+    "good",
+    "great",
+    "thanks",
+    "thank",
+    "help",
+    "wait",
+    "actually",
+    "careful",
+    "carefully",
+    "thorough",
+    "thoroughly",
+    "properly",
+    "correctly",
+    "idea",
+    "ideas",
+    "approach",
+    "option",
+    "options",
+    "way",
+    "ways",
+    "best",
+    "better",
+    "result",
+    "results",
+    "output",
+    "change",
+    "changes",
+    "changed",
+    "issue",
+    "issues",
+    "problem",
+    "problems",
+    "error",
+    "errors",
+    "bug",
+    "bugs",
+    "fail",
+    "failed",
+    "failing",
+    "pass",
+    "passing",
+    "note",
+    "notes",
+    "list",
+    "item",
+    "items",
+    "point",
+    "points",
+    "session",
+    "compact",
+    "compaction",
+    "memory",
+    "prompt",
+    "question",
+    "questions",
+    "answer",
+    "answers",
+    "understand",
+    "verify",
+    "validate",
+    "confirm",
+    "double",
+    "deep",
+    "hard",
+    "quick",
+    "quickly",
+    "simple",
+    "simply",
+    "exactly",
+    "instead",
+    "rather",
+    "already",
+    "still",
+    "yet",
+    "before",
+    "after",
+    "during",
+    "while",
+    "will",
+    "can",
+    "cannot",
+    "we",
+    "you",
+    "me",
+    "us",
+    "it",
+    "them",
+    "up",
+    "down",
+    "out",
+    "in",
+    "on",
+    "at",
+    "to",
+    "of",
+    "a",
+    "an",
+    "the",
+    "and",
+    "or",
+    "if",
+    "so",
+    "do",
+    "does",
+    "is",
+    "are",
+    "be",
+    "been",
+    "was",
+    "has",
+    "have",
+    "had",
+    "get",
+    "got",
+    "put",
+    "set",
+    "let",
+    "lets",
+    "know",
+    "knew",
+    "mean",
+    "means",
+    "meant",
+    "give",
+    "gave",
+    "send",
+    "sent",
+    "call",
+    "called",
+    "use",
+    "used",
+    "using",
+    "new",
+    "old",
+    "same",
+    "different",
+    "other",
+    "another",
+    "more",
+    "less",
+    "few",
+    "many",
+    "much",
+    "some",
+    "any",
+    "every",
+    "each",
+    "both",
+    "either",
+    "neither",
+    "own",
+    "very",
+    "really",
+    "quite",
+    "pretty",
+    "kind",
+    "sort",
+    "about",
+    "into",
+    "onto",
+    "from",
+    "with",
+    "without",
+    "for",
+    "by",
+    "as",
+    "than",
+    "that",
+    "this",
+    "these",
+    "those",
+    "there",
+    "here",
+    "which",
+    "who",
+    "whom",
+    "whose",
+    "my",
+    "your",
+    "our",
+    "their",
+    "its",
+    "his",
+    "her",
+    "i",
+    "am",
+    "not",
+    "no",
+    "never",
+    "always",
+    "once",
+    "twice",
+    "again",
+    "too",
+    "only",
+    "even",
+    "ever",
+    "such",
+    "like",
+    "well",
+    "fine",
+    "right",
+    "wrong",
+    "correct",
+    "incorrect",
+    "true",
+    "false",
+    "maybe",
+    "perhaps",
+    "probably",
+    "possibly",
+    "definitely",
+    "certainly",
+    "sure",
+    "reply",
+    "respond",
+    "tool",
+    "tools",
+    "none",
+    "nothing",
+    "tomorrow",
+    "yesterday",
+    "tonight",
+    "morning",
+    "afternoon",
+    "evening",
+    "night",
+    "day",
+    "days",
+    "week",
+    "weeks",
+    "weekend",
+    "month",
+    "hour",
+    "hours",
+    "minute",
+    "minutes",
+    "soon",
+    "asap",
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+    "sunday",
+    "format",
+    "formatting",
+    "lint",
+    "linting",
+    "build",
+    "rebuild",
+    "compile",
+    "install",
+    "merge",
+    "rebase",
+    "revert",
+    "refactor",
+    "clean",
+    "cleanup",
+    "tidy",
+    "retry",
+    "redo",
+    "undo",
+    "apply",
+    "implement",
+    "execute",
+    "deploy",
+    "release",
+    "ship",
+    "wrap",
+    "close",
+    "open",
+    "save",
+    "hold",
+    "leave",
+    "skip",
+    "ignore",
+    "remove",
+    "delete",
+    "add",
+    "edit",
+    "rename",
+    "rewrite",
+    "redraft",
+    "shorten",
+    "expand",
+    "polish",
+    "improve",
+    "tighten",
+    "loosen",
+    "rest",
+    "remaining",
+    "anything",
+    "whatever",
+    "whichever",
+    "parts",
+    "part",
+    "bit",
+    "bits",
+    "piece",
+    "pieces",
+    "one",
+    "ones",
+    "two",
+    "three",
+];
+
+/// Question openers: a prompt whose first real word (leading fillers such as "ok", "so",
+/// "please" skipped) is one of these asks something and always runs retrieval, however many
+/// of its other words are about the agent's work ("why did the test fail", "what was the
+/// last error", "how did we fix the last problem", "did we already fix the memory issue").
+/// "do" and "have" open imperatives as often as questions ("do the next step", "have a
+/// look"), so they count only when a subject pronoun follows ([`SUBJECT_PRONOUNS`]: "do we
+/// have the results", "have you seen the error"); "has", "had" and "will" are left out ("has
+/// to be done today", "will do" are not questions).
+const QUESTION_OPENERS: &[&str] = &[
+    "why", "what", "whats", "how", "hows", "where", "wheres", "when", "whens", "which", "who",
+    "whos", "whom", "whose", "is", "are", "was", "were", "am", "does", "did", "can", "could",
+    "should", "would", "any",
+];
+
+/// Subjects that make "do"/"have" (and "dont"/"havent") a question opener.
+const SUBJECT_PRONOUNS: &[&str] = &[
+    "we",
+    "you",
+    "i",
+    "they",
+    "it",
+    "he",
+    "she",
+    "anyone",
+    "anybody",
+    "someone",
+    "somebody",
+    "everyone",
+    "everybody",
+    "we've",
+    "you've",
+    "they've",
+    "i've",
+];
+
+/// Words that may open a prompt before its first real word ("ok so what was the error").
+const LEADING_FILLERS: &[&str] = &[
+    "ok", "okay", "so", "and", "also", "now", "please", "hey", "hi", "hmm", "well", "but", "then",
+    "alright", "right", "yes", "yeah", "oh", "um", "uh", "again",
+];
+
+/// A question: the prompt ends in `?` (any sentence of it), or its first real word is a
+/// question opener. Interrogatives never count as instructions (they ask about knowledge,
+/// which is what recall is for), so this fails open on purpose.
+fn is_question(prompt: &str) -> bool {
+    let text = prompt.trim();
+    if text.ends_with('?') || text.contains("? ") || text.contains("?\n") {
+        return true;
+    }
+    let clean = |raw: &str| -> String {
+        raw.trim_matches(|c: char| !c.is_alphanumeric() && c != '\'')
+            .replace('\'', "")
+            .to_lowercase()
+    };
+    let mut words = text.split_whitespace().map(clean).filter(|w| !w.is_empty());
+    let mut first = None;
+    for w in words.by_ref() {
+        if LEADING_FILLERS.contains(&w.as_str()) {
+            continue;
+        }
+        first = Some(w);
+        break;
+    }
+    let Some(first) = first else {
+        return false;
+    };
+    if QUESTION_OPENERS.contains(&first.as_str()) {
+        return true;
+    }
+    if matches!(first.as_str(), "do" | "dont" | "have" | "havent") {
+        return words
+            .next()
+            .map(|w| {
+                SUBJECT_PRONOUNS.contains(&w.as_str())
+                    || SUBJECT_PRONOUNS.contains(&w.replace('\'', "").as_str())
+            })
+            .unwrap_or(false);
+    }
+    false
+}
+
+fn is_work_word(lower: &str) -> bool {
+    WORK_VOCAB.contains(&lower) || is_stopword(lower)
+}
+
+/// True when the prompt is an instruction about the current work with no topic in it. The
+/// rule a user can predict: a question is never an instruction (it ends in `?` or its first
+/// real word is why/what/how/where/when/which/who or an auxiliary such as is/did/can), and
+/// otherwise the prompt is skipped only when every word is a stopword or a word about the
+/// agent's own work (read, review, run, tests, fix, summarize, write, handoff, commit, push,
+/// format, lint, continue, ...) and there is no capitalised name (other than the first word),
+/// no identifier, path, number, quoted string or code span. Such prompts ("read the handoff,
+/// think about it deeply, brainstorm/ultrathink, and tell me what we should do next", "run the
+/// tests again and fix what breaks", "summarize what you just did", "ok go ahead") can only
+/// match files about the words they use, which is never the memory the user wants; recall
+/// stays silent (`skipped:instruction`). One topic word is enough to run retrieval ("fix the
+/// acme test", "tell me about acme"), and so is a question ("why did the test fail?", "what
+/// was the last error", "how did we fix the last problem").
+fn is_instruction_prompt(prompt: &str) -> bool {
+    let text = prompt.trim();
+    if text.is_empty() {
+        return false;
+    }
+    if text.contains('"') || text.contains('`') || text.contains('\u{201c}') {
+        return false;
+    }
+    if is_question(text) {
+        return false;
+    }
+    for (i, raw) in text.split_whitespace().enumerate() {
+        let token = raw.trim_matches(|c: char| {
+            !(c.is_alphanumeric() || matches!(c, '/' | '_' | '-' | '.' | ':'))
+        });
+        let token = token.trim_matches(|c: char| matches!(c, '-' | '.' | ':' | '/'));
+        if token.is_empty() {
+            continue;
+        }
+        // Identifiers, paths, error codes, versions, camelCase and anything with a digit. A
+        // slash between two plain words ("brainstorm/ultrathink") is punctuation, not a path.
+        let looks_like_path = raw.starts_with('/')
+            || raw.starts_with("~/")
+            || raw.starts_with("./")
+            || (token.contains('/') && token.contains('.'));
+        if looks_like_path
+            || token.contains('.')
+            || token.contains('_')
+            || token.chars().any(|c| c.is_ascii_digit())
+            || has_camel_case(token)
+        {
+            return false;
+        }
+        // A capitalised word is a name unless it opens the prompt (sentence case) or is a
+        // lone "I".
+        if i > 0
+            && token
+                .chars()
+                .next()
+                .map(|c| c.is_uppercase())
+                .unwrap_or(false)
+            && token.chars().count() >= 2
+        {
+            return false;
+        }
+        for part in token.split(|c: char| !c.is_alphanumeric()) {
+            if part.is_empty() {
+                continue;
+            }
+            let lower = part.to_lowercase();
+            if lower.chars().count() >= 2 && !is_work_word(&lower) {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 fn is_term_char(c: char) -> bool {
@@ -490,31 +1233,142 @@ fn extract_terms(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Query text and lexical terms; short prompts borrow the session's previous terms. The prompt
-/// is secret-redacted first so a pasted credential never becomes a query or a stored term.
-fn build_query(prompt: &str, last_terms: &[String]) -> (String, Vec<String>) {
+/// Query text and lexical terms. The prompt is secret-redacted first so a pasted credential
+/// never becomes a query or a stored term. The query is built from this prompt alone: the
+/// session state holds no term text to borrow from (only salted hashes, see
+/// [`SessionState`]), so a short follow-up runs on its own words or, when they are all about
+/// the agent's work, is skipped by the instruction gate.
+fn build_query(prompt: &str) -> (String, Vec<String>) {
     // Invisible format characters go first so a zero-width space inside `AKIA…` or `password=`
-    // cannot split a secret past the scanners.
+    // cannot split a secret past the scanners. Line structure is kept for `derive_query`
+    // (fences and quotes are line-based); it collapses whitespace itself.
     let visible: String = prompt.chars().filter(|c| !is_format_char(*c)).collect();
-    let collapsed = collapse_ws(&redact_prompt_secrets(&visible));
-    let mut query = derive_query(&collapsed);
-    let mut terms = extract_terms(&query.replace(REDACTED, " "));
-    let short = collapsed.split_whitespace().count() < SHORT_PROMPT_WORDS;
-    if short && !last_terms.is_empty() {
-        query = truncate_chars(
-            &format!("{} {}", last_terms.join(" "), query),
-            QUERY_MAX_CHARS,
-        );
-        for t in last_terms {
-            if terms.len() >= MAX_UNION_TERMS {
-                break;
-            }
-            if !terms.contains(t) {
-                terms.push(t.clone());
-            }
+    let redacted = redact_prompt_secrets(&visible);
+    let query = derive_query(&redacted);
+    let terms = extract_terms(&query.replace(REDACTED, " "));
+    (query, terms)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Dossier gate (slice 4): broad-question phrasing about an entity, plus project breadth
+// ---------------------------------------------------------------------------------------------
+
+/// Phrases that ask for everything known about a topic rather than for one document or one
+/// action. Matched on the lowercased, whitespace-collapsed prompt; a topic word must follow.
+const BROAD_PHRASES: &[&str] = &[
+    "what do we know about",
+    "what do you know about",
+    "what did we know about",
+    "what do i know about",
+    "what we know about",
+    "what have we done with",
+    "what have we done for",
+    "what have we done on",
+    "everything about",
+    "everything on",
+    "everything we have on",
+    "everything we have about",
+    "everything we know about",
+    "everything you know about",
+    "all we know about",
+    "all we have on",
+    "all you know about",
+    "background on",
+    "history of",
+    "history with",
+    "tell me about",
+    "tell me everything about",
+    "brief me on",
+    "overview of",
+    "catch me up on",
+    "our history with",
+    "our relationship with",
+    "where else have we",
+    "where else did we",
+    "across projects",
+    "across all projects",
+    "across folders",
+    "in other projects",
+    "in other folders",
+    "which projects mention",
+    "which projects involve",
+    "which projects touch",
+    "what projects",
+];
+
+fn is_topic_word(w: &str) -> bool {
+    w.chars().count() >= 3 && w.chars().any(char::is_alphanumeric) && !is_stopword(w)
+}
+
+/// True when the prompt is a broad question about an entity or topic: one of
+/// [`BROAD_PHRASES`] followed by a topic word, or a short prompt (six words or fewer) that
+/// pairs the word "context" with a capitalised name ("Acme context", "context on Globex").
+fn broad_question(prompt: &str) -> bool {
+    let lower = collapse_ws(&prompt.to_lowercase());
+    for phrase in BROAD_PHRASES {
+        let Some(idx) = lower.find(phrase) else {
+            continue;
+        };
+        let rest = &lower[idx + phrase.len()..];
+        if rest
+            .split(|c: char| !(c.is_alphanumeric() || c == '-' || c == '_'))
+            .any(is_topic_word)
+        {
+            return true;
         }
     }
-    (query, terms)
+    let words: Vec<&str> = prompt.split_whitespace().collect();
+    if words.len() <= 6 {
+        let clean =
+            |w: &str| -> String { w.trim_matches(|c: char| !c.is_alphanumeric()).to_string() };
+        let has_context = words
+            .iter()
+            .any(|w| clean(w).eq_ignore_ascii_case("context"));
+        let has_name = words.iter().any(|w| {
+            let t = clean(w);
+            t.chars().count() >= 3
+                && t.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
+                && !t.eq_ignore_ascii_case("context")
+                && !is_stopword(&t.to_lowercase())
+        });
+        if has_context && has_name {
+            return true;
+        }
+    }
+    false
+}
+
+/// The candidates a dossier would be built from: existing, non-noise files under the recall
+/// roots whose cosine reaches the dossier floor (`dossier::floor_for`, 0.30 by default; the
+/// recall floor itself is higher and decides the leads). Empty in lexical mode: without
+/// cosines there is no breadth to measure.
+fn dossier_rows(
+    rows: &[RankedFileResult],
+    params: &SelectParams,
+    floor: f64,
+    semantic: bool,
+) -> Vec<RankedFileResult> {
+    if !semantic {
+        return Vec::new();
+    }
+    let eligible: Vec<RankedFileResult> = rows
+        .iter()
+        .filter(|r| Path::new(&r.path).is_file())
+        .filter(|r| params.roots.is_empty() || under_any_root(&r.path, &params.roots))
+        .filter(|r| super::passes_raw_floor(r.raw_similarity, floor))
+        .cloned()
+        .collect();
+    // Recall asks the ranker for `include_superseded: true` (marks, no downrank) so that
+    // `collapse_series` can decide later; the dossier never sees that pass, so the older
+    // members of a handoff series are folded into their head here (`dossier::candidates`
+    // drops them and the noise rows, and caps each project's share): they neither raise a
+    // project's breadth nor become its entry.
+    dossier::candidates(&eligible, dossier::PER_PROJECT_CAP, dossier::CANDIDATES)
+}
+
+/// The gate: broad phrasing and breadth (`dossier::breadth_fires`), both required.
+fn dossier_gate_fires(broad: bool, b: &dossier::Breadth, recall_floor: f64) -> bool {
+    broad && dossier::breadth_fires(b, recall_floor)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1218,6 +2072,10 @@ struct Candidate {
     /// Newer file of the same series when this one is not the head (set here from the revision
     /// date, overriding the ranker's mark, which never saw the front matter).
     superseded_by: Option<String>,
+    /// Machine artefact (chat dump, lockfile, log): never shown as a lead.
+    noise: bool,
+    /// Which signals contributed, from the ranker (slice 4).
+    why: String,
     /// Orders revisions of one series: the date in the relative path, else the front-matter
     /// date once read, else the last edit. Never a fresh mtime over a dated file name.
     revision_date: f64,
@@ -1255,6 +2113,8 @@ impl Candidate {
             doc_rel_path: r.doc_rel_path.clone(),
             raw_similarity: r.raw_similarity,
             superseded_by: r.superseded_by.clone(),
+            noise: r.noise,
+            why: r.why.clone(),
             revision_date: freshness::revision_date(&r.doc_rel_path, r.doc_mtime, now),
             content_hash: String::new(),
             older_versions: 0,
@@ -1382,8 +2242,8 @@ fn project_contains_cwd(project: &str, cwd: &Path) -> bool {
     !project.is_empty() && cwd.starts_with(Path::new(project))
 }
 
-/// Root filter, absolute floor, relative threshold on the base score, shortlist truncation.
-/// Sorted by base score desc.
+/// Root filter, noise filter, absolute floor, relative threshold on the base score, shortlist
+/// truncation. Sorted by base score desc.
 ///
 /// The absolute floor (`recall_min_abs_score`) is an honest number: in semantic mode it is
 /// applied to each candidate's raw cosine similarity (the min-max normalised fusion score
@@ -1391,11 +2251,13 @@ fn project_contains_cwd(project: &str, cwd: &Path) -> bool {
 /// (`super::passes_raw_floor`): a floor above 0 admits only a finite cosine at or above it,
 /// so a candidate without one (found by keywords only, or with a corrupt vector) fails
 /// closed; a floor of 0 is off and applies no cosine requirement. In lexical mode, where no
-/// cosine exists, the floor applies to the coverage-based base score as before.
+/// cosine exists, the floor applies to the coverage-based base score as before. Machine
+/// artefacts (`noise`: chat dumps, logs, lockfiles) are never leads, whatever their score.
 fn prefilter(mut cands: Vec<Candidate>, p: &SelectParams, semantic: bool) -> Vec<Candidate> {
     if !p.roots.is_empty() {
         cands.retain(|c| under_any_root(&c.path, &p.roots));
     }
+    cands.retain(|c| !c.noise);
     if semantic {
         cands.retain(|c| super::passes_raw_floor(c.raw_similarity, p.min_abs_score));
     }
@@ -1525,7 +2387,8 @@ fn collapse_identical(cands: Vec<Candidate>) -> Vec<Candidate> {
 
 /// Supersession in recall, soft and state-only, the same rule as file search: `state` files
 /// of one series (same project, parent directory and normalised stem) are revisions of one
-/// document. The newest by revision date is the head and counts the others
+/// document. The newest by revision date (ties: the higher score, then the lexicographically
+/// later path, as in `super::mark_superseded`) is the head and counts the others
 /// (`older_versions`); the others get `superseded_by = head` and, unless the prompt asks for
 /// history (`full_strength`), the same x 0.85 as search. Nothing is removed: the per-project
 /// cap in `finalize_leads` keeps the head in front, and an older member can still surface
@@ -1564,7 +2427,7 @@ fn collapse_series(mut cands: Vec<Candidate>, full_strength: bool) -> Vec<Candid
                 ca.revision_date
                     .total_cmp(&cb.revision_date)
                     .then_with(|| ca.score.total_cmp(&cb.score))
-                    .then_with(|| cb.path.cmp(&ca.path))
+                    .then_with(|| ca.path.cmp(&cb.path))
             })
             .expect("non-empty series");
         let head_path = cands[head].path.clone();
@@ -1643,35 +2506,49 @@ fn finalize_leads(cands: Vec<Candidate>, p: &SelectParams) -> Vec<Candidate> {
 // Output block
 // ---------------------------------------------------------------------------------------------
 
+/// Age in whole days, always days (`3d`, `66d`, `120d`): one unit the agent can compare with
+/// the 14- and 35-day tier boundaries without converting months.
 fn format_age(age_days: f64) -> String {
     let d = if age_days.is_finite() {
         age_days.max(0.0).floor() as i64
     } else {
         0
     };
-    if d < 60 {
-        format!("{}d", d)
-    } else {
-        format!("{}mo", d / 30)
+    format!("{}d", d)
+}
+
+/// The label inside a lead's parenthesis: the role and the age as two fields, a warning tier
+/// (`verify` for old state, `stale` for old knowledge) when there is one, and where the date
+/// came from: `state · 3d · date:path`, `record · 66d · date:frontmatter`,
+/// `state · 120d · verify · date:mtime`.
+fn lead_label(c: &Candidate) -> String {
+    let mut label = format!("{} · {}", c.role.as_str(), format_age(c.age_days));
+    if matches!(c.tier.as_str(), "verify" | "stale") {
+        label.push_str(" · ");
+        label.push_str(&c.tier);
     }
+    label.push_str(" · date:");
+    label.push_str(freshness::date_basis(c.date_source));
+    label
 }
 
 /// One lead line. `hint_max` is the hint budget in characters (`None`: no hint). A hint is only
 /// emitted when the excerpt reads like prose: markup, code or table fragments are never shown
-/// raw (the pipeline swaps in the document title when it finds one).
+/// raw (the pipeline swaps in the document title when it finds one). The `why` field and a
+/// supersession note follow the hint so an agent sees the same fields the JSON surfaces carry:
+/// `— superseded by <file>` on an older series member that surfaced, "(supersedes N older)" on
+/// the head (`collapse_series` sets exactly one of the two).
 fn format_lead_line(n: usize, c: &Candidate, hint_max: Option<usize>) -> String {
     let project = Path::new(&c.project_path)
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| c.project_path.clone());
     let mut line = format!(
-        "{}. {} — {} ({}, {}, {}) — {}",
+        "{}. {} — {} ({}) — {}",
         n,
         sanitize(&c.path),
         freshness::format_ymd(c.content_date),
-        format_age(c.age_days),
-        sanitize(&c.tier),
-        sanitize(c.date_source),
+        sanitize(&lead_label(c)),
         sanitize(&project)
     );
     if let Some(max) = hint_max {
@@ -1682,14 +2559,18 @@ fn format_lead_line(n: usize, c: &Candidate, hint_max: Option<usize>) -> String 
             }
         }
     }
-    if c.older_versions > 0 {
-        line.push_str(&format!(" (supersedes {} older)", c.older_versions));
-    } else if let Some(head) = c.superseded_by.as_deref() {
-        let name = Path::new(head)
+    if !c.why.is_empty() {
+        line.push_str(&format!(" — why:{}", sanitize(&c.why)));
+    }
+    if let Some(head) = &c.superseded_by {
+        let head_name = Path::new(head)
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| head.to_string());
-        line.push_str(&format!(" (superseded by {})", sanitize(&name)));
+            .unwrap_or_else(|| head.clone());
+        line.push_str(&format!(" — superseded by {}", sanitize(&head_name)));
+    }
+    if c.older_versions > 0 {
+        line.push_str(&format!(" (supersedes {} older)", c.older_versions));
     }
     line
 }
@@ -1741,6 +2622,44 @@ fn build_block(leads: &[Candidate], excerpts: bool) -> (String, usize) {
     (assemble_block(&[format!("{}…", cut)]), 1)
 }
 
+/// The hook's compact dossier block: the same tags and header as the leads block, then the
+/// dossier lines (title, up to five projects, related projects, instruction). Trailing project
+/// lines are dropped first when the block would pass [`BLOCK_MAX_CHARS`]; the title and the
+/// instruction stay. Returns the block and the number of project lines it holds.
+fn build_dossier_block(lines: &[String]) -> (String, usize) {
+    if lines.is_empty() {
+        return (String::new(), 0);
+    }
+    let mut kept: Vec<String> = lines.to_vec();
+    // Drop from the end of the middle (projects, then the related line) while too long.
+    while kept.len() > 2 && !block_fits(&kept) {
+        let idx = kept.len() - 2;
+        kept.remove(idx);
+    }
+    if !block_fits(&kept) {
+        let overhead = assemble_block(&[String::new()]).chars().count();
+        let room = BLOCK_MAX_CHARS.saturating_sub(overhead + 1);
+        let cut = truncate_chars(&kept[0], room);
+        return (assemble_block(&[format!("{}…", cut)]), 0);
+    }
+    let projects = kept
+        .iter()
+        .filter(|l| {
+            l.chars()
+                .next()
+                .map(|c| c.is_ascii_digit())
+                .unwrap_or(false)
+        })
+        .count();
+    (assemble_block(&kept), projects)
+}
+
+/// The dossier entry paths remembered as shown: only the first `emitted` (the project lines
+/// [`build_dossier_block`] kept), so a project dropped by the block cap can still be a lead.
+fn dossier_shown(paths: &[String], emitted: usize) -> Vec<String> {
+    paths.iter().take(emitted).cloned().collect()
+}
+
 fn hook_output_json(block: &str, event_name: &str, system_message: Option<&str>) -> Value {
     let mut out = json!({
         "hookSpecificOutput": {
@@ -1764,9 +2683,17 @@ fn system_message_for(leads: &[Candidate]) -> String {
 // ---------------------------------------------------------------------------------------------
 
 #[derive(Clone, Debug, Default, PartialEq)]
+/// Per-session memory (`~/.retrivio/recall/<sha1(session id)>.json`, mode 0600): the lead
+/// paths already shown, and the previous turn's search terms as salted hashes. Nothing
+/// prompt-derived is stored in clear: the hashes let a later turn tell whether it continues
+/// the previous topic (equal hashes) without holding a single word of it, and the salt is
+/// random per session so equal terms hash differently in different sessions.
 struct SessionState {
     shown: Vec<String>,
-    last_terms: Vec<String>,
+    /// Random per-session salt (hex), created with the file.
+    salt: String,
+    /// `term_hash(salt, term)` of the previous turn's terms, in order.
+    term_hashes: Vec<String>,
     updated_at: f64,
 }
 
@@ -1774,6 +2701,49 @@ fn sha1_hex(s: &str) -> String {
     let mut hasher = Sha1::new();
     hasher.update(s.as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+/// Salt for a new session file: 16 random bytes from `/dev/urandom` when it can be read,
+/// otherwise the process id, the clock and the session hash mixed through SHA-256. Distinct
+/// per session; stored next to the hashes (the usual salted-hash layout).
+fn new_salt(session_hash: &str) -> String {
+    use sha2::Digest as _;
+    if let Ok(mut f) = fs::File::open("/dev/urandom") {
+        let mut buf = [0u8; 16];
+        if f.read_exact(&mut buf).is_ok() {
+            return buf.iter().map(|b| format!("{:02x}", b)).collect();
+        }
+    }
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut h = sha2::Sha256::new();
+    h.update(session_hash.as_bytes());
+    h.update(nanos.to_le_bytes());
+    h.update(process::id().to_le_bytes());
+    let digest = h.finalize();
+    digest
+        .iter()
+        .take(16)
+        .map(|b| format!("{:02x}", b))
+        .collect()
+}
+
+/// Non-reversible identifier of a term inside one session: SHA-256 over the session salt
+/// and the lowercased term, first 16 hex digits.
+fn term_hash(salt: &str, term: &str) -> String {
+    use sha2::Digest as _;
+    let mut h = sha2::Sha256::new();
+    h.update(salt.as_bytes());
+    h.update([0u8]);
+    h.update(term.trim().to_lowercase().as_bytes());
+    let digest = h.finalize();
+    digest
+        .iter()
+        .take(8)
+        .map(|b| format!("{:02x}", b))
+        .collect()
 }
 
 fn session_file(dir: &Path, hash: &str) -> PathBuf {
@@ -1814,16 +2784,23 @@ fn load_state(path: &Path) -> SessionState {
     };
     SessionState {
         shown: strings("shown"),
-        last_terms: strings("last_terms"),
+        salt: v
+            .get("salt")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_default(),
+        term_hashes: strings("term_hashes"),
         updated_at: v.get("updated_at").and_then(|x| x.as_f64()).unwrap_or(0.0),
     }
 }
 
-/// Temp file (0600) + rename.
+/// Temp file (0600) + rename. No fsync: the file is a cache of what this session has seen,
+/// and the write sits on the hook's critical path.
 fn save_state(path: &Path, state: &SessionState) -> std::io::Result<()> {
     let body = json!({
         "shown": state.shown,
-        "last_terms": state.last_terms,
+        "salt": state.salt,
+        "term_hashes": state.term_hashes,
         "updated_at": state.updated_at,
     })
     .to_string();
@@ -1832,7 +2809,6 @@ fn save_state(path: &Path, state: &SessionState) -> std::io::Result<()> {
     let result = (|| {
         let mut f = open_private_new(&tmp)?;
         f.write_all(body.as_bytes())?;
-        f.sync_all()?;
         fs::rename(&tmp, path)
     })();
     if result.is_err() {
@@ -1851,20 +2827,21 @@ fn file_mtime_ts(path: &Path) -> Option<f64> {
         .map(|d| d.as_secs_f64())
 }
 
-/// Crude advisory lock: `create_new` on `<hash>.lock`, retried, abandoned locks removed.
+/// Crude advisory lock: one `create_new` attempt on `<hash>.lock`; an abandoned lock (older
+/// than [`LOCK_STALE_SECS`]) is removed and the attempt repeated once. No waiting: a held lock
+/// means another hook invocation of the same session is writing, and this run's state is not
+/// worth a sleep on the critical path.
 fn acquire_lock(lock_path: &Path, now: f64) -> bool {
-    for attempt in 0..LOCK_ATTEMPTS {
+    for _ in 0..2 {
         match open_private_new(lock_path) {
             Ok(_) => return true,
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                if let Some(m) = file_mtime_ts(lock_path) {
-                    if now - m > LOCK_STALE_SECS {
+                match file_mtime_ts(lock_path) {
+                    Some(m) if now - m > LOCK_STALE_SECS => {
                         let _ = fs::remove_file(lock_path);
                         continue;
                     }
-                }
-                if attempt + 1 < LOCK_ATTEMPTS {
-                    thread::sleep(LOCK_RETRY);
+                    _ => return false,
                 }
             }
             Err(_) => return false,
@@ -1873,26 +2850,28 @@ fn acquire_lock(lock_path: &Path, now: f64) -> bool {
     false
 }
 
-/// Terms kept in the state file: secret-redacted, capped at [`LAST_TERMS_MAX_CHARS`] in total.
-fn storable_terms(terms: &[String]) -> Vec<String> {
+/// Hashes stored for this turn's terms: secret-redacted first (a term that still looks like a
+/// secret is dropped, hash or not), at most [`TERM_HASHES_MAX`], deduplicated.
+fn storable_term_hashes(salt: &str, terms: &[String]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    let mut total = 0usize;
     for t in terms {
         let red = redact_secrets(t);
-        if red.contains(REDACTED) || red.is_empty() {
+        if red.contains(REDACTED) || red.trim().is_empty() {
             continue;
         }
-        let n = red.chars().count() + usize::from(!out.is_empty());
-        if total + n > LAST_TERMS_MAX_CHARS {
+        let h = term_hash(salt, &red);
+        if !out.contains(&h) {
+            out.push(h);
+        }
+        if out.len() >= TERM_HASHES_MAX {
             break;
         }
-        total += n;
-        out.push(red);
     }
     out
 }
 
-/// Read/modify/write of the session file under the lock. Never stores the prompt.
+/// Read/modify/write of the session file under the lock. Never stores the prompt or any
+/// term text: only shown paths and salted term hashes.
 fn update_session_state(
     dir: &Path,
     hash: &str,
@@ -1916,14 +2895,18 @@ fn update_session_state(
         let drop = st.shown.len() - SHOWN_CAP;
         st.shown.drain(..drop);
     }
-    st.last_terms = storable_terms(terms);
+    if st.salt.is_empty() {
+        st.salt = new_salt(hash);
+    }
+    st.term_hashes = storable_term_hashes(&st.salt, terms);
     st.updated_at = now;
     let res = save_state(&path, &st).map_err(|e| format!("state write: {}", e));
     let _ = fs::remove_file(&lock);
     res
 }
 
-/// Remove session files older than `ttl_days`, at most once per hour (`.last-prune` marker).
+/// Remove session files (and abandoned `.json.tmp-*` files) older than `ttl_days`, at most
+/// once per hour (`.last-prune` marker).
 fn maybe_prune_states(dir: &Path, ttl_days: f64, now: f64) {
     let marker = dir.join(".last-prune");
     if let Some(m) = file_mtime_ts(&marker) {
@@ -1935,7 +2918,9 @@ fn maybe_prune_states(dir: &Path, ttl_days: f64, now: f64) {
     if let Ok(entries) = fs::read_dir(dir) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            if !(name.ends_with(".json") || name.ends_with(".lock")) {
+            // Session files, locks, and temp files a killed write left behind.
+            if !(name.ends_with(".json") || name.ends_with(".lock") || name.contains(".json.tmp-"))
+            {
                 continue;
             }
             if let Some(m) = file_mtime_ts(&entry.path()) {
@@ -1990,29 +2975,60 @@ fn append_log(path: &Path, line: &str) {
     }
 }
 
-/// Session-state persistence and pruning only run when the retrieval left enough of the budget.
+/// Session-state persistence only runs when the retrieval left enough of the budget.
 fn should_persist(elapsed: Duration) -> bool {
     elapsed <= PERSIST_CUTOFF
 }
 
-/// Short, space-free error tag for the log's mode column.
+/// Pruning old session files only runs when the retrieval finished early.
+fn should_prune(elapsed: Duration) -> bool {
+    elapsed <= PRUNE_CUTOFF
+}
+
+/// The class of an error, one fixed word: what the log's mode column and the breaker file
+/// hold instead of the error text. Backend errors carry HTTP response bodies, which can echo
+/// the request (the derived query), so the text itself never reaches disk; `--verbose` dry
+/// runs print it to the terminal.
+fn error_class(e: &str) -> &'static str {
+    let l = e.to_lowercase();
+    if l.contains("timed out") || l.contains("timeout") || l.contains("deadline") {
+        "timeout"
+    } else if l.contains("http 401")
+        || l.contains("http 403")
+        || l.contains("credential")
+        || l.contains("expired")
+        || l.contains("unauthorized")
+        || l.contains("access denied")
+        || l.contains("security token")
+    {
+        "auth"
+    } else if l.contains("http 5") {
+        "http-5xx"
+    } else if l.contains("http 4") {
+        "http-4xx"
+    } else if l.contains("no index") || l.contains("no-index") {
+        "no-index"
+    } else if l.contains("database") || l.contains("sqlite") || l.contains("lance") {
+        "store"
+    } else if l.contains("connect")
+        || l.contains("transport")
+        || l.contains("dns")
+        || l.contains("network")
+        || l.contains("io error")
+    {
+        "transport"
+    } else if l.contains("embed") || l.contains("bedrock") || l.contains("ollama") {
+        "embed"
+    } else if l.contains("spawn") {
+        "spawn"
+    } else {
+        "other"
+    }
+}
+
+/// `error:<class>` for the log's mode column (see [`error_class`]).
 fn short_error(e: &str) -> String {
-    let compact: String = e
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join("_")
-        .chars()
-        .filter(|c| !c.is_control())
-        .take(48)
-        .collect();
-    format!(
-        "error:{}",
-        if compact.is_empty() {
-            "unknown".to_string()
-        } else {
-            compact
-        }
-    )
+    format!("error:{}", error_class(e))
 }
 
 struct Reporter {
@@ -2032,14 +3048,28 @@ impl Reporter {
 
     /// Log the run (never the prompt or terms) and exit with `code`.
     fn finish(&self, mode: &str, candidates: usize, leads: usize, code: i32) -> ! {
+        self.finish_with(mode, candidates, leads, "", code)
+    }
+
+    /// [`Self::finish`] with a trailing token such as `dossier:would-fire`.
+    fn finish_with(
+        &self,
+        mode: &str,
+        candidates: usize,
+        leads: usize,
+        suffix: &str,
+        code: i32,
+    ) -> ! {
         let line = format!(
-            "{} {} {} {}ms cand={} leads={}",
+            "{} {} {} {}ms cand={} leads={}{}{}",
             iso_utc(super::now_ts()),
             self.hash8,
             mode,
             self.started.elapsed().as_millis(),
             candidates,
-            leads
+            leads,
+            if suffix.is_empty() { "" } else { " " },
+            suffix
         );
         append_log(&self.log_path, &line);
         if self.verbose {
@@ -2062,12 +3092,24 @@ struct PipelineJob {
     deadline: Instant,
     params: SelectParams,
     now: f64,
+    /// The prompt reads as a broad question about an entity (`broad_question`).
+    broad: bool,
 }
 
 struct PipelineOutput {
     leads: Vec<Candidate>,
     mode: &'static str,
     candidates: usize,
+    /// `dossier:<decision>` for the log line: `would-fire`, `no` or `fired`; empty when the
+    /// gate is off.
+    gate: String,
+    /// Lines of a compact dossier that replace the leads (`recall_dossier = auto` and the
+    /// gate fired).
+    dossier_lines: Option<Vec<String>>,
+    /// Entry paths of the dossier, remembered as shown.
+    dossier_paths: Vec<String>,
+    /// The breadth half of the gate, for the verbose note.
+    breadth: dossier::Breadth,
 }
 
 fn breaker_active(path: &Path) -> bool {
@@ -2120,6 +3162,8 @@ fn note_slow_semantic(breaker: &Path) {
     }
 }
 
+/// Write the breaker file with a reason word; callers pass a fixed class (`error_class`,
+/// "timeout x2"), never an error message.
 fn trip_breaker(path: &Path, reason: &str) {
     if let Some(parent) = path.parent() {
         let _ = ensure_private_dir(parent);
@@ -2212,7 +3256,7 @@ fn retrieve(job: &PipelineJob) -> Result<(Vec<RankedFileResult>, &'static str), 
             let _ = fs::remove_file(job.breaker.with_file_name("embed-slow"));
             return Ok((rows, "semantic"));
         }
-        Ok(Err(e)) => trip_breaker(&job.breaker, &e),
+        Ok(Err(e)) => trip_breaker(&job.breaker, error_class(&e)),
         Err(_) => note_slow_semantic(&job.breaker),
     }
     let remaining = job.deadline.saturating_duration_since(Instant::now());
@@ -2266,12 +3310,72 @@ fn run_pipeline(job: PipelineJob) -> Result<PipelineOutput, String> {
         let text_of = |id: i64| conn.as_ref().and_then(|c| chunk_text(c, id));
         existing = apply_lexical_confidence(existing, &job.terms, &rp, &text_of);
     }
+    // The dossier gate (slice 4) reads the same candidates as the leads, at the dossier
+    // floor rather than the recall floor: breadth is about where the topic lives, and the
+    // recall floor is calibrated to keep weak matches out of the leads, not to hide projects.
+    let dossier_mode = job.cfg.recall_dossier.as_str();
     let mut shortlist = prefilter(existing, &job.params, mode == "semantic");
+    let dossier_floor = dossier::floor_for(&job.cfg);
+    let candidates_for_dossier = if dossier_mode == "off" {
+        Vec::new()
+    } else {
+        dossier_rows(&rows, &job.params, dossier_floor, mode == "semantic")
+    };
+    let breadth = dossier::breadth(&candidates_for_dossier);
+    let fires =
+        dossier_mode != "off" && dossier_gate_fires(job.broad, &breadth, job.params.min_abs_score);
+    let mut gate = match dossier_mode {
+        "off" => String::new(),
+        _ if fires => "dossier:would-fire".to_string(),
+        _ => "dossier:no".to_string(),
+    };
+    if dossier_mode == "auto" && fires {
+        let projects = dossier::group_projects(
+            &candidates_for_dossier,
+            &job.query,
+            job.params.min_abs_score,
+            DOSSIER_MAX_PROJECTS,
+        );
+        if !projects.is_empty() {
+            let related = conn
+                .as_ref()
+                .and_then(|c| dossier::related_projects(c, &projects, 3).ok())
+                .unwrap_or_default();
+            let mut lines: Vec<String> = Vec::new();
+            lines.push(format!(
+                "Topic dossier: {} project{} hold material on this topic ({} files above the floor). One entry file each; superseded handoffs and copies are folded.",
+                projects.len(),
+                if projects.len() == 1 { "" } else { "s" },
+                candidates_for_dossier.len()
+            ));
+            for (i, p) in projects.iter().enumerate() {
+                lines.push(sanitize(&dossier::project_line(i + 1, p, true)));
+            }
+            if let Some(rel) = dossier::related_line(&related) {
+                lines.push(sanitize(&rel));
+            }
+            lines.push(dossier::INSTRUCTION.to_string());
+            gate = "dossier:fired".to_string();
+            return Ok(PipelineOutput {
+                leads: Vec::new(),
+                mode,
+                candidates,
+                gate,
+                dossier_lines: Some(lines),
+                dossier_paths: projects.iter().map(|p| p.entry.path.clone()).collect(),
+                breadth,
+            });
+        }
+    }
     if shortlist.is_empty() {
         return Ok(PipelineOutput {
             leads: Vec::new(),
             mode,
             candidates,
+            gate,
+            dossier_lines: None,
+            dossier_paths: Vec::new(),
+            breadth,
         });
     }
     for c in shortlist.iter_mut() {
@@ -2303,6 +3407,10 @@ fn run_pipeline(job: PipelineJob) -> Result<PipelineOutput, String> {
         leads,
         mode,
         candidates,
+        gate,
+        dossier_lines: None,
+        dossier_paths: Vec::new(),
+        breadth,
     })
 }
 
@@ -2326,10 +3434,33 @@ pub fn run_recall_cmd(args: &[OsString]) {
         return;
     }
     let dry_run = opts.query.is_some();
-    let stdin_input = if !dry_run && !std::io::stdin().is_terminal() {
-        parse_hook_input(&read_all_stdin())
+    let proc_cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let data_root = super::data_dir(&proc_cwd);
+    let (parsed_input, stdin_truncated) = if !dry_run && !std::io::stdin().is_terminal() {
+        let (raw, truncated) = read_all_stdin();
+        (parse_hook_input(&raw), truncated)
     } else {
-        HookInput::default()
+        (Ok(HookInput::default()), false)
+    };
+    let truncated_token = if stdin_truncated {
+        "stdin:truncated"
+    } else {
+        ""
+    };
+    let stdin_input = match parsed_input {
+        Ok(input) => input,
+        Err(()) => {
+            // A broken envelope is never a prompt: no retrieval, no state, one log line.
+            let rep = Reporter {
+                log_path: data_root.join("recall.log"),
+                hash8: "-".to_string(),
+                started,
+                verbose: opts.verbose,
+                dry_run,
+            };
+            rep.note("hook input starts with '{' but is not a JSON object; skipped");
+            rep.finish_with("skipped:bad-input", 0, 0, truncated_token, 0);
+        }
     };
     let prompt = opts
         .query
@@ -2346,14 +3477,12 @@ pub fn run_recall_cmd(args: &[OsString]) {
         .unwrap_or_else(|| DEFAULT_EVENT_NAME.to_string());
     let format = opts.format.unwrap_or(OutputFormat::Json);
 
-    let proc_cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let cwd: PathBuf = opts
         .cwd
         .clone()
         .or_else(|| stdin_input.cwd.clone())
         .map(|c| super::normalize_path(&c))
         .unwrap_or_else(|| proc_cwd.clone());
-    let data_root = super::data_dir(&proc_cwd);
     let state_dir = data_root.join("recall");
     let session_hash = session_id.as_deref().map(sha1_hex);
     let now = super::now_ts();
@@ -2380,7 +3509,7 @@ pub fn run_recall_cmd(args: &[OsString]) {
 
     if let Some(reason) = skip_reason(&prompt, stdin_input.agent_id.as_deref(), &cwd) {
         rep.note(&format!("skipped: {}", reason));
-        rep.finish(&format!("skipped:{}", reason), 0, 0, 0);
+        rep.finish_with(&format!("skipped:{}", reason), 0, 0, truncated_token, 0);
     }
 
     let cfg = ConfigValues::from_map(super::load_config_values(&super::config_path(&proc_cwd)));
@@ -2394,7 +3523,12 @@ pub fn run_recall_cmd(args: &[OsString]) {
         .as_ref()
         .map(|h| load_state(&session_file(&state_dir, h)))
         .unwrap_or_default();
-    let (query, terms) = build_query(&prompt, &state.last_terms);
+    let (query, terms) = build_query(&prompt);
+    if query.trim().is_empty() {
+        // Fence delimiters only, or nothing but redacted secrets: there is nothing to search.
+        rep.note("derived query is empty; skipped");
+        rep.finish_with("skipped:empty-query", 0, 0, truncated_token, 0);
+    }
     let max_leads = opts
         .limit
         .unwrap_or(cfg.recall_max_leads)
@@ -2412,7 +3546,10 @@ pub fn run_recall_cmd(args: &[OsString]) {
     let excerpts = cfg.recall_excerpts;
     let system_message = cfg.recall_system_message;
     let ttl_days = cfg.recall_session_ttl_days;
-    let deadline = started + HARD_DEADLINE;
+    // The worker gets the deadline less the output reserve, so the block is printed and the
+    // process gone by HARD_DEADLINE even when the worker uses every millisecond it has.
+    let deadline = started + (HARD_DEADLINE - OUTPUT_RESERVE);
+    let broad = broad_question(&prompt);
     let job = PipelineJob {
         cfg,
         db_path,
@@ -2422,6 +3559,7 @@ pub fn run_recall_cmd(args: &[OsString]) {
         deadline,
         params,
         now,
+        broad,
     };
 
     let (tx, rx) = mpsc::channel();
@@ -2454,7 +3592,29 @@ pub fn run_recall_cmd(args: &[OsString]) {
         }
     };
 
-    let emitted = if out.leads.is_empty() {
+    if !out.gate.is_empty() {
+        rep.note(&format!(
+            "{} (broad={}, projects={}, c1={:.3}, c3={:.3}, mode={})",
+            out.gate, broad, out.breadth.projects, out.breadth.c1, out.breadth.c3, out.mode
+        ));
+    }
+    let mut shown: Vec<String> = Vec::new();
+    let emitted = if let Some(lines) = &out.dossier_lines {
+        let (block, n) = build_dossier_block(lines);
+        match format {
+            OutputFormat::Text => println!("{}", block),
+            OutputFormat::Json => {
+                let msg =
+                    system_message.then(|| format!("retrivio: topic dossier, {} projects", n));
+                println!("{}", hook_output_json(&block, &event_name, msg.as_deref()));
+            }
+        }
+        let _ = std::io::stdout().flush();
+        // Only the projects whose lines made it into the block count as shown; trailing
+        // lines dropped by the block cap stay eligible as leads later in the session.
+        shown = dossier_shown(&out.dossier_paths, n);
+        n
+    } else if out.leads.is_empty() {
         0
     } else {
         let (block, n) = build_block(&out.leads, excerpts);
@@ -2466,24 +3626,50 @@ pub fn run_recall_cmd(args: &[OsString]) {
             }
         }
         let _ = std::io::stdout().flush();
+        shown = out.leads[..n].iter().map(|c| c.path.clone()).collect();
         n
     };
 
     if let Some(h) = &session_hash {
         if should_persist(started.elapsed()) {
-            let shown: Vec<String> = out.leads[..emitted]
-                .iter()
-                .map(|c| c.path.clone())
-                .collect();
-            if let Err(e) = update_session_state(&state_dir, h, &shown, &terms, now) {
-                rep.note(&e);
+            // Best effort on a side thread: waited for until STATE_WRITE_CUTOFF, then left
+            // behind (the process exits; a half-written temp file is pruned by a later run).
+            let (stx, srx) = mpsc::channel();
+            let (dir, hash, shown_c, terms_c) =
+                (state_dir.clone(), h.clone(), shown.clone(), terms.clone());
+            let spawned = thread::Builder::new()
+                .name("recall-state".to_string())
+                .spawn(move || {
+                    let _ = stx.send(update_session_state(&dir, &hash, &shown_c, &terms_c, now));
+                });
+            if spawned.is_ok() {
+                let cutoff = started + STATE_WRITE_CUTOFF;
+                match srx.recv_timeout(cutoff.saturating_duration_since(Instant::now())) {
+                    Ok(Ok(())) => {
+                        if should_prune(started.elapsed()) {
+                            maybe_prune_states(&state_dir, ttl_days, now);
+                        }
+                    }
+                    Ok(Err(e)) => rep.note(&e),
+                    Err(_) => rep.note("session state write timed out; not waited for"),
+                }
             }
-            maybe_prune_states(&state_dir, ttl_days, now);
         } else {
             rep.note("late finish; session state not persisted");
         }
     }
-    rep.finish(out.mode, out.candidates, emitted, 0);
+    let suffix = join_tokens(&out.gate, truncated_token);
+    rep.finish_with(out.mode, out.candidates, emitted, &suffix, 0);
+}
+
+/// Two optional log tokens joined by one space.
+fn join_tokens(a: &str, b: &str) -> String {
+    match (a.is_empty(), b.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => a.to_string(),
+        (true, false) => b.to_string(),
+        (false, false) => format!("{} {}", a, b),
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2529,6 +3715,8 @@ mod tests {
             doc_rel_path: rel,
             raw_similarity: Some(score),
             superseded_by: None,
+            noise: false,
+            why: String::new(),
             revision_date: freshness::revision_date(
                 &rel_for_revision,
                 now - age * freshness::DAY_SECS,
@@ -2675,19 +3863,585 @@ mod tests {
 
     #[test]
     fn query_truncation_respects_char_boundaries() {
+        // One 1300-character word: head and tail are cut at character boundaries.
         let long: String = std::iter::repeat('é').take(1300).collect();
         let q = derive_query(&long);
-        assert_eq!(q.chars().count(), QUERY_MAX_CHARS);
-        assert!(q.chars().all(|c| c == 'é'));
+        assert!(q.chars().count() <= QUERY_MAX_CHARS);
+        assert!(q.starts_with(&"é".repeat(QUERY_HEAD_CHARS)));
+        assert!(q.ends_with(&"é".repeat(QUERY_TAIL_CHARS)));
+        assert!(q.chars().all(|c| c == 'é' || c == ' '));
+        // The tail of a long prompt survives: the pointer sentence at the end is kept.
         let mixed = format!("{}  {}\n\n{}", "a".repeat(1198), "日本語", "tail");
         let q2 = derive_query(&mixed);
-        assert_eq!(q2.chars().count(), QUERY_MAX_CHARS);
-        assert!(q2.ends_with("a 日"));
+        assert!(q2.chars().count() <= QUERY_MAX_CHARS);
+        assert!(q2.ends_with("日本語 tail"), "{}", &q2[q2.len() - 20..]);
         assert_eq!(derive_query("  a   b \t c "), "a b c");
-        assert_eq!(
-            derive_query("```rust\nfn x() {}\n```"),
-            "```rust fn x() {} ```"
+        // A prompt that is nothing but a fenced block still yields its content as the query.
+        assert_eq!(derive_query("```rust\nfn x() {}\n```"), "fn x() {}");
+    }
+
+    #[test]
+    fn query_prefers_own_sentences_and_keeps_head_middle_terms_and_tail() {
+        // Own words first, the paste after them.
+        let prompt = "why does the Acme export fail?\n```\nTraceback: KeyError 'region' in export.py line 12\n```\nlook at the handler";
+        let q = derive_query(prompt);
+        assert!(
+            q.starts_with("why does the Acme export fail? look at the handler"),
+            "{}",
+            q
         );
+        assert!(q.contains("Traceback: KeyError"));
+        // Quoted lines count as pasted material too.
+        let quoted =
+            "> pasted summary line one\n> pasted summary line two\nsummarize the Globex call";
+        let q = derive_query(quoted);
+        assert!(
+            q.starts_with("summarize the Globex call pasted summary"),
+            "{}",
+            q
+        );
+        // A long prompt: head, distinctive middle terms, tail; the middle filler is dropped.
+        let filler = "lorem ipsum filler words here ".repeat(60); // 1800 chars
+        let long = format!(
+            "Please review the plan below for the Acme rollout. {} The middle mentions S3Tables, config.toml and the COA workshop and Globex twice Globex. {} then read docs/sessions/HANDOFF-2026-09-10.md and tell me the next step",
+            filler, filler
+        );
+        let q = derive_query(&long);
+        assert!(q.chars().count() <= QUERY_MAX_CHARS);
+        assert!(q.starts_with("Please review the plan below for the Acme rollout."));
+        assert!(
+            q.ends_with("then read docs/sessions/HANDOFF-2026-09-10.md and tell me the next step"),
+            "{}",
+            q
+        );
+        for term in ["S3Tables", "config.toml", "COA", "Globex"] {
+            assert!(q.contains(term), "middle term {} missing from {}", term, q);
+        }
+        assert_eq!(
+            q.matches("Globex").count(),
+            1,
+            "middle terms are deduplicated"
+        );
+        // Pasted material never displaces the user's words when the budget is tight.
+        let tight = format!(
+            "{}\n```\n{}\n```",
+            "own words ".repeat(118),
+            "pasted ".repeat(100)
+        );
+        let q = derive_query(&tight);
+        assert!(q.chars().count() <= QUERY_MAX_CHARS);
+        assert!(q.starts_with("own words own words"));
+        assert!(!q.contains("pasted") || q.rfind("own words").unwrap() < q.find("pasted").unwrap());
+        // Head and tail cuts land on word boundaries.
+        let words = format!("{} end", "alpha bravo charlie ".repeat(80));
+        let q = derive_query(&words);
+        assert!(
+            q.split(' ')
+                .all(|w| matches!(w, "alpha" | "bravo" | "charlie" | "end")),
+            "{}",
+            q
+        );
+    }
+
+    #[test]
+    fn instruction_prompts_are_skipped_but_one_topic_word_is_enough() {
+        for p in [
+            "read the handoff, think about it deeply, brainstorm/ultrathink, and tell me what we should do next",
+            "run the tests again and fix what breaks",
+            "summarize what you just did",
+            "ok go ahead",
+            "write a detailed handoff doc with todays date in the name of the file, and we will resume work when i come back",
+            "Continue where we left off and finish the plan",
+            "please check the results and tell me what changed",
+            "write a detailed handoff doc with todays date in the name of the file, and we will resume work when i come back tomorrow",
+            "reply only with none and do not use any tools",
+        ] {
+            assert!(is_instruction_prompt(p), "{:?} should be an instruction", p);
+            assert_eq!(
+                skip_reason(p, None, Path::new("/nonexistent")),
+                Some("instruction"),
+                "{:?}",
+                p
+            );
+        }
+        for p in [
+            "what time is it in Seattle",
+            "fix the acme test",
+            "tell me about acme",
+            "what do we know about acme",
+            "read the APG guide for orion, that explains the architecture",
+            "resume where we left off: Handoff complete, the handoff is written",
+            "run the tests in config.toml",
+            "check `retrivio watch`",
+            "read \"the plan\" again",
+            "look at /Users/me/docs/HANDOFF.md",
+            "fix E1234 in the handler",
+            "summarize the transcript and list the items kun suggested",
+        ] {
+            assert!(
+                !is_instruction_prompt(p),
+                "{:?} should not be an instruction",
+                p
+            );
+        }
+        assert_eq!(
+            skip_reason(
+                "what time is it in Seattle",
+                None,
+                Path::new("/nonexistent")
+            ),
+            None
+        );
+    }
+
+    /// Held-out matrix for the gate rule (distinct from the scorecard's seven negatives):
+    /// knowledge questions must never be skipped, topic-less work instructions must be.
+    #[test]
+    fn question_matrix_never_skips_knowledge_questions_and_skips_work_instructions() {
+        let knowledge = [
+            "Why did the test fail?",
+            "What was the last error?",
+            "How did we fix the last problem?",
+            "Which issues did we fix last week?",
+            "What changed after the update?",
+            "What was the result of the last test?",
+            "why does the build break",
+            "what did we decide about the cache",
+            "how does the watcher pick up changes",
+            "where did we leave off yesterday",
+            "when did the tests start failing",
+            "who owns the deploy step",
+            "what is the plan for next week",
+            "is the fix from yesterday done?",
+            "did we already fix the memory issue",
+            "are the tests passing now",
+            "can we reuse the old approach",
+            "should we keep the old plan",
+            "what does the error mean",
+            "ok so what was the problem again",
+            "and how did that go",
+            "what were the results?",
+            "remind me how we run the tests",
+            "which file has the handoff notes?",
+            "what should we work on next?",
+        ];
+        assert_eq!(knowledge.len(), 25);
+        for p in knowledge {
+            // "remind me how ..." runs because "remind" is a topic word, not because it is
+            // phrased as a question; every other entry is an interrogative.
+            if !p.starts_with("remind") {
+                assert!(is_question(p), "{:?} should read as a question", p);
+            }
+            assert!(
+                !is_instruction_prompt(p),
+                "{:?} must not be an instruction",
+                p
+            );
+            assert_eq!(
+                skip_reason(p, None, Path::new("/nonexistent")),
+                None,
+                "{:?} must run recall",
+                p
+            );
+        }
+        let instructions = [
+            "go ahead and run the tests again",
+            "rerun the tests and fix what breaks",
+            "fix what breaks",
+            "summarize what you just did",
+            "write the handoff",
+            "update the handoff doc and commit",
+            "commit and push",
+            "format and lint everything",
+            "read the handoff, think about it deeply, and carry on",
+            "keep going",
+            "finish the plan and then stop",
+            "please review the changes again carefully",
+            "make sure the tests still pass",
+            "double check everything and commit",
+            "ok do the next step",
+            "tell me when you are done",
+            "write a detailed summary and stop",
+            "try again",
+            "run it again",
+            "proceed with the plan",
+            "do the same for the other files",
+            "clean up and commit the work",
+            "pick up where we left off",
+            "carry on with the next item",
+            "reply with the summary only",
+        ];
+        assert_eq!(instructions.len(), 25);
+        for p in instructions {
+            assert!(!is_question(p), "{:?} is not a question", p);
+            assert!(is_instruction_prompt(p), "{:?} should be an instruction", p);
+            assert_eq!(
+                skip_reason(p, None, Path::new("/nonexistent")),
+                Some("instruction"),
+                "{:?}",
+                p
+            );
+        }
+        // "do"/"have" open a question only before a subject pronoun; "has"/"will" never do.
+        for p in [
+            "Do we have the results",
+            "Have we fixed the bug",
+            "do you know why the build broke",
+            "have you seen the last error",
+            "don't we have the results",
+            "Do the tests still fail?",
+        ] {
+            assert!(is_question(p), "{:?}", p);
+            assert!(!is_instruction_prompt(p), "{:?}", p);
+        }
+        for p in [
+            "do the next step",
+            "have a look at the tests",
+            "Do the tests still fail",
+            "Has to be done today",
+        ] {
+            assert!(!is_question(p), "{:?}", p);
+            assert!(is_instruction_prompt(p), "{:?}", p);
+        }
+        assert_eq!(
+            skip_reason("Will do", None, Path::new("/nonexistent")),
+            Some("ack")
+        );
+        assert_eq!(
+            skip_reason("will do.", None, Path::new("/nonexistent")),
+            Some("ack")
+        );
+        // The boundary: the same words as a question run; a name, a path or a number makes
+        // any instruction run; a question mark anywhere in the prompt counts.
+        assert!(is_instruction_prompt("fix the last error"));
+        assert!(!is_instruction_prompt("fix the last error?"));
+        assert!(!is_instruction_prompt("what was the last error. fix it"));
+        assert!(!is_instruction_prompt(
+            "was the last error fixed? then continue"
+        ));
+        assert!(!is_instruction_prompt("fix the Acme error"));
+        assert!(!is_instruction_prompt("fix error 42"));
+        assert!(!is_instruction_prompt("fix src/main.rs"));
+        assert!(!is_instruction_prompt("What's the plan"));
+        assert!(!is_instruction_prompt("Please, what changed"));
+        // "what" inside an instruction is not a question opener.
+        assert!(is_instruction_prompt("tell me what we should do next"));
+        assert!(!is_question("summarize what you just did"));
+    }
+
+    /// Only the dossier projects whose lines survived the block cap are remembered as shown.
+    #[test]
+    fn dossier_shown_follows_the_emitted_project_lines() {
+        let paths: Vec<String> = (1..=5).map(|i| format!("/r/p{}/entry.md", i)).collect();
+        assert_eq!(dossier_shown(&paths, 5), paths);
+        assert_eq!(dossier_shown(&paths, 2), paths[..2].to_vec());
+        assert!(dossier_shown(&paths, 0).is_empty());
+        assert_eq!(dossier_shown(&paths, 9), paths, "never past the list");
+        // Over-long project lines: the block keeps the title, the first project and the
+        // instruction; the count it returns is what `dossier_shown` trims to.
+        let long = "x".repeat(700);
+        let lines = vec![
+            "Topic dossier: 3 projects".to_string(),
+            format!("1. p1 — /r/p1/entry.md — {}", long),
+            format!("2. p2 — /r/p2/entry.md — {}", long),
+            format!("3. p3 — /r/p3/entry.md — {}", long),
+            dossier::INSTRUCTION.to_string(),
+        ];
+        let (block, n) = build_dossier_block(&lines);
+        assert!(
+            block.chars().count() <= BLOCK_MAX_CHARS,
+            "{}",
+            block.chars().count()
+        );
+        assert!(n >= 1 && n < 3, "n={}", n);
+        assert!(block.contains("1. p1"));
+        assert!(!block.contains("3. p3"));
+        assert_eq!(dossier_shown(&paths[..3], n).len(), n);
+    }
+
+    /// Child half of the end-to-end tests: the test binary running this "test" is `retrivio
+    /// recall` with the arguments and data dir from the environment (see `pdf_child_helper`
+    /// in `documents.rs` for the pattern). Returns at once when not spawned as a child.
+    #[test]
+    fn recall_child_helper() {
+        let Ok(dir) = env::var("RETRIVIO_RECALL_CHILD_DATA_DIR") else {
+            return;
+        };
+        super::super::test_support::install_process_data_dir(Path::new(&dir));
+        let args: Vec<OsString> = env::var("RETRIVIO_RECALL_CHILD_ARGS")
+            .ok()
+            .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .map(OsString::from)
+            .collect();
+        run_recall_cmd(&args);
+        // `run_recall_cmd` always exits the process; reaching this line is a bug.
+        process::exit(97);
+    }
+
+    /// One hook-mode run of `retrivio recall` in a child process: stdin bytes in, (exit code,
+    /// stdout JSON lines, stderr, wall time) out.
+    struct ChildRun {
+        code: Option<i32>,
+        json_lines: Vec<String>,
+        stderr: String,
+        wall: Duration,
+    }
+
+    fn spawn_recall(data_dir: &Path, cwd: &Path, args: &[&str], stdin: &[u8]) -> ChildRun {
+        use std::process::{Command, Stdio};
+        let exe = env::current_exe().expect("test binary path");
+        let args_json = serde_json::to_string(args).unwrap();
+        let started = Instant::now();
+        let mut child = Command::new(exe)
+            .args([
+                "recall::tests::recall_child_helper",
+                "--exact",
+                "--nocapture",
+            ])
+            .env("RETRIVIO_RECALL_CHILD_DATA_DIR", data_dir)
+            .env("RETRIVIO_RECALL_CHILD_ARGS", &args_json)
+            .env_remove("RETRIVIO_HOOK")
+            .current_dir(cwd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn recall child");
+        {
+            let mut sin = child.stdin.take().expect("child stdin");
+            let _ = sin.write_all(stdin);
+            // dropping closes the pipe
+        }
+        let out = child.wait_with_output().expect("child output");
+        let wall = started.elapsed();
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        // libtest prints its own lines around the command's output; the hook output is the
+        // one line that is a JSON object.
+        let json_lines: Vec<String> = stdout
+            .lines()
+            .filter(|l| l.starts_with('{'))
+            .map(|l| l.to_string())
+            .collect();
+        ChildRun {
+            code: out.status.code(),
+            json_lines,
+            stderr: String::from_utf8_lossy(&out.stderr).to_string(),
+            wall,
+        }
+    }
+
+    /// End-to-end through the process boundary against a small hash-embedded store: hostile
+    /// and oversized inputs finish well inside the hook deadline with a valid (possibly
+    /// empty) output and one log line each. Timings are printed for the run record.
+    #[test]
+    fn hook_runs_finish_under_the_deadline_on_hostile_input() {
+        use super::super::test_support::{TestEmbedder, TestStore};
+        let store = TestStore::new("recall-e2e");
+        let root = store.corpus_root("root");
+        let write = |rel: &str, text: &str| {
+            let p = root.join(rel);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(&p, text).unwrap();
+        };
+        write(
+            "alpha/storage.md",
+            "Alpha design notes: storage layers, the api endpoints and the retry budget. Decision 2026-09-01: keep the cache warm.",
+        );
+        write(
+            "alpha/api.md",
+            "Alpha api endpoints and their storage layers; pagination and the retry budget.",
+        );
+        write(
+            "beta/auth.md",
+            "Beta notes on authentication tokens and the login flow for the widget service.",
+        );
+        store.track(&root);
+        let cfg = store.cfg(
+            &root,
+            &[("embed_backend", "hash"), ("recall_min_abs_score", "0.2")],
+        );
+        let embedder = TestEmbedder::new(&cfg, true);
+        let stats = store.index(&cfg, &embedder, false).expect("index");
+        assert!(stats.chunks_embedded >= 3, "{:?}", stats.chunks_embedded);
+        fs::write(
+            store.dir.join("config.toml"),
+            format!(
+                "root = \"{}\"\nembed_backend = \"hash\"\nlocal_embed_dim = 64\nretrieval_backend = \"lancedb\"\nrecall_min_abs_score = 0.2\n",
+                root.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        // The parent's LanceDB handle would hold the store open; the child opens its own.
+        drop(embedder);
+
+        let log_path = store.dir.join("recall.log");
+        let last_log = || -> String {
+            fs::read_to_string(&log_path)
+                .unwrap_or_default()
+                .lines()
+                .last()
+                .unwrap_or("")
+                .to_string()
+        };
+        let envelope = |prompt: &str, session: &str| -> Vec<u8> {
+            json!({
+                "prompt": prompt,
+                "session_id": session,
+                "cwd": root.to_string_lossy(),
+                "hook_event_name": "UserPromptSubmit",
+            })
+            .to_string()
+            .into_bytes()
+        };
+        let mut timings: Vec<(String, u128)> = Vec::new();
+        let mut check = |name: &str, run: &ChildRun, expect_log: &str| {
+            timings.push((name.to_string(), run.wall.as_millis()));
+            assert_eq!(
+                run.code,
+                Some(0),
+                "{}: exit code; stderr:\n{}",
+                name,
+                run.stderr
+            );
+            assert!(
+                run.wall < HARD_DEADLINE,
+                "{}: {} ms is past the deadline; stderr:\n{}",
+                name,
+                run.wall.as_millis(),
+                run.stderr
+            );
+            assert!(
+                run.json_lines.len() <= 1,
+                "{}: more than one output line: {:?}",
+                name,
+                run.json_lines
+            );
+            for line in &run.json_lines {
+                let v: Value = serde_json::from_str(line).expect("valid hook JSON");
+                assert!(
+                    v["hookSpecificOutput"]["additionalContext"].is_string(),
+                    "{}",
+                    line
+                );
+            }
+            let log = last_log();
+            assert!(
+                log.contains(expect_log),
+                "{}: log line {:?} lacks {:?}; stderr:\n{}",
+                name,
+                log,
+                expect_log,
+                run.stderr
+            );
+        };
+
+        // Warm-up: a plain content prompt yields leads (the store works end to end).
+        let content = spawn_recall(
+            &store.dir,
+            &root,
+            &["--verbose"],
+            &envelope(
+                "what did we decide about the storage layers and the cache",
+                "s-warm",
+            ),
+        );
+        check("content", &content, " leads=");
+        assert_eq!(
+            content.json_lines.len(),
+            1,
+            "a content prompt yields a block; stderr:\n{}",
+            content.stderr
+        );
+        assert!(
+            content.json_lines[0].contains("storage.md"),
+            "{}",
+            content.json_lines[0]
+        );
+
+        // 20 KB prompt: the query is derived from its head, middle terms and tail.
+        let big_prompt = format!(
+            "what did we decide about the storage layers {} and the retry budget",
+            "pasted transcript line about api endpoints and widgets ".repeat(380)
+        );
+        assert!(big_prompt.len() > 20_000, "{}", big_prompt.len());
+        let big = spawn_recall(
+            &store.dir,
+            &root,
+            &["--verbose"],
+            &envelope(&big_prompt, "s-big"),
+        );
+        check("20kb-prompt", &big, " cand=");
+
+        // Fence delimiters only: nothing to search, the run stops before retrieval.
+        let fence = spawn_recall(
+            &store.dir,
+            &root,
+            &["--verbose"],
+            &envelope("```\n```", "s-fence"),
+        );
+        check("fence-only", &fence, "skipped:empty-query");
+        assert!(fence.json_lines.is_empty());
+
+        // Invalid UTF-8 before plain text: lossily decoded, treated as the prompt.
+        let mut bad_bytes = vec![0xffu8, 0xfe, 0xc3];
+        bad_bytes.extend_from_slice(b"tell me about the storage layers of alpha");
+        let utf8 = spawn_recall(&store.dir, &root, &["--verbose"], &bad_bytes);
+        check("invalid-utf8", &utf8, " cand=");
+
+        // Malformed JSON envelope: skipped as bad input, never searched as a prompt.
+        let malformed = spawn_recall(
+            &store.dir,
+            &root,
+            &["--verbose"],
+            br#"{"prompt": "tell me about storage layers", "session_id": "s-bad"#,
+        );
+        check("malformed-json", &malformed, "skipped:bad-input");
+        assert!(malformed.json_lines.is_empty());
+
+        // Oversized envelope (past the 64 KiB cap): truncated, hence bad input, and logged
+        // as truncated.
+        let huge = envelope(&"storage layers ".repeat(6000), "s-huge");
+        assert!(huge.len() > STDIN_MAX_BYTES);
+        let oversize = spawn_recall(&store.dir, &root, &["--verbose"], &huge);
+        check("oversize-stdin", &oversize, "skipped:bad-input");
+        assert!(last_log().ends_with("stdin:truncated"), "{}", last_log());
+
+        // A held session lock: the state write is skipped at once, the block still comes.
+        let session = "s-locked";
+        let state_dir = store.dir.join("recall");
+        ensure_private_dir(&state_dir).unwrap();
+        let lock = state_dir.join(format!("{}.lock", sha1_hex(session)));
+        open_private_new(&lock).unwrap();
+        let locked = spawn_recall(
+            &store.dir,
+            &root,
+            &["--verbose"],
+            &envelope(
+                "what did we decide about the storage layers and the cache",
+                session,
+            ),
+        );
+        check("locked-session", &locked, " leads=");
+        assert_eq!(locked.json_lines.len(), 1, "stderr:\n{}", locked.stderr);
+        assert!(
+            locked.stderr.contains("session state locked"),
+            "{}",
+            locked.stderr
+        );
+        assert!(
+            !session_file(&state_dir, &sha1_hex(session)).exists(),
+            "no state file is written past a held lock"
+        );
+        assert!(lock.exists(), "a fresh lock is left alone");
+
+        // An empty envelope: the prompt is empty.
+        let empty = spawn_recall(&store.dir, &root, &["--verbose"], b"{}");
+        check("empty-envelope", &empty, "skipped:empty");
+
+        println!("recall e2e timings (ms): {:?}", timings);
+        let _ = fs::remove_dir_all(&store.dir);
     }
 
     #[test]
@@ -2722,18 +4476,20 @@ mod tests {
     }
 
     #[test]
-    fn short_prompt_borrows_previous_terms() {
-        let prev = vec!["bedrock".to_string(), "us-west-2".to_string()];
-        let (q, terms) = build_query("fix it now", &prev);
-        assert_eq!(q, "bedrock us-west-2 fix it now");
+    fn short_prompts_run_on_their_own_words() {
+        // Session state holds no term text (only salted hashes), so nothing is borrowed: the
+        // query is the prompt, and a topic-less follow-up is the instruction gate's business.
+        let (q, terms) = build_query("fix the bedrock region now");
+        assert_eq!(q, "fix the bedrock region now");
         assert!(terms.contains(&"bedrock".to_string()));
-        assert!(terms.contains(&"us-west-2".to_string()));
-        assert!(terms.contains(&"fix".to_string()));
-        let (q2, terms2) = build_query("a much longer prompt that stands on its own here", &prev);
-        assert!(!q2.starts_with("bedrock"));
-        assert!(!terms2.contains(&"bedrock".to_string()));
-        let (q3, _) = build_query("short one", &[]);
+        assert!(terms.contains(&"region".to_string()));
+        let (q3, _) = build_query("short one");
         assert_eq!(q3, "short one");
+        assert!(is_instruction_prompt("fix it now"));
+        // Fence delimiters alone derive an empty query: the run stops before retrieval.
+        let (q4, terms4) = build_query("```\n```");
+        assert!(q4.trim().is_empty(), "{:?}", q4);
+        assert!(terms4.is_empty());
     }
 
     #[test]
@@ -3073,7 +4829,7 @@ mod tests {
 
     #[test]
     fn prompt_secrets_never_reach_terms_or_session_state() {
-        let (query, terms) = build_query("deploy with password=hunter2 and token abc", &[]);
+        let (query, terms) = build_query("deploy with password=hunter2 and token abc");
         assert!(
             !query.contains("hunter2") && !query.contains("abc"),
             "{}",
@@ -3089,7 +4845,6 @@ mod tests {
         );
         let (_, terms2) = build_query(
             "why does AKIAIOSFODNN7EXAMPLE fail with Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig in the S3Tables handler",
-            &[],
         );
         assert!(terms2.contains(&"s3tables".to_string()), "{:?}", terms2);
         assert!(
@@ -3102,7 +4857,6 @@ mod tests {
         // Zero-width characters inside a secret do not split it past the scanners.
         let (q3, terms3) = build_query(
             "deploy AKI\u{200B}AIOSFODNN7EXAMPLE and pass\u{200B}word=hunter2 with Auth\u{FEFF}orization: Basic dXNlcjpwYXNz",
-            &[],
         );
         assert!(
             !q3.contains("AKIA") && !q3.contains("hunter2") && !q3.contains("dXNl"),
@@ -3123,16 +4877,16 @@ mod tests {
         let hash = sha1_hex("session-secrets");
         update_session_state(&state_dir, &hash, &[], &terms, 1_800_000_000.0).unwrap();
         let st = load_state(&session_file(&state_dir, &hash));
-        assert!(!st.last_terms.is_empty());
-        assert!(
-            !st.last_terms
-                .iter()
-                .any(|t| t.contains("hunter2") || t == "abc"),
-            "{:?}",
-            st.last_terms
-        );
+        assert!(!st.term_hashes.is_empty());
+        assert!(st
+            .term_hashes
+            .iter()
+            .all(|h| h.len() == 16 && h.chars().all(|c| c.is_ascii_hexdigit())));
+        // Not a single term reaches the disk in clear: neither the secrets nor "deploy".
         let raw = fs::read_to_string(session_file(&state_dir, &hash)).unwrap();
-        assert!(!raw.contains("hunter2") && !raw.contains("abc"), "{}", raw);
+        for word in ["hunter2", "abc", "deploy", "password", "token"] {
+            assert!(!raw.contains(word), "{} in {}", word, raw);
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -3393,7 +5147,7 @@ mod tests {
         assert_eq!(leads[0].superseded_by.as_deref(), Some(new.path.as_str()));
         let line = format_lead_line(1, &leads[0], None);
         assert!(
-            line.ends_with("(superseded by HANDOFF-2026-09-10-orion.md)"),
+            line.ends_with(" — superseded by HANDOFF-2026-09-10-orion.md"),
             "{}",
             line
         );
@@ -3754,13 +5508,36 @@ mod tests {
     #[test]
     fn persistence_is_skipped_late_in_the_budget() {
         assert!(should_persist(Duration::from_millis(0)));
-        assert!(should_persist(Duration::from_millis(3599)));
+        assert!(should_persist(Duration::from_millis(3699)));
         assert!(should_persist(PERSIST_CUTOFF));
-        assert!(!should_persist(Duration::from_millis(3601)));
+        assert!(!should_persist(Duration::from_millis(3701)));
         assert!(!should_persist(HARD_DEADLINE));
         assert!(PERSIST_CUTOFF < HARD_DEADLINE);
-        // The lock tail is bounded too: 3 attempts x 100 ms leaves room before the deadline.
-        assert!(LOCK_RETRY * (LOCK_ATTEMPTS as u32) + PERSIST_CUTOFF < HARD_DEADLINE);
+        // The worker's deadline leaves the output reserve before the hard deadline; the state
+        // write (one lock attempt, no fsync) starts by PERSIST_CUTOFF at the latest and is
+        // waited for until STATE_WRITE_CUTOFF at most; the log line and the exit follow.
+        assert_eq!(HARD_DEADLINE - OUTPUT_RESERVE, Duration::from_millis(3400));
+        assert!(HARD_DEADLINE - OUTPUT_RESERVE < PERSIST_CUTOFF);
+        assert!(PERSIST_CUTOFF < STATE_WRITE_CUTOFF && STATE_WRITE_CUTOFF < HARD_DEADLINE);
+        // Pruning waits for an early finish.
+        assert!(should_prune(Duration::from_millis(1999)));
+        assert!(!should_prune(Duration::from_millis(2001)));
+        assert!(PRUNE_CUTOFF < PERSIST_CUTOFF);
+        // A held, fresh lock is not waited for: the attempt returns at once.
+        let dir = scratch("lock-fast");
+        fs::create_dir_all(&dir).unwrap();
+        let lock = dir.join("x.lock");
+        open_private_new(&lock).unwrap();
+        let real_now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        let t = Instant::now();
+        assert!(!acquire_lock(&lock, real_now));
+        assert!(t.elapsed() < Duration::from_millis(50), "{:?}", t.elapsed());
+        // An abandoned lock (older than LOCK_STALE_SECS) is taken over.
+        assert!(acquire_lock(&lock, real_now + LOCK_STALE_SECS + 1.0));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3878,20 +5655,228 @@ mod tests {
     fn lead_line_format_and_age() {
         assert_eq!(format_age(5.0), "5d");
         assert_eq!(format_age(59.9), "59d");
-        assert_eq!(format_age(60.0), "2mo");
-        assert_eq!(format_age(91.0), "3mo");
+        assert_eq!(format_age(60.0), "60d");
+        assert_eq!(format_age(91.0), "91d");
+        assert_eq!(format_age(f64::NAN), "0d");
         let mut c = cand("/r/202609-x/BRIEF.md", "/r/202609-x", 0.9, "fresh", 2.0);
         c.date_source = "path-date";
         c.excerpt = "escaped <100-char> hint & more".to_string();
         c.older_versions = 2;
         let line = format_lead_line(1, &c, Some(HINT_MAX_CHARS));
         assert!(line.starts_with("1. /r/202609-x/BRIEF.md — "));
-        assert!(line.contains(" (2d, fresh, path-date) — 202609-x — \"escaped \u{2039}100-char\u{203a} hint & more\" (supersedes 2 older)"));
+        assert!(
+            line.contains(" (knowledge · 2d · date:path) — 202609-x — \"escaped \u{2039}100-char\u{203a} hint & more\" (supersedes 2 older)"),
+            "{}",
+            line
+        );
         let no_hint = format_lead_line(2, &c, None);
         assert!(!no_hint.contains('"'));
         assert!(no_hint.ends_with("(supersedes 2 older)"));
         let short_hint = format_lead_line(3, &c, Some(12));
         assert!(short_hint.contains(" — \"escaped ‹10…\""), "{}", short_hint);
+
+        // Role and age are two fields; verify/stale and the date basis follow; why and the
+        // supersession note come after the hint; noise is never a lead at all.
+        let mut h = cand(
+            "/r/p/docs/sessions/HANDOFF-2026-05-01.md",
+            "/r/p",
+            0.8,
+            "verify",
+            120.0,
+        );
+        h.date_source = "frontmatter";
+        h.why = "semantic:0.61+lexical:0.40".to_string();
+        h.superseded_by = Some("/r/p/docs/sessions/HANDOFF-2026-09-01.md".to_string());
+        h.excerpt = String::new();
+        assert_eq!(
+            format_lead_line(1, &h, Some(HINT_MAX_CHARS)),
+            "1. /r/p/docs/sessions/HANDOFF-2026-05-01.md — 2022-11-15 (state · 120d · verify · date:frontmatter) — p — why:semantic:0.61+lexical:0.40 — superseded by HANDOFF-2026-09-01.md"
+                .replace("2022-11-15", &freshness::format_ymd(h.content_date))
+        );
+        let rec = cand("/r/t/transcripts/call.txt", "/r/t", 0.7, "record", 66.0);
+        assert_eq!(lead_label(&rec), "record · 66d · date:mtime");
+        let fresh_state = cand("/r/p/HANDOFF.md", "/r/p", 0.7, "fresh", 3.0);
+        assert_eq!(lead_label(&fresh_state), "state · 3d · date:mtime");
+        let stale = cand("/r/p/notes.md", "/r/p", 0.7, "stale", 200.0);
+        assert_eq!(lead_label(&stale), "knowledge · 200d · stale · date:mtime");
+        let mut dump = cand("/r/p/exports/chat.txt", "/r/p", 0.95, "fresh", 1.0);
+        dump.noise = true;
+        let kept = prefilter(
+            vec![dump, cand("/r/q/spec.md", "/r/q", 0.6, "fresh", 1.0)],
+            &params(3),
+            true,
+        );
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].path, "/r/q/spec.md");
+    }
+
+    #[test]
+    fn dossier_gate_needs_broad_phrasing_and_breadth() {
+        for p in [
+            "what do we know about Acme",
+            "What do you know about acme pricing?",
+            "everything about the Globex migration",
+            "give me the background on Acme",
+            "history of the widget service",
+            "tell me about Globex",
+            "Acme context",
+            "context on Globex please",
+            "which projects mention Acme",
+        ] {
+            assert!(broad_question(p), "{:?} should read as a broad question", p);
+        }
+        for p in [
+            "fix the acme test",
+            "read the handoff, think about it deeply, brainstorm/ultrathink, and tell me what we should do next",
+            "run the tests again and fix what breaks",
+            "summarize what you just did",
+            "what time is it in Seattle",
+            "write a detailed handoff doc with todays date in the name of the file",
+            "tell me about it",
+            "read the AWS Context GA roadmap pdf from today and summarize the changes for the team",
+            "what do we know about",
+        ] {
+            assert!(!broad_question(p), "{:?} should not read as a broad question", p);
+        }
+        // Breadth (measured in dossier.rs): both halves are required.
+        let wide = dossier::Breadth {
+            projects: 5,
+            c1: 0.462,
+            c3: 0.447,
+        };
+        assert!(dossier_gate_fires(true, &wide, 0.45));
+        assert!(
+            !dossier_gate_fires(false, &wide, 0.45),
+            "phrasing is required"
+        );
+        let owned = dossier::Breadth {
+            projects: 4,
+            c1: 0.607,
+            c3: 0.417,
+        };
+        assert!(
+            !dossier_gate_fires(true, &owned, 0.45),
+            "one project owns the topic"
+        );
+        // Lexical mode yields no dossier rows, so no breadth.
+        let params = params(3);
+        let rows: Vec<RankedFileResult> = Vec::new();
+        assert!(dossier_rows(&rows, &params, 0.30, false).is_empty());
+        // The compact block keeps the title and the instruction, drops projects from the end.
+        let lines: Vec<String> = std::iter::once("Topic dossier: 5 projects".to_string())
+            .chain((1..=5).map(|i| {
+                format!(
+                    "{}. p{} — {} — 2026-09-01 (state · 3d) — 2 files",
+                    i,
+                    i,
+                    "/x/".repeat(120)
+                )
+            }))
+            .chain(std::iter::once(dossier::INSTRUCTION.to_string()))
+            .collect();
+        let (block, n) = build_dossier_block(&lines);
+        assert!(block.chars().count() <= BLOCK_MAX_CHARS);
+        assert!(n >= 1 && n < 5, "kept {} project lines", n);
+        assert!(block.contains("Topic dossier: 5 projects"));
+        assert!(block.contains(dossier::INSTRUCTION));
+        assert!(block.starts_with("<retrivio_leads>\n"));
+    }
+
+    /// The dossier gate reads the ranker rows before `collapse_series` runs, and recall asks
+    /// the ranker for `include_superseded: true` (marks, no downrank), so the older members of
+    /// a handoff series are folded out here: they never raise a project's breadth or become its
+    /// entry. Noise, a missing file and a missing or non-finite cosine are dropped as well.
+    #[test]
+    fn dossier_rows_fold_superseded_members_and_fail_closed() {
+        let dir = scratch("dossier-rows");
+        let project = dir.to_string_lossy().to_string();
+        let mk = |name: &str| {
+            let p = dir.join(name);
+            fs::write(&p, "x").unwrap();
+            p.to_string_lossy().to_string()
+        };
+        let head = dossier::test_row(&mk("HANDOFF-2026-09-10.md"), &project, 0.8, 0.50, "state");
+        let mut older =
+            dossier::test_row(&mk("HANDOFF-2026-08-28.md"), &project, 0.9, 0.62, "state");
+        older.superseded_by = Some(head.path.clone());
+        let mut dump = dossier::test_row(&mk("chat.txt"), &project, 0.7, 0.55, "knowledge");
+        dump.noise = true;
+        let nan = dossier::test_row(&mk("nan.md"), &project, 0.7, f64::NAN, "knowledge");
+        let mut none = dossier::test_row(&mk("none.md"), &project, 0.7, 0.0, "knowledge");
+        none.raw_similarity = None;
+        let missing = dossier::test_row(
+            &dir.join("missing.md").to_string_lossy(),
+            &project,
+            0.7,
+            0.6,
+            "knowledge",
+        );
+        let rows = vec![older, head.clone(), dump, nan, none, missing];
+        let kept = dossier_rows(&rows, &params(3), 0.30, true);
+        assert_eq!(
+            kept.iter().map(|r| r.path.as_str()).collect::<Vec<_>>(),
+            vec![head.path.as_str()]
+        );
+        assert!(
+            dossier_rows(&rows, &params(3), 0.30, false).is_empty(),
+            "lexical mode has no cosines: no breadth"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Exact ties on the revision date go to the higher score, then to the lexicographically
+    /// later path: the same order as file search (`mark_superseded`) and the chunk labels.
+    #[test]
+    fn series_head_ties_break_on_score_then_later_path() {
+        let a = cand(
+            "/r/p/docs/sessions/HANDOFF-draft.md",
+            "/r/p",
+            0.7,
+            "fresh",
+            2.0,
+        );
+        let b = cand(
+            "/r/p/docs/sessions/HANDOFF-final.md",
+            "/r/p",
+            0.6,
+            "fresh",
+            2.0,
+        );
+        assert_eq!(a.revision_date, b.revision_date, "undated names, same age");
+        let out = collapse_series(vec![b.clone(), a.clone()], false);
+        assert_eq!(
+            out.iter().find(|c| c.older_versions == 1).unwrap().path,
+            a.path,
+            "the higher score is the head"
+        );
+        let c = cand(
+            "/r/p/docs/sessions/HANDOFF-v2.md",
+            "/r/p",
+            0.6,
+            "fresh",
+            2.0,
+        );
+        let d = cand(
+            "/r/p/docs/sessions/HANDOFF-v3.md",
+            "/r/p",
+            0.6,
+            "fresh",
+            2.0,
+        );
+        let out = collapse_series(vec![d.clone(), c.clone()], false);
+        assert_eq!(
+            out.iter().find(|x| x.older_versions == 1).unwrap().path,
+            d.path,
+            "same score: the later path is the head"
+        );
+        assert_eq!(
+            out.iter()
+                .find(|x| x.path == c.path)
+                .unwrap()
+                .superseded_by
+                .as_deref(),
+            Some(d.path.as_str())
+        );
     }
 
     #[test]
@@ -3928,7 +5913,7 @@ mod tests {
     #[test]
     fn hook_input_parsing() {
         let json_in = r#"{"session_id":"s1","cwd":"/w","prompt":"hello","agent_id":"a9","hook_event_name":"UserPromptSubmit","extra":1}"#;
-        let parsed = parse_hook_input(json_in);
+        let parsed = parse_hook_input(json_in).unwrap();
         assert_eq!(
             parsed,
             HookInput {
@@ -3939,14 +5924,35 @@ mod tests {
                 hook_event_name: Some("UserPromptSubmit".into()),
             }
         );
-        let plain = parse_hook_input("  just a prompt\n");
+        let plain = parse_hook_input("  just a prompt\n").unwrap();
         assert_eq!(plain.prompt, "just a prompt");
         assert!(plain.session_id.is_none());
-        let broken = parse_hook_input("{not json");
-        assert_eq!(broken.prompt, "{not json");
-        let no_prompt = parse_hook_input(r#"{"session_id":"s"}"#);
+        // A broken envelope is an error, never a prompt: its fields (session ids, paths)
+        // must not be searched for.
+        assert!(parse_hook_input("{not json").is_err());
+        assert!(parse_hook_input(r#"{"prompt": "hello"#).is_err());
+        assert!(parse_hook_input("[1, 2]").is_ok(), "an array is plain text");
+        let no_prompt = parse_hook_input(r#"{"session_id":"s"}"#).unwrap();
         assert_eq!(no_prompt.prompt, "");
         assert_eq!(no_prompt.session_id.as_deref(), Some("s"));
+        // Stdin is capped: bytes past the cap are dropped and reported.
+        let big = vec![b'a'; 100];
+        let (text, truncated) = read_capped(&mut &big[..], 64);
+        assert_eq!(text.len(), 64);
+        assert!(truncated);
+        let (text, truncated) = read_capped(&mut &big[..], 100);
+        assert_eq!(text.len(), 100);
+        assert!(!truncated);
+        let bad = [0xffu8, 0xfe, b'h', b'i'];
+        let (text, truncated) = read_capped(&mut &bad[..], 1024);
+        assert!(text.ends_with("hi") && !truncated, "{:?}", text);
+        assert_eq!(join_tokens("", ""), "");
+        assert_eq!(join_tokens("dossier:no", ""), "dossier:no");
+        assert_eq!(join_tokens("", "stdin:truncated"), "stdin:truncated");
+        assert_eq!(
+            join_tokens("dossier:no", "stdin:truncated"),
+            "dossier:no stdin:truncated"
+        );
     }
 
     #[test]
@@ -4006,8 +6012,39 @@ mod tests {
         .unwrap();
         let st = load_state(&session_file(&state_dir, &hash));
         assert_eq!(st.shown, vec!["/r/a.md".to_string(), "/r/b.md".to_string()]);
-        assert_eq!(st.last_terms, vec!["orion".to_string()]); // secret-looking term dropped
+        // Terms are stored as salted hashes: the secret-looking term is dropped before
+        // hashing, the salt is created with the file and kept, and the hash is reproducible
+        // within the session (dedupe by equality) but not across sessions (other salt).
+        assert_eq!(st.salt.len(), 32, "{}", st.salt);
+        assert_eq!(st.term_hashes, vec![term_hash(&st.salt, "orion")]);
+        assert_ne!(
+            term_hash(&st.salt, "orion"),
+            term_hash("other-salt", "orion")
+        );
+        assert_eq!(term_hash(&st.salt, "Orion "), term_hash(&st.salt, "orion"));
         assert_eq!(st.updated_at, now + 1.0);
+        let raw = fs::read_to_string(session_file(&state_dir, &hash)).unwrap();
+        assert!(
+            !raw.contains("orion") && !raw.contains("bedrock") && !raw.contains("last_terms"),
+            "{}",
+            raw
+        );
+        // The salt survives later updates, so hashes stay comparable across turns.
+        update_session_state(&state_dir, &hash, &[], &["orion".to_string()], now + 1.5).unwrap();
+        let again = load_state(&session_file(&state_dir, &hash));
+        assert_eq!(again.salt, st.salt);
+        assert_eq!(again.term_hashes, st.term_hashes);
+        // A legacy file with `last_terms` loads without them.
+        let legacy = state_dir.join("legacy.json");
+        fs::write(
+            &legacy,
+            r#"{"shown":["/r/x.md"],"last_terms":["acme"],"updated_at":1.0}"#,
+        )
+        .unwrap();
+        let old = load_state(&legacy);
+        assert_eq!(old.shown, vec!["/r/x.md".to_string()]);
+        assert!(old.term_hashes.is_empty() && old.salt.is_empty());
+        fs::remove_file(&legacy).unwrap();
         assert!(!state_dir.join(format!("{}.lock", hash)).exists());
         #[cfg(unix)]
         {
@@ -4069,9 +6106,32 @@ mod tests {
         assert_eq!(iso_utc(1_758_292_800.0 + 59.0), "2025-09-19T14:40:59Z");
         assert_eq!(
             short_error("failed opening database: no such file"),
-            "error:failed_opening_database:_no_such_file"
+            "error:store"
         );
-        assert!(short_error("").starts_with("error:"));
+        assert_eq!(short_error(""), "error:other");
+        assert_eq!(
+            error_class("semantic path timed out after 3000ms"),
+            "timeout"
+        );
+        assert_eq!(
+            error_class("Bedrock request failed: HTTP 403 ExpiredTokenException"),
+            "auth"
+        );
+        assert_eq!(error_class("ollama connection refused"), "transport");
+        // A backend error that echoes request text never reaches the log or the breaker.
+        let echo = "Bedrock embedding failed: HTTP 500 InternalServerError - {\"message\":\"could not embed: acme pricing notes from the workshop\"} (request id abc)";
+        assert_eq!(short_error(echo), "error:http-5xx");
+        let dir2 = scratch("breaker-class");
+        let b = dir2.join("recall").join("embed-breaker");
+        trip_breaker(&b, error_class(echo));
+        let body = fs::read_to_string(&b).unwrap();
+        assert!(body.ends_with(" http-5xx\n"), "{}", body);
+        assert!(
+            !body.contains("acme") && !body.contains("workshop"),
+            "{}",
+            body
+        );
+        let _ = fs::remove_dir_all(&dir2);
         let dir = scratch("log");
         let log = dir.join("recall.log");
         append_log(&log, "one");

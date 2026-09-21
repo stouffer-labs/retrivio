@@ -589,6 +589,18 @@ pub fn age_days(now: f64, ts: f64) -> f64 {
 }
 
 /// `YYYY-MM-DD` in UTC for a unix timestamp.
+/// Canonical spelling of where a content date came from, as every result reports it in
+/// `date_basis`: `frontmatter` (a date in the file's front matter, read by recall for its
+/// short list), `path` (a `YYYYMMDD`/`YYYY-MM-DD`/`YYYYMM` component of the path) or `mtime`
+/// (the file's modification time). `date_source` keeps the older spelling (`path-date`).
+pub fn date_basis(date_source: &str) -> &'static str {
+    match date_source {
+        "frontmatter" => "frontmatter",
+        "path-date" | "path" => "path",
+        _ => "mtime",
+    }
+}
+
 pub fn format_ymd(ts: f64) -> String {
     let days = if ts.is_finite() {
         (ts / DAY_SECS).floor() as i64

@@ -13,6 +13,8 @@ Run API server: `retrivio api --host 127.0.0.1 --port 8765`
 | GET | `/health` | Health check |
 | GET | `/tracked` | List tracked roots |
 
+Read endpoints (`/search`, `/search/pick`, `/chunks/search`, `/chunks/related`, `/chunks/get`, `/chunks/feedback` (GET), `/docs/read`, `/context/pack`, `/graph/neighbors`, `/graph/view/*` except `state`) open SQLite read-only, so they never wait on the watcher's write transactions; the query-embedding cache write that a search may make waits at most 100 ms and is skipped when the database is busy.
+
 ### Search
 
 | Method | Endpoint | Description |
@@ -23,15 +25,16 @@ Run API server: `retrivio api --host 127.0.0.1 --port 8765`
 
 `retrivio search --json [--since <days>] [--include-superseded]` prints exactly the `/search` payload for the chosen view.
 
-#### Freshness, role and score fields (file, chunk and evidence results)
+#### Freshness, role and score fields (file, chunk, evidence and related-chunk results)
 
-Every file result, chunk result, evidence hit and `/context/pack` `chunks[]` entry carries:
+Every file result, chunk result, evidence hit, related chunk (`/chunks/related`, `get_related_chunks`, the `related[]` of a pack entry) and `/context/pack` `chunks[]` entry carries the same fields; the dossier's `entry` objects do too:
 
 | Field | Type | Meaning |
 |---|---|---|
 | `doc_mtime` | number | File modification time (unix seconds) recorded at index time (file/chunk results) |
 | `content_date` | number | Date used for ranking, unix seconds. State and knowledge: the newer of the path date (`YYYYMMDD`/`YYYYMM`/`YYYY-MM-DD` prefix on a path component) and `doc_mtime`. Records: the path date when there is one (the event), else `doc_mtime` |
-| `date_source` | string | `path-date` or `mtime` |
+| `date_source` | string | `path-date`, `mtime` or `frontmatter` (recall's short list only); the older spelling |
+| `date_basis` | string | `path`, `mtime` or `frontmatter`: the canonical spelling of where the content date came from |
 | `age_days` | number | `now - content_date` in days, never negative |
 | `freshness_tier` | string | `fresh` (< 14 d), `aging` (14–35 d), then `stale` (knowledge) or `verify` (state) over 35 d; `record` for records at any age |
 | `role` | string | `state` (handoffs, status briefs, plans), `knowledge` (specs, notes, code, documents) or `record` (transcripts, call and meeting notes, customer signals), decided from the path relative to the project and, for `.txt`, the text shape; see the README "Roles and supersession" |
@@ -39,7 +42,8 @@ Every file result, chunk result, evidence hit and `/context/pack` `chunks[]` ent
 | `is_record` | bool | Compatibility alias: `role == "record"` |
 | `noise` | bool | True for machine artefacts (chat dumps, `.jsonl`/`.log`, lockfiles, minified code); their `quality` is low (file and chunk results) |
 | `raw_similarity` | number or null | Cosine similarity between the query and the result's best chunk, in [-1, 1]; the honest absolute number that `recall_min_abs_score` and `search_min_abs_score` compare against. `null` only in lexical-only retrieval (recall's fallback) |
-| `superseded_by` | string or null | File results only. For a `state` file, the path of the newest file of the same series (project, parent directory, normalised stem; newest by the date in the path, else the last edit) when this one is not it; such results are downranked unless `include_superseded` is set or the query asks for history explicitly (see README "Roles and supersession") |
+| `superseded_by` | string or null | For a `state` file, the path of the newest file of the same series (project, parent directory, normalised stem; newest by the date in the path, else the last edit) when this one is not it. File results are downranked for it (x 0.85) unless `include_superseded` is set or the query asks for history explicitly (see README "Roles and supersession"); chunk results only carry the label (the head is computed among the files of the result set by the same rule) and are never downranked; evidence hits report `null` |
+| `why` | string | The signals behind the score, `+`-joined and deterministic: `semantic:<cosine>` (found by the vector search) or `cosine:<c>` (keyword/path hit with the cosine backfilled), `lexical:<0..1>`, `graph:<seed\|same_project\|related_project>`, `path`, `recency:<fresh\|aging>`, `role`, `path-penalty`, `summary-page` (a file named after another project, ranked x0.85), `noise`, `superseded`. Empty only when no signal fired |
 
 `score` and `semantic` stay relative: `semantic` is min-max normalised over the query's vector hits (the best hit is 1.0) and `score` is the fused, recency-blended value. Compare them between results of one query, never with a floor.
 
@@ -50,7 +54,7 @@ Project results (`view=projects`, `search_projects`) carry `recency`: the releva
 | Method | Endpoint | Description |
 |---|---|---|
 | GET | `/chunks/search?q=<query>&limit=<n>&since_days=<n>` | Search chunks (`since_days` optional, same semantics as `/search`) |
-| GET | `/chunks/related?chunk_id=<id>&limit=<n>` | Related chunks |
+| GET | `/chunks/related?chunk_id=<id>&limit=<n>` | Related chunks (one plain ranker pass over the source chunk's text, no HyDE or reranker; results carry the freshness, role and score fields) |
 | GET | `/chunks/get?chunk_id=<id>&max_chars=<n>` | Read a chunk |
 | GET | `/chunks/feedback?chunk_id=<id>&decision=<d>&quality=<q>&limit=<n>` | List relation feedback |
 | POST | `/chunks/feedback/suppress` | Suppress relation (`source_chunk_id`, `target_chunk_id`, `relation`, `note?`) |
@@ -61,7 +65,7 @@ Project results (`view=projects`, `search_projects`) carry `recency`: the releva
 
 | Method | Endpoint | Description |
 |---|---|---|
-| GET | `/context/pack?q=<query>&budget_chars=<n>&seed_limit=<n>&related_per_seed=<n>&include_docs=0\|1&doc_max_chars=<n>` | Pack context (GET) |
+| GET | `/context/pack?q=<query>&budget_chars=<n>&seed_limit=<n>&related_per_seed=<n>&include_docs=0\|1&doc_max_chars=<n>` | Pack context (GET). One ranker pass: seeds and their related chunks come from the same pool (see the README "Context Packing") |
 | POST | `/context/pack` | Pack context (JSON body: `query`, `budget_chars`, `seed_limit`, `related_per_seed`, `include_docs`, `doc_max_chars`) |
 
 ### Documents
@@ -105,9 +109,24 @@ Project results (`view=projects`, `search_projects`) carry `recency`: the releva
 | `lance_repaired`, `lance_orphans_removed` | LanceDB rows rebuilt from SQLite vectors and LanceDB rows without a SQLite vector removed by the repair step |
 | `graph_edges`, `retrieval_backend`, `retrieval_synced_chunks`, `retrieval_error`, `vector_failures`, `tracked_roots` | Project graph edges rebuilt, backend name, LanceDB row count, last sync error if any, embedding failures, roots covered |
 
-Chunk payloads include a stable `schema` field (`chunk-search-v2`, `chunk-related-v1`, `chunk-get-v1`, `doc-read-v1`) for contract-safe consumers. `chunk-search-v2` added the freshness fields (`doc_mtime`, `content_date`, `date_source`, `age_days`, `freshness_tier`, `is_record`) to every result; version 0.2.0 adds `role`, `verify`, `noise` and `raw_similarity` under the same schema name (additive keys); `chunk-search-v1` consumers only need to ignore the extra keys.
+Chunk payloads include a stable `schema` field (`chunk-search-v2`, `chunk-related-v1`, `chunk-get-v1`, `doc-read-v1`, `topic-dossier-v1`) for contract-safe consumers. `chunk-search-v2` added the freshness fields (`doc_mtime`, `content_date`, `date_source`, `age_days`, `freshness_tier`, `is_record`) to every result; version 0.2.0 added `role`, `verify`, `noise` and `raw_similarity`; version 0.2.1 adds `date_basis`, `why` and (on chunk results) `superseded_by`, and gives `chunk-related-v1` results the full freshness, role and score field set; all under the same schema names (additive keys). Older consumers only need to ignore the extra keys.
 
-The MCP tools `search_files` and `search_chunks` accept the same optional `since_days` argument, `search_files` also accepts `include_superseded` (boolean), and `search_files` / `search_chunks` / `pack_context` return the same freshness, role and score fields as the HTTP endpoints.
+The MCP tools `search_files` and `search_chunks` accept the same optional `since_days` argument, `search_files` also accepts `include_superseded` (boolean), and `search_files` / `search_chunks` / `get_related_chunks` / `pack_context` return the same freshness, role and score fields as the HTTP endpoints.
+
+#### Topic dossier (`retrivio dossier --json`, MCP `topic_dossier`)
+
+Arguments: `topic` (string, required), `limit` (1–8, default 6). One fused file-level retrieval pass (60 files) grouped by project; see the README "Topic dossier" for the rules. Payload `topic-dossier-v1`:
+
+| Field | Meaning |
+|---|---|
+| `topic`, `count`, `candidates` | The topic, projects returned, files the dossier was built from (above the floor, machine artefacts and superseded handoffs dropped, at most 12 per project and 60 in all) |
+| `floor`, `weak_below` | Cosine floor applied to the files (`search_min_abs_score` when set, else 0.30) and the recall floor under which a project is flagged `weak` |
+| `projects[]` | `project_path`, `name`, `score` (entry score with the breadth credit), `evidence_count` (distinct files; copies and superseded handoffs folded), `evidence_date` / `evidence_date_ymd` (newest content date), `best_cosine`, `weak`, `matched` (topic words found in the entry's path or excerpt), `reason` (one line: files, matches, `why`, weak), `entry` (the best file: `path`, `role`, `content_date`, `content_date_ymd`, `date_source`, `date_basis`, `age_days`, `freshness_tier`, `verify`, `noise`, `superseded_by`, `raw_similarity`, `why`, `excerpt`) |
+| `related_projects[]` | `project_path`, `name`, `weight` (raw edge weight), `kind` (`embedding_similarity` first, then `imports_from`, then `semantic_related`), `via` (the dossier project it neighbours) |
+| `instruction` | The closing sentence telling the agent to use `search_files` / `pack_context` for depth |
+| `timing_ms` | Ranking and grouping time inside the process |
+
+There is no HTTP endpoint for the dossier in this version; the CLI and the MCP tool share the same builder.
 
 ## API / Daemon Env Vars
 

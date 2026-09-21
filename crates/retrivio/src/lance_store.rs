@@ -306,10 +306,11 @@ pub struct OptimizeReport {
 /// younger than 7 days may belong to another process's in-flight write and is left alone.
 ///
 /// Versions younger than `keep_versions_younger_than_secs` are retained (the
-/// `lance_version_grace_secs` key, default 120 s): a reader that opened an older snapshot
+/// `lance_version_grace_secs` key, default 900 s): a reader that opened an older snapshot
 /// (every Retrivio process opens the table with strong read consistency, so that is at most
-/// one operation old) can finish its query before the files it references go away. The recall
-/// hook's whole run is bounded by a 4 s deadline, so the default leaves a wide margin; `0`
+/// one operation old) can finish its query before the files it references go away; a reader
+/// that outlives the grace fails its scan (see the pinned-reader test). The recall hook's
+/// whole run is bounded by a 4 s deadline, so the default leaves a wide margin; `0`
 /// drops every old version at once.
 pub fn optimize(
     store: &LanceStore,
@@ -351,13 +352,82 @@ pub fn optimize(
     })
 }
 
+/// Drop every dataset version older than `older_than_secs` (never the latest) together with
+/// the data files only those versions reference: the prune half of [`optimize`] on its own,
+/// without rewriting any fragment. Cheap enough to run after every watcher sweep. The same
+/// reader-safety argument as [`optimize`] applies (versions inside the grace window stay).
+pub fn prune_versions(store: &LanceStore, older_than_secs: u64) -> Result<OptimizeReport, String> {
+    use lancedb::table::{Duration as LanceDuration, OptimizeAction};
+    runtime().block_on(async {
+        let mut report = OptimizeReport::default();
+        let pruned = store
+            .table
+            .optimize(OptimizeAction::Prune {
+                older_than: Some(LanceDuration::seconds(
+                    older_than_secs.min(i64::MAX as u64) as i64
+                )),
+                delete_unverified: Some(false),
+                error_if_tagged_old_versions: Some(false),
+            })
+            .await
+            .map_err(|e| format!("LanceDB version prune failed: {}", e))?;
+        if let Some(p) = pruned.prune {
+            report.old_versions = p.old_versions;
+            report.bytes_removed = p.bytes_removed;
+        }
+        Ok(report)
+    })
+}
+
 /// Number of dataset versions the `chunks` table keeps on disk (files under
 /// `chunks.lance/_versions`); 0 when the store does not exist. Every write commits one more
-/// version until [`optimize`] drops the old ones, so this is the compaction trigger.
+/// version until [`optimize`] or [`prune_versions`] drops the old ones.
 pub fn version_count(lance_dir: &Path) -> usize {
     std::fs::read_dir(lance_dir.join("chunks.lance").join("_versions"))
         .map(|rd| rd.flatten().count())
         .unwrap_or(0)
+}
+
+/// Number of data files (fragments) under `chunks.lance/data`, live or dead; 0 when the store
+/// does not exist. Every write adds at least one; a vector search opens every live one.
+pub fn fragment_count(lance_dir: &Path) -> usize {
+    std::fs::read_dir(lance_dir.join("chunks.lance").join("data"))
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| e.path().extension().map(|x| x == "lance").unwrap_or(false))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// Versions other than the newest whose manifest is older than `grace_secs`: the ones
+/// [`prune_versions`] would drop now. Manifest files are named `u64::MAX - version`, all
+/// twenty digits, so the smallest name is the newest version.
+pub fn stale_version_count(lance_dir: &Path, grace_secs: u64) -> usize {
+    let Ok(rd) = std::fs::read_dir(lance_dir.join("chunks.lance").join("_versions")) else {
+        return 0;
+    };
+    let mut manifests: Vec<(String, std::time::SystemTime)> = rd
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            if !name.ends_with(".manifest") {
+                return None;
+            }
+            let modified = e.metadata().ok()?.modified().ok()?;
+            Some((name, modified))
+        })
+        .collect();
+    if manifests.len() < 2 {
+        return 0;
+    }
+    manifests.sort_by(|a, b| a.0.cmp(&b.0));
+    let grace = std::time::Duration::from_secs(grace_secs);
+    manifests
+        .iter()
+        .skip(1)
+        .filter(|(_, modified)| modified.elapsed().map(|age| age > grace).unwrap_or(false))
+        .count()
 }
 
 /// Bytes used by every regular file under `path` (0 when it does not exist). Symlinks are
@@ -572,6 +642,106 @@ mod tests {
         (0..dim)
             .map(|k| ((id as f32) * 0.37 + (k as f32) * 0.11).sin())
             .collect()
+    }
+
+    #[test]
+    fn prune_versions_drops_aged_versions_and_their_fragments_without_compacting() {
+        let dir = temp_lance_dir("prune");
+        let mut store = open(&dir, 8).expect("open");
+        for id in 1..=4i64 {
+            upsert_chunks(&mut store, &[(id, vec_for(id, 8))]).unwrap();
+        }
+        let versions = version_count(&dir);
+        assert!(versions >= 4, "one version per write, got {}", versions);
+        let fragments = fragment_count(&dir);
+        assert!(fragments >= 4, "one fragment per write, got {}", fragments);
+        // Nothing is older than a day; a one-day grace keeps everything.
+        assert_eq!(stale_version_count(&dir, 86_400), 0);
+        let kept = prune_versions(&store, 86_400).expect("prune with grace");
+        assert_eq!(kept.old_versions, 0);
+        assert_eq!(version_count(&dir), versions);
+        // With no grace every old version goes; live fragments stay (no compaction ran),
+        // so the count of data files does not exceed what it was and the rows are intact.
+        assert_eq!(stale_version_count(&dir, 0), versions - 1);
+        let dropped = prune_versions(&store, 0).expect("prune");
+        assert_eq!(dropped.old_versions as usize, versions - 1);
+        assert_eq!(version_count(&dir), 1);
+        assert!(fragment_count(&dir) <= fragments);
+        assert_eq!(stale_version_count(&dir, 0), 0);
+        let hits = search_vectors(&store, &vec_for(3, 8), 4).expect("search");
+        assert_eq!(hits.len(), 4);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A handle opened without the read-consistency interval stays on the version it opened
+    /// (LanceDB's default): the stand-in for a reader in another process that is midway
+    /// through a search while the watcher prunes.
+    fn open_pinned(path: &Path, dim: usize) -> LanceStore {
+        runtime().block_on(async {
+            let db = connect(path.to_string_lossy().as_ref())
+                .execute()
+                .await
+                .expect("connect pinned");
+            let table = db
+                .open_table("chunks")
+                .execute()
+                .await
+                .expect("open pinned");
+            LanceStore { table, dim }
+        })
+    }
+
+    /// The reader-safety contract behind `lance_version_grace_secs`: a reader holding an old
+    /// snapshot keeps working across a prune that respects the grace (its version and data
+    /// files stay), and the test records what happens when the grace is zero and the
+    /// snapshot's files are removed under it.
+    #[test]
+    fn a_reader_on_an_old_snapshot_survives_a_prune_inside_the_grace() {
+        let dir = temp_lance_dir("pinned-reader");
+        let dim = 8;
+        let mut writer = open(&dir, dim).expect("open writer");
+        for id in 1..=4i64 {
+            upsert_chunks(&mut writer, &[(id, vec_for(id, dim))]).unwrap();
+        }
+        let pinned = open_pinned(&dir, dim);
+        assert_eq!(count(&pinned).unwrap(), 4);
+        let versions_at_pin = version_count(&dir);
+
+        // The writer moves on: a delete and an insert, two more versions.
+        delete_chunks(&mut writer, &[1]).unwrap();
+        upsert_chunks(&mut writer, &[(5, vec_for(5, dim))]).unwrap();
+        assert!(version_count(&dir) > versions_at_pin);
+        // The pinned reader still sees its snapshot: 4 rows, id 1 present, id 5 absent.
+        let hits = search_vectors(&pinned, &vec_for(1, dim), 4).expect("pinned search");
+        assert_eq!(hits.len(), 4);
+        assert!(hits.contains_key(&1) && !hits.contains_key(&5));
+
+        // A prune inside the grace (every version is seconds old): nothing is dropped, the
+        // pinned reader is untouched. This is the watcher's sweep with the default grace.
+        let kept = prune_versions(&writer, 900).expect("prune with grace");
+        assert_eq!(kept.old_versions, 0);
+        let hits = search_vectors(&pinned, &vec_for(2, dim), 4).expect("search after prune");
+        assert_eq!(hits.len(), 4);
+
+        // Compaction plus a zero grace removes every old version and the data files only
+        // they referenced, under the pinned reader, whose next scan fails with a missing data
+        // file (measured with lancedb 0.26 / lance 2.0: "Object at location .../data/....lance
+        // not found"). LanceDB gives a reader no lease on an old version, so the grace period
+        // is the only protection and a reader must finish within it: the recall hook's whole
+        // run is under 4 s, a search or MCP call is one operation, and the default grace is
+        // 900 s. Should a future LanceDB protect old snapshots, this assertion is the one to
+        // relax, together with the README's "keeps versions younger than" sentence.
+        let dropped = optimize(&writer, 0).expect("compact and prune");
+        assert!(dropped.old_versions >= 1, "{:?}", dropped.old_versions);
+        let after = search_vectors(&pinned, &vec_for(2, dim), 4);
+        let err = after.expect_err("a snapshot whose data files were pruned cannot be read");
+        assert!(err.contains("not found"), "{}", err);
+        // A fresh handle sees the compacted table whole.
+        let fresh = open(&dir, dim).expect("reopen");
+        assert_eq!(count(&fresh).unwrap(), 4);
+        let hits = search_vectors(&fresh, &vec_for(5, dim), 4).unwrap();
+        assert!(hits.contains_key(&5) && !hits.contains_key(&1));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

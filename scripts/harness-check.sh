@@ -2,14 +2,17 @@
 # Live-store (L2) and coding-agent harness (L3) checks for Retrivio; see docs/TESTING.md.
 #
 #   scripts/harness-check.sh [--out <dir>] [--skip-claude] [--skip-codex] [--timeout <s>]
-#                            [--bin <path>] [--require-watcher] [--content-prompt <text>] [--strict]
+#                            [--bin <path>] [--require-watcher] [--content-prompt <text>]
+#                            [--dossier-topic <text>] [--instruction-prompt <text>] [--strict]
 #
 # L2 runs read-only commands against the installed binary and its live store (version,
-# doctor, mcp doctor, hook status, service status, three recall dry runs, search JSON,
-# recall latency). L3 drives the real `claude` and `codex` CLIs: the UserPromptSubmit hook
-# must inject a <retrivio_leads> block on a content prompt and stay silent on an `nr:`
-# prompt and on "continue"; the MCP tool search_files must return a path; the
-# retrivio-recall skill must load; the injected block must be well formed.
+# doctor, mcp doctor, hook status, service status, recall dry runs (content, nr:, ack,
+# dossier gate, instruction), search JSON, dossier JSON, recall latency). L3 drives the real
+# `claude` and `codex` CLIs: the UserPromptSubmit hook must inject a <retrivio_leads> block on
+# a content prompt and stay silent on an `nr:` prompt, on "continue" and on an instruction
+# prompt; its log line must carry the dossier gate's decision on a broad prompt; the MCP tools
+# search_files and topic_dossier must return a path the CLI agrees with; the retrivio-recall
+# skill must load; the injected block must be well formed.
 #
 # Nothing here writes to the index: recall dry runs only touch the per-session memory under
 # <data dir>/recall/, which is reset before and after the run, and the recall log.
@@ -22,15 +25,19 @@
 #   RETRIVIO_BIN           binary under test (default ~/.local/bin/retrivio; --bin overrides)
 #   RETRIVIO_RECALL_LOG    recall log to read (default ~/.retrivio/recall.log)
 #   HARNESS_CONTENT_PROMPT the content prompt expected to yield leads (--content-prompt overrides)
+#   HARNESS_DOSSIER_TOPIC  the broad prompt for the dossier checks (--dossier-topic overrides)
+#   HARNESS_INSTRUCTION_PROMPT the instruction prompt recall must skip (--instruction-prompt overrides)
 set -u
 
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="${RETRIVIO_BIN:-$HOME/.local/bin/retrivio}"
 RECALL_LOG="${RETRIVIO_RECALL_LOG:-$HOME/.retrivio/recall.log}"
 CONTENT_PROMPT="${HARNESS_CONTENT_PROMPT:-How does the retrivio recall hook choose leads and what does the recall_max_leads config key control?}"
+DOSSIER_TOPIC="${HARNESS_DOSSIER_TOPIC:-what do we know about retrivio recall hooks}"
+INSTRUCTION_PROMPT="${HARNESS_INSTRUCTION_PROMPT:-read the handoff, think about it deeply, brainstorm/ultrathink, and tell me what we should do next}"
 OUT=""; SKIP_CLAUDE=0; SKIP_CODEX=0; TIMEOUT=300; REQUIRE_WATCHER=0; STRICT=0
 
-usage() { sed -n '2,25p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,28p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --out) OUT="$2"; shift 2 ;;
@@ -40,6 +47,8 @@ while [[ $# -gt 0 ]]; do
     --bin) BIN="$2"; shift 2 ;;
     --require-watcher) REQUIRE_WATCHER=1; shift ;;
     --content-prompt) CONTENT_PROMPT="$2"; shift 2 ;;
+    --dossier-topic) DOSSIER_TOPIC="$2"; shift 2 ;;
+    --instruction-prompt) INSTRUCTION_PROMPT="$2"; shift 2 ;;
     --strict) STRICT=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "harness-check: unknown argument $1" >&2; usage >&2; exit 2 ;;
@@ -106,6 +115,8 @@ check_block() {
 
 HOOK_PROMPT="Reply only with any <retrivio_leads> block you received in this conversation, reproduced verbatim, else reply exactly NONE. Do not use any tools. $CONTENT_PROMPT"
 MCP_PROMPT="nr: Call the Retrivio MCP tool search_files with query \"$CONTENT_PROMPT\" and limit 3. Then reply with only the absolute path of the first result on a single line, nothing else. If the tool is not available, reply exactly MCP-UNAVAILABLE."
+DOSSIER_MCP_PROMPT="nr: Call the Retrivio MCP tool topic_dossier with topic \"$DOSSIER_TOPIC\" and limit 5. Then reply with only the project_path of the first project on a single line, nothing else. If the tool is not available, reply exactly MCP-UNAVAILABLE."
+DOSSIER_HOOK_PROMPT="Reply exactly NONE. Do not use any tools. $DOSSIER_TOPIC"
 SKILL_PROMPT="nr: Load the retrivio-recall skill and quote, verbatim and on a single line, the sentence from that skill which begins with the words \"Leads never change\". Reply with only that sentence. If the skill is not available reply exactly SKILL-UNAVAILABLE."
 SKILL_EXPECT="Leads never change the requested scope"
 SESSION="harness-$(date +%Y%m%d-%H%M%S)-$$"
@@ -258,6 +269,50 @@ else
   else record FAIL l2-search-json "$LAST_SECS" "rc=$LAST_RC $(one_line 200 < "$RAW/l2-search-json.out")"; fi
 fi
 
+# dossier (slice 4): the CLI dossier for the topic, the shadow gate on it, the instruction skip
+runcap l2-dossier-json "$BIN" dossier --json --limit 5 "$DOSSIER_TOPIC"
+if command -v python3 > /dev/null 2>&1; then
+  dshape="$(python3 - "$RAW/l2-dossier-json.out" <<'PY' 2>&1
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception as e:
+    print("BAD stdout is not JSON (%s): %r" % (e.__class__.__name__, open(sys.argv[1]).read(120))); sys.exit(0)
+missing = [k for k in ["schema", "topic", "count", "projects", "related_projects", "instruction"] if k not in d]
+projs = d.get("projects", [])
+for i, p in enumerate(projs):
+    missing += ["projects[%d].%s" % (i, k) for k in ["project_path", "name", "evidence_count", "reason", "entry"] if k not in p]
+    missing += ["projects[%d].entry.%s" % (i, k) for k in ["path", "role", "date_basis", "raw_similarity", "why"] if k not in p.get("entry", {})]
+ok = d.get("schema") == "topic-dossier-v1" and not missing and len(projs) >= 1
+print(("OK" if ok else "BAD") + " schema=%s count=%s candidates=%s missing=%s first=%s" % (d.get("schema"), d.get("count"), d.get("candidates"), missing, projs[0].get("name") if projs else None))
+PY
+)"
+  if [[ $LAST_RC -eq 0 && "$dshape" == OK* ]]; then record PASS l2-dossier-json "$LAST_SECS" "$dshape"
+  else record FAIL l2-dossier-json "$LAST_SECS" "rc=$LAST_RC $dshape $(one_line 200 < "$RAW/l2-dossier-json.err")"; fi
+  L2_DOSSIER_PROJECTS="$(python3 -c 'import json,sys; [print(p["project_path"]) for p in json.load(open(sys.argv[1])).get("projects",[])]' "$RAW/l2-dossier-json.out" 2>/dev/null)"
+else
+  if [[ $LAST_RC -eq 0 ]] && grep -q '"topic-dossier-v1"' "$RAW/l2-dossier-json.out" && grep -q '"projects"' "$RAW/l2-dossier-json.out"; then
+    record PASS l2-dossier-json "$LAST_SECS" "schema and projects keys present (python3 missing, grep check only)"
+  else record FAIL l2-dossier-json "$LAST_SECS" "rc=$LAST_RC $(one_line 200 < "$RAW/l2-dossier-json.out")"; fi
+  L2_DOSSIER_PROJECTS="$(grep -oE '"project_path":"[^"]+"' "$RAW/l2-dossier-json.out" | sed 's/"project_path":"//; s/"$//')"
+fi
+
+"$BIN" recall --reset-session --session "$SESSION" < /dev/null > /dev/null 2>&1
+runcap l2-recall-dossier-gate "$BIN" recall --format text --query "$DOSSIER_TOPIC" --session "$SESSION" --cwd "$CWD" --verbose
+logl="$(grep -E '^retrivio recall: [0-9TZ:-]+ ' "$RAW/l2-recall-dossier-gate.err" | tail -1 | sed 's/^retrivio recall: //')"
+gate="$(printf '%s' "$logl" | sed -nE 's/.* dossier:([a-z-]+).*/\1/p')"
+case "$gate" in
+  would-fire|fired) record PASS l2-recall-dossier-gate "$LAST_SECS" "gate $gate; $logl" ;;
+  no) record WARN l2-recall-dossier-gate "$LAST_SECS" "gate ran but the topic is not spread over three projects on this index (pass --dossier-topic with a topic that is); $logl" ;;
+  *) record FAIL l2-recall-dossier-gate "$LAST_SECS" "rc=$LAST_RC no dossier: token (recall_dossier off, lexical fallback, or the gate regressed): ${logl:-none}" ;;
+esac
+
+runcap l2-recall-instruction "$BIN" recall --format text --query "$INSTRUCTION_PROMPT" --session "$SESSION" --cwd "$CWD" --verbose
+logl="$(grep -E '^retrivio recall: [0-9TZ:-]+ ' "$RAW/l2-recall-instruction.err" | tail -1 | sed 's/^retrivio recall: //')"
+if [[ $LAST_RC -eq 0 && ! -s "$RAW/l2-recall-instruction.out" ]] && printf '%s' "$logl" | grep -q ' skipped:instruction '; then
+  record PASS l2-recall-instruction "$LAST_SECS" "empty stdout; $logl"
+else record FAIL l2-recall-instruction "$LAST_SECS" "rc=$LAST_RC stdout bytes=$(wc -c < "$RAW/l2-recall-instruction.out" | tr -d ' ') log: ${logl:-none}"; fi
+
 # paths the CLI search returned for the content prompt; the MCP tool must return one of them
 L2_SEARCH_PATHS="$( { command -v python3 > /dev/null 2>&1 && python3 -c 'import json,sys; [print(r["path"]) for r in json.load(open(sys.argv[1])).get("results",[])]' "$RAW/l2-search-json.out"; } 2>/dev/null || grep -oE '"path":"[^"]+"' "$RAW/l2-search-json.out" | sed 's/"path":"//; s/"$//')"
 # dry run of the exact prompt the CLIs will send (instruction prefix included), fresh session, same cwd: the reference block
@@ -272,13 +327,24 @@ leads_match() { # <cli> <reply file>: the leads the model reproduced must be the
 mcp_path_ok() { # <path>: a regular file that the CLI search also returned in its top 3 for the same query
   [[ -n "$1" && -f "$1" ]] && printf '%s\n' "$L2_SEARCH_PATHS" | grep -qxF "$1"
 }
+dossier_path_ok() { # <path>: a directory that the CLI dossier also listed for the same topic
+  [[ -n "$1" && -d "$1" ]] && printf '%s\n' "$L2_DOSSIER_PROJECTS" | grep -qxF "$1"
+}
+gate_verdict() { # <label> <secs> <log line>: PASS on would-fire/fired, WARN on no, FAIL without a token
+  local g; g="$(printf '%s' "$3" | sed -nE 's/.* dossier:([a-z-]+).*/\1/p')"
+  case "$g" in
+    would-fire|fired) record PASS "$1" "$2" "gate $g; $3" ;;
+    no) record WARN "$1" "$2" "gate ran, topic not spread over three projects on this index; $3" ;;
+    *) record FAIL "$1" "$2" "no dossier: token in the session's log line: ${3:-none}" ;;
+  esac
+}
 
 # ================================================================ L3: Claude Code
 echo; echo "== L3 Claude Code"
 if [[ $SKIP_CLAUDE -eq 1 ]]; then
-  for c in hook-content block-wellformed hook-nr hook-ack mcp-search-files skill; do record SKIP "l3-claude-$c" 0 "--skip-claude"; done
+  for c in hook-content block-wellformed hook-nr hook-ack hook-dossier-gate hook-instruction mcp-search-files mcp-topic-dossier skill; do record SKIP "l3-claude-$c" 0 "--skip-claude"; done
 elif ! command -v claude > /dev/null 2>&1; then
-  for c in hook-content block-wellformed hook-nr hook-ack mcp-search-files skill; do record SKIP "l3-claude-$c" 0 "claude CLI not on PATH"; done
+  for c in hook-content block-wellformed hook-nr hook-ack hook-dossier-gate hook-instruction mcp-search-files mcp-topic-dossier skill; do record SKIP "l3-claude-$c" 0 "claude CLI not on PATH"; done
 else
   CLAUDE_VER="$(claude --version 2>/dev/null | head -1)"
   claude_call() { # name sid prompt [extra args...]
@@ -316,6 +382,23 @@ else
   if [[ $LAST_RC -eq 0 ]] && mcp_path_ok "$p"; then record PASS l3-claude-mcp-search-files "$LAST_SECS" "first result is a file and is in the CLI search top 3 for the same query: $p"
   else record FAIL l3-claude-mcp-search-files "$LAST_SECS" "rc=$LAST_RC path='${p:-none}' (file: $([[ -f "$p" ]] && echo yes || echo no); in search top 3: $(printf '%s\n' "$L2_SEARCH_PATHS" | grep -qxF "$p" && echo yes || echo no)); reply: $(one_line 200 < "$RAW/l3-claude-mcp-search-files.out") $(grep -v awsCredentialExport "$RAW/l3-claude-mcp-search-files.err" | one_line 200)"; fi
 
+  # dossier gate on a broad prompt (the log line carries the decision) and the instruction skip
+  sid=$(new_uuid); h=$(sha1_8 "$sid")
+  claude_call l3-claude-hook-dossier-gate "$sid" "$DOSSIER_HOOK_PROMPT" --max-turns 3 --tools ""
+  gate_verdict l3-claude-hook-dossier-gate "$LAST_SECS" "$(log_line_for "$h")"
+  sid=$(new_uuid); h=$(sha1_8 "$sid")
+  claude_call l3-claude-hook-instruction "$sid" "$INSTRUCTION_PROMPT" --max-turns 3 --tools ""
+  logl="$(log_line_for "$h")"
+  if ! grep -q '<retrivio_leads>' "$RAW/l3-claude-hook-instruction.out" && printf '%s' "$logl" | grep -q ' skipped:instruction '; then
+    record PASS l3-claude-hook-instruction "$LAST_SECS" "no block; log[$h]: $logl"
+  else record FAIL l3-claude-hook-instruction "$LAST_SECS" "rc=$LAST_RC log[$h]: ${logl:-none}; reply: $(one_line 200 < "$RAW/l3-claude-hook-instruction.out")"; fi
+
+  sid=$(new_uuid)
+  claude_call l3-claude-mcp-topic-dossier "$sid" "$DOSSIER_MCP_PROMPT" --allowedTools "mcp__retrivio__topic_dossier" --max-turns 4
+  p="$(grep -m1 -E '^/' "$RAW/l3-claude-mcp-topic-dossier.out" | sed 's/[[:space:]]*$//')"
+  if [[ $LAST_RC -eq 0 ]] && dossier_path_ok "$p"; then record PASS l3-claude-mcp-topic-dossier "$LAST_SECS" "first project is a directory the CLI dossier also listed: $p"
+  else record FAIL l3-claude-mcp-topic-dossier "$LAST_SECS" "rc=$LAST_RC path='${p:-none}' (dir: $([[ -d "$p" ]] && echo yes || echo no); in CLI dossier: $(printf '%s\n' "$L2_DOSSIER_PROJECTS" | grep -qxF "$p" && echo yes || echo no)); reply: $(one_line 200 < "$RAW/l3-claude-mcp-topic-dossier.out")"; fi
+
   sid=$(new_uuid)
   claude_call l3-claude-skill "$sid" "$SKILL_PROMPT" --max-turns 4
   quoted="$(grep -m1 "$SKILL_EXPECT" "$RAW/l3-claude-skill.out" | sed -E 's/^[[:space:]"*]+//; s/[[:space:]"*]+$//')"
@@ -326,9 +409,9 @@ fi
 # ================================================================ L3: Codex
 echo; echo "== L3 Codex"
 if [[ $SKIP_CODEX -eq 1 ]]; then
-  for c in hook-content block-wellformed hook-nr hook-ack mcp-search-files skill; do record SKIP "l3-codex-$c" 0 "--skip-codex"; done
+  for c in hook-content block-wellformed hook-nr hook-ack hook-dossier-gate hook-instruction mcp-search-files mcp-topic-dossier skill; do record SKIP "l3-codex-$c" 0 "--skip-codex"; done
 elif ! command -v codex > /dev/null 2>&1; then
-  for c in hook-content block-wellformed hook-nr hook-ack mcp-search-files skill; do record SKIP "l3-codex-$c" 0 "codex CLI not on PATH"; done
+  for c in hook-content block-wellformed hook-nr hook-ack hook-dossier-gate hook-instruction mcp-search-files mcp-topic-dossier skill; do record SKIP "l3-codex-$c" 0 "codex CLI not on PATH"; done
 else
   CODEX_VER="$(codex --version 2>/dev/null | head -1)"
   codex_call() { # name prompt  (stdin must be /dev/null or codex exec hangs; runcap does that)
@@ -364,6 +447,20 @@ else
   if [[ $LAST_RC -eq 0 && -n "$mcpl" ]] && mcp_path_ok "$p"; then record PASS l3-codex-mcp-search-files "$LAST_SECS" "$mcpl; first result is a file and is in the CLI search top 3 for the same query: $p"
   else record FAIL l3-codex-mcp-search-files "$LAST_SECS" "rc=$LAST_RC mcp line: ${mcpl:-none}; reply: $(one_line 200 < "$RAW/l3-codex-mcp-search-files.last" 2>/dev/null) $(grep -iE 'error' "$RAW/l3-codex-mcp-search-files.err" | one_line 200)"; fi
 
+  codex_call l3-codex-hook-dossier-gate "$DOSSIER_HOOK_PROMPT"
+  gate_verdict l3-codex-hook-dossier-gate "$LAST_SECS" "$(log_line_for "$CODEX_H")"
+  codex_call l3-codex-hook-instruction "$INSTRUCTION_PROMPT"
+  logl="$(log_line_for "$CODEX_H")"
+  if [[ $CODEX_HOOK_DONE -ge 1 ]] && ! grep -q '<retrivio_leads>' "$RAW/l3-codex-hook-instruction.last" && printf '%s' "$logl" | grep -q ' skipped:instruction '; then
+    record PASS l3-codex-hook-instruction "$LAST_SECS" "hook ran, no block; log[$CODEX_H]: $logl"
+  else record FAIL l3-codex-hook-instruction "$LAST_SECS" "rc=$LAST_RC hook-completed=$CODEX_HOOK_DONE log[$CODEX_H]: ${logl:-none}; reply: $(one_line 200 < "$RAW/l3-codex-hook-instruction.last" 2>/dev/null)"; fi
+
+  codex_call l3-codex-mcp-topic-dossier "$DOSSIER_MCP_PROMPT"
+  p="$(grep -m1 -E '^/' "$RAW/l3-codex-mcp-topic-dossier.last" 2>/dev/null | sed 's/[[:space:]]*$//')"
+  mcpl="$(grep -m1 -E 'mcp: retrivio/topic_dossier \(completed\)' "$RAW/l3-codex-mcp-topic-dossier.err")"
+  if [[ $LAST_RC -eq 0 && -n "$mcpl" ]] && dossier_path_ok "$p"; then record PASS l3-codex-mcp-topic-dossier "$LAST_SECS" "$mcpl; first project is a directory the CLI dossier also listed: $p"
+  else record FAIL l3-codex-mcp-topic-dossier "$LAST_SECS" "rc=$LAST_RC mcp line: ${mcpl:-none}; reply: $(one_line 200 < "$RAW/l3-codex-mcp-topic-dossier.last" 2>/dev/null)"; fi
+
   codex_call l3-codex-skill "$SKILL_PROMPT"
   quoted="$(grep -m1 "$SKILL_EXPECT" "$RAW/l3-codex-skill.last" 2>/dev/null | sed -E 's/^[[:space:]"*]+//; s/[[:space:]"*]+$//')"
   if [[ $LAST_RC -eq 0 && -n "$quoted" ]] && grep -qF "$quoted" "$skill_codex"; then record PASS l3-codex-skill "$LAST_SECS" "quoted text is verbatim in $skill_codex: $(printf '%s' "$quoted" | one_line 120)"
@@ -381,6 +478,7 @@ rv recall --reset-session --session "$SESSION" < /dev/null > /dev/null 2>&1
   echo "- host: $(uname -sr); claude: ${CLAUDE_VER:-not run}; codex: ${CODEX_VER:-not run}"
   echo "- recall log: \`$RECALL_LOG\`; recall_max_leads: $MAX_LEADS; dry-run session: \`$SESSION\`; CLI timeout: ${TIMEOUT}s"
   echo "- content prompt: \"$CONTENT_PROMPT\""
+  echo "- dossier topic: \"$DOSSIER_TOPIC\"; instruction prompt: \"$INSTRUCTION_PROMPT\""
   echo "- result: $pass PASS, $fail FAIL, $warn WARN, $skip SKIP$([[ $STRICT -eq 1 ]] && echo ' (--strict: WARN and SKIP counted as FAIL)')"
   echo "- this report contains absolute paths, lead excerpts and raw CLI output from this machine; keep it private"
   echo
