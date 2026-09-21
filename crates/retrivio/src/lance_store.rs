@@ -10,6 +10,7 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use lancedb::connect;
 use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::table::Table;
+use lancedb::DistanceType;
 use tokio::runtime::Runtime;
 
 /// Shared Tokio runtime for LanceDB async operations (lazy, 2 worker threads).
@@ -198,21 +199,37 @@ pub fn list_chunk_ids(store: &LanceStore) -> Result<Vec<i64>, String> {
     })
 }
 
-/// ANN vector search returning chunk_id → normalized similarity score.
+/// One vector-search hit: the raw cosine similarity and its position in the retrieved set.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VectorHit {
+    /// Min-max normalised over the retrieved set: the best hit is 1.0, the worst 0.0. A
+    /// relative signal for fusion; it says nothing about absolute relevance.
+    pub score: f64,
+    /// Cosine similarity between the query and the chunk vector, in [-1, 1]. Absolute floors
+    /// apply to this value.
+    pub raw_similarity: f64,
+}
+
+/// Vector search returning chunk_id → [`VectorHit`].
 ///
-/// Scores are normalized to [0, 1] where 1 is most similar.
-/// LanceDB returns L2 distances by default; we convert to similarity.
+/// The query runs with cosine distance (`_distance = 1 - cos`), stated explicitly rather than
+/// LanceDB's L2 default. The table needs no rebuild for this: every stored vector is unit
+/// length (the indexer normalises, and `normalized` is part of the embedding identity), and
+/// for unit vectors cosine distance is a monotonic function of L2 (`cos = 1 - d_l2^2 / 2`), so
+/// the ranking is identical and only the reported number changes from `1/(1+d_l2)` to the
+/// cosine itself. There is no vector index on the table, so the metric is a per-query choice.
 pub fn search_vectors(
     store: &LanceStore,
     query_vector: &[f32],
     limit: usize,
-) -> Result<HashMap<i64, f64>, String> {
+) -> Result<HashMap<i64, VectorHit>, String> {
     let use_limit = limit.max(1);
     runtime().block_on(async {
         let results = store
             .table
             .vector_search(query_vector.to_vec())
             .map_err(|e| format!("failed to build LanceDB vector query: {}", e))?
+            .distance_type(DistanceType::Cosine)
             .limit(use_limit)
             .execute()
             .await
@@ -489,36 +506,41 @@ fn blob_to_f32_vec(blob: &[u8]) -> Vec<f32> {
     out
 }
 
-/// Convert L2 distances to normalized similarity scores [0, 1].
-fn normalize_distances(rows: &[(i64, f64)]) -> HashMap<i64, f64> {
+/// Cosine distances (`1 - cos`) to hits: the raw cosine plus a min-max normalised score.
+fn normalize_distances(rows: &[(i64, f64)]) -> HashMap<i64, VectorHit> {
     if rows.is_empty() {
         return HashMap::new();
     }
-    let sims: Vec<(i64, f64)> = rows
-        .iter()
-        .map(|(id, dist)| (*id, 1.0 / (1.0 + dist)))
-        .collect();
-
     let mut dedup: HashMap<i64, f64> = HashMap::new();
-    for (id, sim) in &sims {
+    for (id, dist) in rows {
+        let cos = (1.0 - dist).clamp(-1.0, 1.0);
         let prev = dedup.get(id).copied().unwrap_or(f64::NEG_INFINITY);
-        if *sim > prev {
-            dedup.insert(*id, *sim);
+        if cos > prev {
+            dedup.insert(*id, cos);
         }
     }
     if dedup.is_empty() {
         return HashMap::new();
     }
-
     let lo = dedup.values().copied().fold(f64::INFINITY, f64::min);
     let hi = dedup.values().copied().fold(f64::NEG_INFINITY, f64::max);
-    if (hi - lo).abs() < f64::EPSILON {
-        return dedup.into_keys().map(|id| (id, 1.0)).collect();
-    }
     let span = hi - lo;
     dedup
         .into_iter()
-        .map(|(id, sim)| (id, ((sim - lo) / span).clamp(0.0, 1.0)))
+        .map(|(id, cos)| {
+            let score = if span.abs() < f64::EPSILON {
+                1.0
+            } else {
+                ((cos - lo) / span).clamp(0.0, 1.0)
+            };
+            (
+                id,
+                VectorHit {
+                    score,
+                    raw_similarity: cos,
+                },
+            )
+        })
         .collect()
 }
 
@@ -596,6 +618,11 @@ mod tests {
             "search on the stale handle: {:?}",
             hits
         );
+        // The query is the stored vector itself: cosine 1 (unit vectors are not required,
+        // cosine distance normalises internally), normalised score 1 for the single hit.
+        let hit = hits[&2];
+        assert!((hit.raw_similarity - 1.0).abs() < 1e-5, "{:?}", hit);
+        assert!((hit.score - 1.0).abs() < 1e-12, "{:?}", hit);
 
         delete_chunks(&mut writer, &[1]).unwrap();
         assert_eq!(list_chunk_ids(&reader).unwrap(), vec![2]);
@@ -672,6 +699,60 @@ mod tests {
         assert!(hits.contains_key(&7), "{:?}", hits);
         upsert_chunks(&mut store, &[(500, vec_for(500, dim))]).unwrap();
         assert_eq!(count(&store).unwrap(), 101);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Raw similarity is the cosine, the normalised score is min-max over the retrieved set,
+    /// and on unit vectors it equals `1 - d_l2^2 / 2` (so tables built under L2 need no rebuild).
+    #[test]
+    fn search_reports_cosine_and_min_max_normalised_scores() {
+        let dir = temp_lance_dir("cosine");
+        let dim = 8;
+        let mut store = open(&dir, dim).expect("open");
+        let unit = |v: Vec<f32>| -> Vec<f32> {
+            let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            v.iter().map(|x| x / n).collect()
+        };
+        let rows: Vec<(i64, Vec<f32>)> = (1..=5).map(|id| (id, unit(vec_for(id, dim)))).collect();
+        upsert_chunks(&mut store, &rows).unwrap();
+        let q = unit(vec_for(9, dim));
+        let hits = search_vectors(&store, &q, 5).unwrap();
+        assert_eq!(hits.len(), 5);
+        let mut best = f64::NEG_INFINITY;
+        let mut worst = f64::INFINITY;
+        for (id, v) in &rows {
+            let cos: f64 = q
+                .iter()
+                .zip(v.iter())
+                .map(|(a, b)| (*a as f64) * (*b as f64))
+                .sum();
+            let l2sq: f64 = q
+                .iter()
+                .zip(v.iter())
+                .map(|(a, b)| ((*a - *b) as f64).powi(2))
+                .sum();
+            let hit = hits[id];
+            assert!(
+                (hit.raw_similarity - cos).abs() < 1e-5,
+                "id {} {:?} vs {}",
+                id,
+                hit,
+                cos
+            );
+            assert!(
+                (hit.raw_similarity - (1.0 - l2sq / 2.0)).abs() < 1e-5,
+                "L2 identity on unit vectors: id {} {:?} vs {}",
+                id,
+                hit,
+                1.0 - l2sq / 2.0
+            );
+            best = best.max(hit.raw_similarity);
+            worst = worst.min(hit.raw_similarity);
+        }
+        let top = hits.values().find(|h| h.raw_similarity == best).unwrap();
+        let bottom = hits.values().find(|h| h.raw_similarity == worst).unwrap();
+        assert!((top.score - 1.0).abs() < 1e-12);
+        assert!(bottom.score.abs() < 1e-12);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -30,10 +30,11 @@ Each lead carries a tier computed from its content date (frontmatter date, then 
 |---|---|---|
 | fresh | under 14 days | Likely current. Use it, still verify anything that matters. |
 | aging | 14 to 35 days | Probably still useful. Verify facts before repeating them. |
-| stale | over 35 days | Locates prior work only. Its facts are presumed outdated until re-verified against the current file, system or docs. |
-| record | any age | A point-in-time artifact such as a transcript, call note or handoff. Correct for "what happened then", not for "what is true now". |
+| stale | over 35 days | A knowledge document (spec, note, README, code). Locates prior work only. Its facts are presumed outdated until re-verified against the current file, system or docs. |
+| verify | over 35 days | A state document (handoff, status brief, plan). It was the truth once; treat every fact in it as a claim to re-check before repeating it. |
+| record | any age | A point-in-time event such as a transcript, call note or meeting note, dated by when it happened. Correct for "what happened then", never for "what is true now". Records do not go stale. |
 
-Prefer the newer lead when two cover the same topic. "(N older versions)" means older copies exist in the same project; ignore them unless the user asks for history. Never state a stale lead's figures, prices, owners, API details or system state as current.
+Prefer the newer lead when two cover the same topic. "(supersedes N older)" means N older handoffs of the same series exist in that directory; ignore them unless the user asks for history. "(superseded by <file>)" marks an older handoff that surfaced because the newest was already shown or the prompt asked for history: read the named newer file for the current state. Never state a stale or verify lead's figures, prices, owners, API details or system state as current.
 
 ## Searching Retrivio yourself
 
@@ -45,7 +46,7 @@ retrivio search --view files --since 30 "focused query"     # only content dated
 retrivio search --view projects --limit 5 "system name plus constraint"
 ```
 
-Results include `content_date`, `age_days`, `freshness_tier` and `date_source`. Treat them under the same freshness rules.
+Results include `content_date`, `age_days`, `freshness_tier`, `date_source`, `role` (`state`, `knowledge` or `record`), `verify`, `noise`, `raw_similarity` and `superseded_by`. Treat them under the same freshness rules. `raw_similarity` is the cosine between the query and the result (an absolute number; below about 0.40 with the default Titan v2 model the result is rarely about the query, which is where the recall floor sits), while `score` is relative to the other results of the same query. A `superseded_by` value names the newer handoff of the same series: read that one instead, unless the question is about history (`--include-superseded` ranks the older ones at full strength). `noise` marks chat dumps, logs and lockfiles.
 
 ## Trust and safety
 

@@ -29,7 +29,7 @@ Every L2/L3 run writes its own report; keep it. Convention: `tmp/harness-runs/<d
 ## L0: unit tests, formatting, lints, public tree
 
 ```bash
-cargo test -p retrivio                 # expected: "test result: ok. N passed; 0 failed"
+cargo test -p retrivio -- --test-threads=1   # serial: process-wide scan settings; expected: "test result: ok. N passed; 0 failed"
 cargo fmt --check                      # expected: no output, exit 0
 cargo clippy -p retrivio               # reported, not gating: note the warning count in the run record
 scripts/check-public-tree.sh           # expected: "check-public-tree: ok (N tracked files)"

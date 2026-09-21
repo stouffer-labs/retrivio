@@ -33,6 +33,7 @@ use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
 
 use super::freshness;
+use super::roles::{self, Role};
 use super::{ConfigValues, RankOptions, RankedFileResult};
 
 /// Whole-run budget; the main thread exits 0 with no output when the worker misses it.
@@ -211,8 +212,11 @@ const STOPWORDS: &[&str] = &[
     "were",
 ];
 
-/// Filename tokens that mark a revision rather than a distinct document (series collapse).
-const VERSION_TOKENS: &[&str] = &["draft", "final", "copy"];
+/// True for a lower-case token in the shared stopword list (used by the ranker's lexical
+/// coverage as well).
+pub(crate) fn is_stopword(token: &str) -> bool {
+    STOPWORDS.contains(&token)
+}
 
 // ---------------------------------------------------------------------------------------------
 // Arguments and hook input
@@ -1205,14 +1209,36 @@ struct Candidate {
     age_days: f64,
     tier: String,
     is_record: bool,
-    text_hash: String,
+    /// `state`, `knowledge` or `record` (slice 3).
+    role: Role,
+    /// Path relative to the project; series identity for state files.
+    doc_rel_path: String,
+    /// Cosine similarity of the best chunk; `None` in lexical mode.
+    raw_similarity: Option<f64>,
+    /// Newer file of the same series when this one is not the head (set here from the revision
+    /// date, overriding the ranker's mark, which never saw the front matter).
+    superseded_by: Option<String>,
+    /// Orders revisions of one series: the date in the relative path, else the front-matter
+    /// date once read, else the last edit. Never a fresh mtime over a dated file name.
+    revision_date: f64,
+    /// Manifest hash of the whole file (`project_files.content_hash`), the identity duplicate
+    /// collapse uses; empty when unknown.
+    content_hash: String,
     older_versions: usize,
     /// True when `excerpt` was replaced by the document title (skip the markup re-check).
     hint_is_title: bool,
 }
 
+fn role_from_str(s: &str) -> Role {
+    match s {
+        "state" => Role::State,
+        "record" => Role::Record,
+        _ => Role::Knowledge,
+    }
+}
+
 impl Candidate {
-    fn from_ranked(r: &RankedFileResult) -> Self {
+    fn from_ranked(r: &RankedFileResult, now: f64) -> Self {
         Candidate {
             path: r.path.clone(),
             project_path: r.project_path.clone(),
@@ -1225,7 +1251,12 @@ impl Candidate {
             age_days: r.age_days,
             tier: r.freshness_tier.clone(),
             is_record: r.is_record,
-            text_hash: String::new(),
+            role: role_from_str(r.role),
+            doc_rel_path: r.doc_rel_path.clone(),
+            raw_similarity: r.raw_similarity,
+            superseded_by: r.superseded_by.clone(),
+            revision_date: freshness::revision_date(&r.doc_rel_path, r.doc_mtime, now),
+            content_hash: String::new(),
             older_versions: 0,
             hint_is_title: false,
         }
@@ -1280,7 +1311,14 @@ fn refine_with_frontmatter(c: &mut Candidate, fm_date: f64, now: f64, rp: &Recen
     c.content_date = fm_date;
     c.date_source = "frontmatter";
     c.age_days = age;
-    c.tier = freshness::tier(age, c.is_record).to_string();
+    c.tier = freshness::tier_for_role(age, c.role).to_string();
+    // The front-matter date orders the series when the path carries no date.
+    if freshness::embedded_path_date(&c.doc_rel_path)
+        .filter(|ts| *ts <= now + freshness::FUTURE_SLACK_DAYS * freshness::DAY_SECS)
+        .is_none()
+    {
+        c.revision_date = fm_date;
+    }
 }
 
 /// Everything the selection pipeline needs besides the candidates.
@@ -1293,6 +1331,9 @@ struct SelectParams {
     roots: Vec<PathBuf>,
     cwd: Option<PathBuf>,
     shown: HashSet<String>,
+    /// The prompt asks for history explicitly (`roles::history_query`): superseded state
+    /// files rank at full strength.
+    history: bool,
 }
 
 fn tier_rank(tier: &str) -> u8 {
@@ -1300,7 +1341,7 @@ fn tier_rank(tier: &str) -> u8 {
         "fresh" => 0,
         "aging" => 1,
         "record" => 2,
-        "stale" => 3,
+        "stale" | "verify" => 3,
         _ => 4,
     }
 }
@@ -1341,116 +1382,28 @@ fn project_contains_cwd(project: &str, cwd: &Path) -> bool {
     !project.is_empty() && cwd.starts_with(Path::new(project))
 }
 
-fn all_digits(s: &str) -> bool {
-    !s.is_empty() && s.chars().all(|c| c.is_ascii_digit())
-}
-
-/// `YYYY-MM-DD` / `YYYY_MM_DD` runs and `(<n>)` copy markers become spaces (token separators),
-/// so they vanish before the token pass; everything else is kept.
-fn blank_dates_and_copy_markers(stem: &str) -> String {
-    let chars: Vec<char> = stem.chars().collect();
-    let mut out = String::with_capacity(stem.len());
-    let mut i = 0usize;
-    while i < chars.len() {
-        let c = chars[i];
-        if c == '(' {
-            let mut j = i + 1;
-            while j < chars.len() && chars[j].is_ascii_digit() {
-                j += 1;
-            }
-            if j > i + 1 && j < chars.len() && chars[j] == ')' {
-                out.push(' ');
-                i = j + 1;
-                continue;
-            }
-        }
-        if c.is_ascii_digit()
-            && (i == 0 || !chars[i - 1].is_alphanumeric())
-            && i + 10 <= chars.len()
-        {
-            let d = &chars[i..i + 10];
-            let dashed = d[..4].iter().all(|c| c.is_ascii_digit())
-                && matches!(d[4], '-' | '_')
-                && d[5..7].iter().all(|c| c.is_ascii_digit())
-                && matches!(d[7], '-' | '_')
-                && d[8..10].iter().all(|c| c.is_ascii_digit())
-                && chars
-                    .get(i + 10)
-                    .map(|n| !n.is_alphanumeric())
-                    .unwrap_or(true);
-            if dashed {
-                out.push(' ');
-                i += 10;
-                continue;
-            }
-        }
-        out.push(c);
-        i += 1;
-    }
-    out
-}
-
-/// Tokens that mark a revision of the same document rather than a different one: digit-only
-/// tokens of four or more digits (dates, serials), `v<n>`, `rev<n>`, `r<n>`, `draft`, `final`,
-/// `copy`. Digits inside words (`s3`, `ec2`, `core3`) are meaningful and kept.
-fn is_series_token(tok: &str) -> bool {
-    if all_digits(tok) {
-        return tok.len() >= 4;
-    }
-    if VERSION_TOKENS.contains(&tok) {
-        return true;
-    }
-    ["rev", "v", "r"]
-        .iter()
-        .any(|p| tok.strip_prefix(p).map(all_digits).unwrap_or(false))
-}
-
-/// Filename stem with date runs, revision markers and copy counters removed, separators squeezed.
-fn normalize_stem(file_name: &str) -> String {
-    let lower = file_name.to_lowercase();
-    let stem = match lower.rsplit_once('.') {
-        Some((s, ext))
-            if !s.is_empty()
-                && !ext.is_empty()
-                && ext.chars().all(|c| c.is_ascii_alphanumeric()) =>
-        {
-            s
-        }
-        _ => lower.as_str(),
-    };
-    let blanked = blank_dates_and_copy_markers(stem);
-    let toks: Vec<&str> = blanked
-        .split(|c: char| matches!(c, '-' | '_' | ' ' | '.' | '(' | ')' | '[' | ']'))
-        .filter(|tok| !tok.is_empty())
-        .collect();
-    let mut parts: Vec<&str> = Vec::with_capacity(toks.len());
-    let mut i = 0usize;
-    while i < toks.len() {
-        let tok = toks[i];
-        // Finder-style `name copy 2`: the counter belongs to the copy marker.
-        if tok == "copy" && toks.get(i + 1).map(|n| all_digits(n)).unwrap_or(false) {
-            i += 2;
-            continue;
-        }
-        if !is_series_token(tok) {
-            parts.push(tok);
-        }
-        i += 1;
-    }
-    parts.join("-")
-}
-
-/// Root filter, absolute and relative thresholds on the base score, shortlist truncation.
+/// Root filter, absolute floor, relative threshold on the base score, shortlist truncation.
 /// Sorted by base score desc.
-fn prefilter(mut cands: Vec<Candidate>, p: &SelectParams) -> Vec<Candidate> {
+///
+/// The absolute floor (`recall_min_abs_score`) is an honest number: in semantic mode it is
+/// applied to each candidate's raw cosine similarity (the min-max normalised fusion score
+/// says nothing absolute, its top is always 1.0) under the same contract as search
+/// (`super::passes_raw_floor`): a floor above 0 admits only a finite cosine at or above it,
+/// so a candidate without one (found by keywords only, or with a corrupt vector) fails
+/// closed; a floor of 0 is off and applies no cosine requirement. In lexical mode, where no
+/// cosine exists, the floor applies to the coverage-based base score as before.
+fn prefilter(mut cands: Vec<Candidate>, p: &SelectParams, semantic: bool) -> Vec<Candidate> {
     if !p.roots.is_empty() {
         cands.retain(|c| under_any_root(&c.path, &p.roots));
+    }
+    if semantic {
+        cands.retain(|c| super::passes_raw_floor(c.raw_similarity, p.min_abs_score));
     }
     sort_by_base(&mut cands);
     let Some(top) = cands.first().map(|c| c.base_score) else {
         return Vec::new();
     };
-    if !(top >= p.min_abs_score) {
+    if !semantic && !(top >= p.min_abs_score) {
         return Vec::new();
     }
     let floor = top * p.min_score_ratio;
@@ -1520,62 +1473,124 @@ fn newer(a: &Candidate, b: &Candidate) -> bool {
     a.content_date > b.content_date || (a.content_date == b.content_date && a.score > b.score)
 }
 
-/// Same top-chunk `text_hash` means identical content: keep the newest copy.
+/// Relative path for copy-directory and file-name checks (the absolute path when the ranker
+/// gave none).
+fn rel_or_path(c: &Candidate) -> &str {
+    if c.doc_rel_path.is_empty() {
+        &c.path
+    } else {
+        &c.doc_rel_path
+    }
+}
+
+/// `a` is the better survivor of two copies: outside a copy directory first, then the newer,
+/// then the higher score.
+fn better_copy(a: &Candidate, b: &Candidate) -> bool {
+    let (na, nb) = (
+        roles::under_noise_dir(rel_or_path(a)),
+        roles::under_noise_dir(rel_or_path(b)),
+    );
+    if na != nb {
+        return !na;
+    }
+    newer(a, b)
+}
+
+/// Copies of one file collapse to one candidate, with the same identity as file search: the
+/// manifest hash of the whole file, and either the same file name or one copy under a copy
+/// directory (`super::same_file_copy`). Two byte-identical documents that meet neither rule
+/// stay two candidates. The survivor keeps its own score and cosine.
 fn collapse_identical(cands: Vec<Candidate>) -> Vec<Candidate> {
     let mut out: Vec<Candidate> = Vec::new();
-    let mut by_hash: HashMap<String, usize> = HashMap::new();
     for c in cands {
-        if c.text_hash.is_empty() {
+        if c.content_hash.is_empty() {
             out.push(c);
             continue;
         }
-        match by_hash.get(&c.text_hash).copied() {
+        let dup = out.iter().position(|o| {
+            o.content_hash == c.content_hash
+                && super::same_file_copy(rel_or_path(o), rel_or_path(&c))
+        });
+        match dup {
             Some(idx) => {
-                if newer(&c, &out[idx]) {
+                if better_copy(&c, &out[idx]) {
                     out[idx] = c;
                 }
             }
-            None => {
-                by_hash.insert(c.text_hash.clone(), out.len());
-                out.push(c);
-            }
+            None => out.push(c),
         }
     }
     out
 }
 
-/// Same project and normalized stem is a series: keep the newest, count the rest.
-fn collapse_series(cands: Vec<Candidate>) -> Vec<Candidate> {
-    let mut out: Vec<Candidate> = Vec::new();
-    let mut by_key: HashMap<(String, String), usize> = HashMap::new();
-    for c in cands {
-        let file_name = Path::new(&c.path)
-            .file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| c.path.clone());
-        let key = (c.project_path.clone(), normalize_stem(&file_name));
-        match by_key.get(&key).copied() {
-            Some(idx) => {
-                let prev_versions = out[idx].older_versions;
-                if newer(&c, &out[idx]) {
-                    out[idx] = c;
-                }
-                out[idx].older_versions = prev_versions + 1;
+/// Supersession in recall, soft and state-only, the same rule as file search: `state` files
+/// of one series (same project, parent directory and normalised stem) are revisions of one
+/// document. The newest by revision date is the head and counts the others
+/// (`older_versions`); the others get `superseded_by = head` and, unless the prompt asks for
+/// history (`full_strength`), the same x 0.85 as search. Nothing is removed: the per-project
+/// cap in `finalize_leads` keeps the head in front, and an older member can still surface
+/// when the head was already shown or the prompt asks for history. Records are distinct
+/// events and knowledge files are distinct documents; neither is touched. Runs after the
+/// front matter was read, so the revision date can come from it; the ranker's own mark
+/// (`superseded_by`, set without downranking because recall asks for `include_superseded`)
+/// is overridden here.
+fn collapse_series(mut cands: Vec<Candidate>, full_strength: bool) -> Vec<Candidate> {
+    let mut by_key: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, c) in cands.iter().enumerate() {
+        if c.role != Role::State {
+            continue;
+        }
+        let rel = if c.doc_rel_path.is_empty() {
+            Path::new(&c.path)
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| c.path.clone())
+        } else {
+            c.doc_rel_path.clone()
+        };
+        by_key
+            .entry(roles::series_key(&c.project_path, &rel))
+            .or_default()
+            .push(i);
+    }
+    for members in by_key.into_values() {
+        if members.len() < 2 {
+            continue;
+        }
+        let head = *members
+            .iter()
+            .max_by(|a, b| {
+                let (ca, cb) = (&cands[**a], &cands[**b]);
+                ca.revision_date
+                    .total_cmp(&cb.revision_date)
+                    .then_with(|| ca.score.total_cmp(&cb.score))
+                    .then_with(|| cb.path.cmp(&ca.path))
+            })
+            .expect("non-empty series");
+        let head_path = cands[head].path.clone();
+        cands[head].older_versions = members.len() - 1;
+        cands[head].superseded_by = None;
+        for &m in &members {
+            if m == head {
+                continue;
             }
-            None => {
-                by_key.insert(key, out.len());
-                out.push(c);
+            let c = &mut cands[m];
+            c.superseded_by = Some(head_path.clone());
+            c.older_versions = 0;
+            if !full_strength {
+                c.score *= super::SUPERSEDED_FACTOR;
+                c.base_score *= super::SUPERSEDED_FACTOR;
             }
         }
     }
-    out
+    cands
 }
 
 /// Order candidates: those whose base score is within `band_ratio` of the top base score by
 /// tier rank then blended score, the rest by blended score; then apply the greedy caps (shown,
 /// one per project, one from the cwd project, one record) and take `max_leads`.
 fn finalize_leads(cands: Vec<Candidate>, p: &SelectParams) -> Vec<Candidate> {
-    let cands = collapse_series(collapse_identical(cands));
+    let cands = collapse_series(collapse_identical(cands), p.history);
     let Some(top) = top_base(&cands) else {
         return Vec::new();
     };
@@ -1668,7 +1683,13 @@ fn format_lead_line(n: usize, c: &Candidate, hint_max: Option<usize>) -> String 
         }
     }
     if c.older_versions > 0 {
-        line.push_str(&format!(" ({} older versions)", c.older_versions));
+        line.push_str(&format!(" (supersedes {} older)", c.older_versions));
+    } else if let Some(head) = c.superseded_by.as_deref() {
+        let name = Path::new(head)
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| head.to_string());
+        line.push_str(&format!(" (superseded by {})", sanitize(&name)));
     }
     line
 }
@@ -2125,6 +2146,11 @@ fn semantic_rows(
         RankOptions {
             since_days: None,
             lexical_only: false,
+            // Recall applies its own raw-cosine floor in `prefilter` and decides supersession
+            // itself in `collapse_series`, after reading the front matter: the ranker marks
+            // series members but must not downrank them here.
+            include_superseded: true,
+            ..RankOptions::default()
         },
     )
 }
@@ -2214,15 +2240,6 @@ fn read_head(path: &str, max: usize) -> Option<String> {
     Some(String::from_utf8_lossy(&buf).to_string())
 }
 
-fn chunk_text_hash(conn: &Connection, chunk_id: i64) -> String {
-    conn.query_row(
-        "SELECT text_hash FROM project_chunks WHERE id = ?1",
-        params![chunk_id],
-        |row| row.get::<_, String>(0),
-    )
-    .unwrap_or_default()
-}
-
 fn chunk_text(conn: &Connection, chunk_id: i64) -> Option<String> {
     conn.query_row(
         "SELECT text FROM project_chunks WHERE id = ?1",
@@ -2243,13 +2260,13 @@ fn run_pipeline(job: PipelineJob) -> Result<PipelineOutput, String> {
     let mut existing: Vec<Candidate> = rows
         .iter()
         .filter(|r| Path::new(&r.path).is_file())
-        .map(Candidate::from_ranked)
+        .map(|r| Candidate::from_ranked(r, job.now))
         .collect();
     if mode == "lexical" {
         let text_of = |id: i64| conn.as_ref().and_then(|c| chunk_text(c, id));
         existing = apply_lexical_confidence(existing, &job.terms, &rp, &text_of);
     }
-    let mut shortlist = prefilter(existing, &job.params);
+    let mut shortlist = prefilter(existing, &job.params, mode == "semantic");
     if shortlist.is_empty() {
         return Ok(PipelineOutput {
             leads: Vec::new(),
@@ -2271,8 +2288,14 @@ fn run_pipeline(job: PipelineJob) -> Result<PipelineOutput, String> {
                 }
             }
         }
-        if let Some(conn) = conn.as_ref() {
-            c.text_hash = chunk_text_hash(conn, c.chunk_id);
+    }
+    if let Some(conn) = conn.as_ref() {
+        let paths: Vec<String> = shortlist.iter().map(|c| c.path.clone()).collect();
+        let hashes = super::file_content_hashes(conn, &paths);
+        for c in shortlist.iter_mut() {
+            if let Some(h) = hashes.get(&c.path) {
+                c.content_hash = h.clone();
+            }
         }
     }
     let leads = finalize_leads(shortlist, &job.params);
@@ -2384,6 +2407,7 @@ pub fn run_recall_cmd(args: &[OsString]) {
         roots: cfg.recall_root_list(),
         cwd: Some(cwd.clone()),
         shown: state.shown.iter().cloned().collect(),
+        history: roles::history_query(&prompt),
     };
     let excerpts = cfg.recall_excerpts;
     let system_message = cfg.recall_system_message;
@@ -2474,9 +2498,21 @@ mod tests {
         hint_text_capped(excerpt, HINT_MAX_CHARS)
     }
 
-    /// Synthetic candidate; `base_score == score` unless a test sets them apart.
+    /// Synthetic candidate; `base_score == score` unless a test sets them apart. The role
+    /// follows the tier (`record`) or the file name (handoffs are `state`); the raw
+    /// similarity is set to the score so semantic-mode floors behave like the old base floor.
     fn cand(path: &str, project: &str, score: f64, tier: &str, age: f64) -> Candidate {
         let now = 1_800_000_000.0;
+        let rel = path
+            .strip_prefix(project)
+            .map(|r| r.trim_start_matches('/').to_string())
+            .unwrap_or_else(|| path.to_string());
+        let role = if tier == "record" {
+            Role::Record
+        } else {
+            roles::classify(&rel, roles::TextShape::Prose, &[])
+        };
+        let rel_for_revision = rel.clone();
         Candidate {
             path: path.to_string(),
             project_path: project.to_string(),
@@ -2489,7 +2525,16 @@ mod tests {
             age_days: age,
             tier: tier.to_string(),
             is_record: tier == "record",
-            text_hash: String::new(),
+            role,
+            doc_rel_path: rel,
+            raw_similarity: Some(score),
+            superseded_by: None,
+            revision_date: freshness::revision_date(
+                &rel_for_revision,
+                now - age * freshness::DAY_SECS,
+                now,
+            ),
+            content_hash: String::new(),
             older_versions: 0,
             hint_is_title: false,
         }
@@ -2504,6 +2549,7 @@ mod tests {
             roots: Vec::new(),
             cwd: None,
             shown: HashSet::new(),
+            history: false,
         }
     }
 
@@ -2780,7 +2826,7 @@ mod tests {
         c.older_versions = 1;
         let json_line = format_lead_line(2, &c, Some(HINT_MAX_CHARS));
         assert!(
-            json_line.ends_with(" — p (1 older versions)"),
+            json_line.ends_with(" — p (supersedes 1 older)"),
             "{}",
             json_line
         );
@@ -3102,72 +3148,54 @@ mod tests {
     }
 
     #[test]
-    fn series_stem_normalization() {
-        assert_eq!(
-            normalize_stem("HANDOFF-2026-08-28-orion.md"),
-            "handoff-orion"
-        );
-        assert_eq!(
-            normalize_stem("HANDOFF-2026-08-28-orion.md"),
-            normalize_stem("HANDOFF-2026-09-10-orion.md")
-        );
-        assert_eq!(normalize_stem("design-v2-final.md"), "design");
-        assert_eq!(normalize_stem("design.md"), "design");
-        assert_eq!(normalize_stem("notes copy (2).md"), "notes");
-        assert_eq!(normalize_stem("notes copy 2.md"), "notes"); // Finder-style counter follows `copy`
-        assert_eq!(normalize_stem("notes copy.md"), "notes");
-        assert_eq!(normalize_stem("notes 2.md"), "notes-2"); // a lone short number elsewhere is kept
-        assert_eq!(normalize_stem("Brief (draft).md"), "brief");
-        assert_ne!(
-            normalize_stem("runbook.md"),
-            normalize_stem("HANDOFF-2026-09-10-orion.md")
-        );
-        assert_eq!(normalize_stem("20260812-vendor-call.txt"), "vendor-call");
-        assert_eq!(normalize_stem("202609_notes.md"), "notes");
-        assert_eq!(normalize_stem("2026_09_10_notes.md"), "notes");
-        assert_eq!(
-            normalize_stem("2026-09-19-proactive-recall-design.md"),
-            "proactive-recall-design"
-        );
-        assert_eq!(normalize_stem(".hidden"), "hidden");
-        assert_eq!(normalize_stem("README"), "readme");
-        // Digits inside words are meaningful: these stay distinct.
-        assert_ne!(
-            normalize_stem("s3-tables.md"),
-            normalize_stem("s4-tables.md")
-        );
-        assert_eq!(normalize_stem("s3-tables.md"), "s3-tables");
-        assert_eq!(normalize_stem("ec2-core3-access.md"), "ec2-core3-access");
-        assert_ne!(
-            normalize_stem("ec2-notes.md"),
-            normalize_stem("ec3-notes.md")
-        );
-        // Revision markers collapse.
-        assert_eq!(
-            normalize_stem("deck-v11.html"),
-            normalize_stem("deck-v12.html")
-        );
-        assert_eq!(normalize_stem("deck-v11.html"), "deck");
-        assert_eq!(normalize_stem("spec-rev3.md"), "spec");
-        assert_eq!(normalize_stem("spec_r12.md"), "spec");
-        assert_eq!(normalize_stem("spec-final-copy.md"), "spec");
-        assert_eq!(normalize_stem("invoice-12345.pdf"), "invoice");
-        assert_eq!(normalize_stem("q3-report-123.md"), "q3-report-123"); // 3 digits: kept
-        assert_eq!(normalize_stem("version-notes.md"), "version-notes"); // words are not markers
-        assert_eq!(normalize_stem("revenue-drafting.md"), "revenue-drafting");
-    }
-
-    #[test]
-    fn identical_content_keeps_newest_copy() {
+    fn identical_files_collapse_by_file_hash_with_name_or_copy_directory() {
+        // Same bytes, same file name: copies; the newer survives with its own score.
         let mut a = cand("/r/dup/copy-a/x.md", "/r/dup", 0.90, "stale", 200.0);
-        a.text_hash = "h1".into();
+        a.content_hash = "h1".into();
         let mut b = cand("/r/dup/copy-b/x.md", "/r/dup", 0.85, "fresh", 1.0);
-        b.text_hash = "h1".into();
+        b.content_hash = "h1".into();
         let mut c = cand("/r/other/y.md", "/r/other", 0.80, "aging", 20.0);
-        c.text_hash = "h2".into();
+        c.content_hash = "h2".into();
         let d = cand("/r/other/z.md", "/r/other", 0.70, "aging", 20.0); // no hash: kept
         let out = collapse_identical(vec![a, b.clone(), c.clone(), d.clone()]);
-        assert_eq!(out, vec![b, c, d]);
+        assert_eq!(out, vec![b.clone(), c, d]);
+        assert!(
+            (out[0].score - 0.85).abs() < 1e-12,
+            "own score, not the removed 0.90"
+        );
+
+        // Same bytes, different names, neither under a copy directory: two documents.
+        let mut e = cand("/r/p/specs/design.md", "/r/p", 0.90, "aging", 20.0);
+        e.content_hash = "h3".into();
+        let mut f = cand("/r/q/notes/design-notes.md", "/r/q", 0.95, "fresh", 1.0);
+        f.content_hash = "h3".into();
+        let out = collapse_identical(vec![e.clone(), f.clone()]);
+        assert_eq!(
+            out.len(),
+            2,
+            "byte-identical documents in two projects stay apart"
+        );
+
+        // Same bytes under a copy directory, any name: a copy; the original survives even
+        // when the copy is newer and scores higher, and keeps its own score.
+        let mut g = cand("/r/p/backup/anything.md", "/r/p", 0.99, "fresh", 0.5);
+        g.content_hash = "h3".into();
+        let out = collapse_identical(vec![g.clone(), e.clone()]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].path, e.path);
+        assert!((out[0].score - 0.90).abs() < 1e-12);
+        let mut snap = cand(
+            "/r/p/memory-snapshot/-Users-x/memory/MEMORY.md",
+            "/r/p",
+            0.9,
+            "fresh",
+            1.0,
+        );
+        snap.content_hash = "h4".into();
+        let mut src = cand("/r/s/memory/MEMORY.md", "/r/s", 0.8, "aging", 20.0);
+        src.content_hash = "h4".into();
+        let out = collapse_identical(vec![snap, src.clone()]);
+        assert_eq!(out, vec![src]);
     }
 
     #[test]
@@ -3176,22 +3204,69 @@ mod tests {
             "/r/orion/docs/sessions/HANDOFF-2026-08-28-orion.md",
             "/r/orion",
             0.95,
-            "record",
+            "aging",
             22.0,
         );
         let h2 = cand(
             "/r/orion/docs/sessions/HANDOFF-2026-09-10-orion.md",
             "/r/orion",
             0.90,
-            "record",
+            "fresh",
             9.0,
         );
+        assert_eq!(h1.role, Role::State);
         let rb = cand("/r/orion/docs/runbook.md", "/r/orion", 0.92, "stale", 150.0);
-        let out = collapse_series(vec![h1, h2.clone(), rb.clone()]);
-        assert_eq!(out.len(), 2);
-        let kept = out.iter().find(|c| c.path.contains("HANDOFF")).unwrap();
-        assert_eq!(kept.path, h2.path);
-        assert_eq!(kept.older_versions, 1);
+        // Same stem in another directory: another document, not a revision.
+        let other_dir = cand(
+            "/r/orion/workshop/HANDOFF-2026-09-01-orion.md",
+            "/r/orion",
+            0.80,
+            "aging",
+            18.0,
+        );
+        // Two transcripts of one series are two events: records are never folded.
+        let t1 = cand(
+            "/r/orion/transcripts/20260413-call.txt",
+            "/r/orion",
+            0.7,
+            "record",
+            100.0,
+        );
+        let t2 = cand(
+            "/r/orion/transcripts/20260514-call.txt",
+            "/r/orion",
+            0.6,
+            "record",
+            70.0,
+        );
+        let out = collapse_series(
+            vec![
+                h1.clone(),
+                h2.clone(),
+                rb.clone(),
+                other_dir.clone(),
+                t1,
+                t2,
+            ],
+            false,
+        );
+        assert_eq!(out.len(), 6, "nothing is removed");
+        let head = out.iter().find(|c| c.path == h2.path).unwrap();
+        assert_eq!(head.older_versions, 1);
+        assert!(head.superseded_by.is_none());
+        assert!(
+            (head.score - h2.score).abs() < 1e-12,
+            "the head keeps its score"
+        );
+        let older = out.iter().find(|c| c.path == h1.path).unwrap();
+        assert_eq!(older.superseded_by.as_deref(), Some(h2.path.as_str()));
+        assert_eq!(older.older_versions, 0);
+        assert!(
+            (older.score - h1.score * super::super::SUPERSEDED_FACTOR).abs() < 1e-12
+                && (older.base_score - h1.base_score * super::super::SUPERSEDED_FACTOR).abs()
+                    < 1e-12,
+            "the same x0.85 as search"
+        );
         assert_eq!(
             out.iter()
                 .find(|c| c.path.contains("runbook"))
@@ -3199,6 +3274,203 @@ mod tests {
                 .older_versions,
             0
         );
+        assert!(out
+            .iter()
+            .any(|c| c.path == other_dir.path && c.superseded_by.is_none()));
+        assert_eq!(out.iter().filter(|c| c.role == Role::Record).count(), 2);
+        assert!(out
+            .iter()
+            .filter(|c| c.role == Role::Record)
+            .all(|c| c.superseded_by.is_none() && c.older_versions == 0));
+
+        // A history prompt: marked, counted, full strength.
+        let full = collapse_series(vec![h1.clone(), h2.clone()], true);
+        let older = full.iter().find(|c| c.path == h1.path).unwrap();
+        assert_eq!(older.superseded_by.as_deref(), Some(h2.path.as_str()));
+        assert!((older.score - h1.score).abs() < 1e-12);
+        assert_eq!(
+            full.iter()
+                .find(|c| c.path == h2.path)
+                .unwrap()
+                .older_versions,
+            1
+        );
+    }
+
+    /// The head of a series is the newest by revision date (the date in the file name), not by
+    /// content date: an old handoff touched today keeps its place behind the newer one.
+    #[test]
+    fn touched_old_handoff_is_not_the_series_head() {
+        // Written 2026-08-28, edited today (age 0): content date is today, revision date is the
+        // path date.
+        let mut old = cand(
+            "/r/orion/docs/sessions/HANDOFF-2026-08-28-orion.md",
+            "/r/orion",
+            0.97,
+            "fresh",
+            0.0,
+        );
+        assert_eq!(freshness::format_ymd(old.revision_date), "2026-08-28");
+        let new = cand(
+            "/r/orion/docs/sessions/HANDOFF-2026-09-10-orion.md",
+            "/r/orion",
+            0.90,
+            "aging",
+            20.0,
+        );
+        assert!(old.content_date > new.content_date, "touched: newer mtime");
+        assert!(old.revision_date < new.revision_date, "older revision");
+        let out = collapse_series(vec![old.clone(), new.clone()], false);
+        let head = out.iter().find(|c| c.older_versions == 1).unwrap();
+        assert_eq!(head.path, new.path);
+        assert_eq!(
+            out.iter()
+                .find(|c| c.path == old.path)
+                .unwrap()
+                .superseded_by
+                .as_deref(),
+            Some(new.path.as_str())
+        );
+        // Without a date in the name the front matter decides, else the mtime.
+        old.path = "/r/orion/docs/sessions/HANDOFF-orion.md".into();
+        old.doc_rel_path = "docs/sessions/HANDOFF-orion.md".into();
+        old.revision_date =
+            freshness::revision_date(&old.doc_rel_path, old.content_date, 1_800_000_000.0);
+        assert_eq!(old.revision_date, old.content_date, "no path date: mtime");
+        let rp = RecencyParams {
+            living_half_life: 21.0,
+            record_half_life: 90.0,
+            living_weight: 0.12,
+            record_weight: 0.04,
+        };
+        let june = freshness::days_from_civil(2026, 6, 1) as f64 * freshness::DAY_SECS;
+        refine_with_frontmatter(&mut old, june, 1_800_000_000.0, &rp);
+        assert_eq!(
+            old.revision_date, june,
+            "front matter orders an undated file name"
+        );
+        let mut dated = new.clone();
+        refine_with_frontmatter(&mut dated, june, 1_800_000_000.0, &rp);
+        assert_eq!(
+            freshness::format_ymd(dated.revision_date),
+            "2026-09-10",
+            "a dated file name beats the front matter"
+        );
+    }
+
+    /// Default prompt: the newest handoff leads and carries the note; the older one, downranked,
+    /// is not shown (one lead per project). A history prompt ranks the series at full strength,
+    /// so the older, better-matching member can be the lead, marked as superseded.
+    #[test]
+    fn history_prompt_can_return_the_older_series_member() {
+        let old = cand(
+            "/r/orion/docs/sessions/HANDOFF-2026-08-28-orion.md",
+            "/r/orion",
+            0.96,
+            "verify",
+            40.0,
+        );
+        let new = cand(
+            "/r/orion/docs/sessions/HANDOFF-2026-09-10-orion.md",
+            "/r/orion",
+            0.90,
+            "verify",
+            36.0,
+        );
+        let other = cand("/r/beta/notes.md", "/r/beta", 0.80, "fresh", 1.0);
+        let p = params(3);
+        let leads = finalize_leads(vec![old.clone(), new.clone(), other.clone()], &p);
+        let paths: Vec<&str> = leads.iter().map(|c| c.path.as_str()).collect();
+        assert_eq!(paths, vec![new.path.as_str(), other.path.as_str()]);
+        assert_eq!(leads[0].older_versions, 1);
+        assert!(format_lead_line(1, &leads[0], None).ends_with("(supersedes 1 older)"));
+
+        let mut hist = params(3);
+        hist.history = true;
+        let leads = finalize_leads(vec![old.clone(), new.clone(), other.clone()], &hist);
+        let paths: Vec<&str> = leads.iter().map(|c| c.path.as_str()).collect();
+        assert_eq!(paths, vec![old.path.as_str(), other.path.as_str()]);
+        assert_eq!(leads[0].superseded_by.as_deref(), Some(new.path.as_str()));
+        let line = format_lead_line(1, &leads[0], None);
+        assert!(
+            line.ends_with("(superseded by HANDOFF-2026-09-10-orion.md)"),
+            "{}",
+            line
+        );
+
+        // The head already shown in this session: the older member surfaces, marked.
+        let mut shown = params(3);
+        shown.shown.insert(new.path.clone());
+        let leads = finalize_leads(vec![old.clone(), new.clone(), other.clone()], &shown);
+        assert_eq!(leads[0].path, old.path);
+        assert_eq!(leads[0].superseded_by.as_deref(), Some(new.path.as_str()));
+    }
+
+    #[test]
+    fn semantic_floor_is_on_raw_cosine_not_the_normalised_score() {
+        // A normalised fusion score of 1.0 (the top hit always is) with a weak cosine is not a
+        // lead; a modest fusion score with a strong cosine is.
+        let mut weak = cand("/r/a/a.md", "/r/a", 1.0, "fresh", 1.0);
+        weak.raw_similarity = Some(0.31);
+        let mut strong = cand("/r/b/b.md", "/r/b", 0.62, "fresh", 1.0);
+        strong.raw_similarity = Some(0.55);
+        let mut unknown = cand("/r/c/c.md", "/r/c", 0.9, "fresh", 1.0);
+        unknown.raw_similarity = None;
+        let out = prefilter(
+            vec![weak.clone(), strong.clone(), unknown.clone()],
+            &params(3),
+            true,
+        );
+        let paths: Vec<&str> = out.iter().map(|c| c.path.as_str()).collect();
+        assert_eq!(paths, vec!["/r/b/b.md"]);
+        // Lexical mode has no cosine: the base-score floor and ratio apply as before (0.62 is
+        // under 0.8 of the top base 1.0 and falls to the ratio floor, not the absolute one).
+        let out = prefilter(
+            vec![weak.clone(), strong.clone(), unknown.clone()],
+            &params(3),
+            false,
+        );
+        let paths: Vec<&str> = out.iter().map(|c| c.path.as_str()).collect();
+        assert_eq!(paths, vec!["/r/a/a.md", "/r/c/c.md"]);
+        let mut low = cand("/r/l/l.md", "/r/l", 0.39, "fresh", 1.0);
+        low.raw_similarity = None;
+        assert!(prefilter(vec![low], &params(3), false).is_empty());
+    }
+
+    /// The semantic floor follows `passes_raw_floor`, as search does: at 0 it is off and a
+    /// candidate without a cosine (a keyword-only hit, the lexical fallback inside a semantic
+    /// run) is admitted; at the default 0.40 the same candidate fails closed, as does a NaN.
+    #[test]
+    fn semantic_floor_zero_is_off_and_admits_a_candidate_without_a_cosine() {
+        let mut lexical_only = cand("/r/c/c.md", "/r/c", 0.9, "fresh", 1.0);
+        lexical_only.raw_similarity = None;
+        let mut nan = cand("/r/n/n.md", "/r/n", 0.88, "fresh", 1.0);
+        nan.raw_similarity = Some(f64::NAN);
+        let mut weak = cand("/r/a/a.md", "/r/a", 0.85, "fresh", 1.0);
+        weak.raw_similarity = Some(0.31);
+        let mut off = params(3);
+        off.min_abs_score = 0.0;
+        let out = prefilter(
+            vec![lexical_only.clone(), nan.clone(), weak.clone()],
+            &off,
+            true,
+        );
+        let paths: Vec<&str> = out.iter().map(|c| c.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["/r/c/c.md", "/r/n/n.md", "/r/a/a.md"],
+            "floor 0 applies no cosine requirement"
+        );
+        assert!(prefilter(vec![lexical_only.clone()], &params(3), true).is_empty());
+        assert!(prefilter(vec![nan.clone()], &params(3), true).is_empty());
+        assert!(prefilter(vec![weak.clone()], &params(3), true).is_empty());
+        // A floor just above 0 is not off.
+        let mut hair = params(3);
+        hair.min_abs_score = 0.01;
+        assert!(prefilter(vec![lexical_only], &hair, true).is_empty());
+        let mut strong = cand("/r/b/b.md", "/r/b", 0.62, "fresh", 1.0);
+        strong.raw_similarity = Some(0.55);
+        assert_eq!(prefilter(vec![strong], &hair, true).len(), 1);
     }
 
     #[test]
@@ -3211,6 +3483,7 @@ mod tests {
         let shortlist = prefilter(
             vec![a.clone(), b.clone(), c.clone(), d.clone(), e.clone()],
             &params(5),
+            true,
         );
         assert_eq!(shortlist.len(), 5);
         let leads = finalize_leads(shortlist, &params(5));
@@ -3240,7 +3513,11 @@ mod tests {
         c.base_score = 0.85;
         let mut d = cand("/r/d/d.md", "/r/d", 0.60, "fresh", 0.0); // recency alone cannot rescue it
         d.base_score = 0.30;
-        let shortlist = prefilter(vec![a.clone(), b.clone(), c.clone(), d.clone()], &params(5));
+        let shortlist = prefilter(
+            vec![a.clone(), b.clone(), c.clone(), d.clone()],
+            &params(5),
+            false,
+        );
         let paths: Vec<&str> = shortlist.iter().map(|c| c.path.as_str()).collect();
         assert_eq!(
             paths,
@@ -3255,13 +3532,13 @@ mod tests {
         // The absolute floor is on the base score: a recency-inflated blend does not pass.
         let mut weak = cand("/r/w/w.md", "/r/w", 0.45, "fresh", 0.0);
         weak.base_score = 0.39;
-        assert!(prefilter(vec![weak], &params(3)).is_empty());
+        assert!(prefilter(vec![weak], &params(3), false).is_empty());
         // Ratio floor on base: 0.79 of the top base is dropped even with a higher blend.
         let mut top = cand("/r/t/t.md", "/r/t", 0.90, "stale", 100.0);
         top.base_score = 1.0;
         let mut low = cand("/r/l/l.md", "/r/l", 0.95, "fresh", 0.0);
         low.base_score = 0.79;
-        let out = prefilter(vec![top, low], &params(3));
+        let out = prefilter(vec![top, low], &params(3), false);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].path, "/r/t/t.md");
     }
@@ -3300,7 +3577,7 @@ mod tests {
         lone.chunk_id = 1;
         let out = apply_lexical_confidence(vec![lone.clone()], &terms, &rp, &texts);
         assert!(out.is_empty());
-        assert!(prefilter(out, &params(3)).is_empty());
+        assert!(prefilter(out, &params(3), false).is_empty());
         // Mixed set: the one-term hit is dropped, the full match is rescored to 0.5*bm25+0.5*cov.
         let mut full = cand("/r/b/b.md", "/r/b", 0.7, "fresh", 1.0);
         full.chunk_id = 2;
@@ -3355,7 +3632,8 @@ mod tests {
     fn thresholds_drop_weak_results() {
         assert!(prefilter(
             vec![cand("/r/a/a.md", "/r/a", 0.39, "fresh", 1.0)],
-            &params(3)
+            &params(3),
+            true
         )
         .is_empty());
         let out = prefilter(
@@ -3365,6 +3643,7 @@ mod tests {
                 cand("/r/c/c.md", "/r/c", 0.79, "fresh", 1.0),
             ],
             &params(3),
+            true,
         );
         assert_eq!(out.len(), 2);
         let mut p = params(3);
@@ -3375,6 +3654,7 @@ mod tests {
                 cand("/r/b/b.md", "/r/b", 0.81, "fresh", 1.0),
             ],
             &p,
+            true,
         );
         assert_eq!(rooted.len(), 1);
         assert_eq!(rooted[0].path, "/r/b/b.md");
@@ -3606,10 +3886,10 @@ mod tests {
         c.older_versions = 2;
         let line = format_lead_line(1, &c, Some(HINT_MAX_CHARS));
         assert!(line.starts_with("1. /r/202609-x/BRIEF.md — "));
-        assert!(line.contains(" (2d, fresh, path-date) — 202609-x — \"escaped \u{2039}100-char\u{203a} hint & more\" (2 older versions)"));
+        assert!(line.contains(" (2d, fresh, path-date) — 202609-x — \"escaped \u{2039}100-char\u{203a} hint & more\" (supersedes 2 older)"));
         let no_hint = format_lead_line(2, &c, None);
         assert!(!no_hint.contains('"'));
-        assert!(no_hint.ends_with("(2 older versions)"));
+        assert!(no_hint.ends_with("(supersedes 2 older)"));
         let short_hint = format_lead_line(3, &c, Some(12));
         assert!(short_hint.contains(" — \"escaped ‹10…\""), "{}", short_hint);
     }

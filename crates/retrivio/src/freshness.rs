@@ -1,8 +1,11 @@
-//! Freshness model: content-date resolution, document class, recency score and tier labels.
-//! See docs/superpowers/specs/2026-09-19-proactive-recall-design.md §4.
+//! Freshness model: content-date resolution, recency score and tier labels.
+//! See docs/superpowers/specs/2026-09-19-proactive-recall-design.md §4; document roles
+//! (state, knowledge, record) live in `roles.rs` and decide how a date is chosen here.
 //!
 //! Everything here is pure arithmetic on paths, timestamps and small strings: no file I/O,
 //! no database access, no `chrono`. Callers supply `now` so results are reproducible in tests.
+
+use crate::roles::Role;
 
 /// Seconds in one UTC day.
 pub const DAY_SECS: f64 = 86_400.0;
@@ -162,7 +165,8 @@ pub fn path_date(path: &str) -> Option<f64> {
 ///
 /// Returns `(timestamp, source)` with source `"path-date"` or `"mtime"`. A candidate more than
 /// [`FUTURE_SLACK_DAYS`] ahead of `now` is implausible and is skipped; if both candidates are
-/// implausible the result falls back to `(doc_mtime, "mtime")`.
+/// implausible the result falls back to `(doc_mtime, "mtime")`. This is the rule for `state`
+/// and `knowledge` documents; see [`content_date_for_role`] for records.
 pub fn content_date(path: &str, doc_mtime: f64, now: f64) -> (f64, &'static str) {
     let horizon = now + FUTURE_SLACK_DAYS * DAY_SECS;
     let mtime_ok = doc_mtime.is_finite() && doc_mtime <= horizon;
@@ -175,6 +179,86 @@ pub fn content_date(path: &str, doc_mtime: f64, now: f64) -> (f64, &'static str)
         // Every candidate is implausibly far in the future (clock skew, bad archive
         // timestamps): treat the document as current rather than trusting a future date.
         (None, false) => (now, "mtime"),
+    }
+}
+
+/// Like [`path_date`], but the date may sit anywhere in a component at a token boundary
+/// (`HANDOFF-2026-08-28-orion.md`, `notes_20260828.md`), not only at its start. The most
+/// specific date wins, then the deepest component, then the first in the component.
+pub fn embedded_path_date(path: &str) -> Option<f64> {
+    let mut best: Option<(f64, u8)> = None;
+    for comp in path.split(['/', '\\']) {
+        let bytes = comp.as_bytes();
+        let mut comp_best: Option<(f64, u8)> = None;
+        for i in 0..bytes.len() {
+            if !bytes[i].is_ascii_digit() {
+                continue;
+            }
+            if i > 0 && bytes[i - 1].is_ascii_alphanumeric() {
+                continue;
+            }
+            if let Some((ts, precision)) = component_date(&comp[i..]) {
+                let better = match comp_best {
+                    None => true,
+                    Some((_, p)) => precision > p,
+                };
+                if better {
+                    comp_best = Some((ts, precision));
+                }
+            }
+        }
+        if let Some((ts, precision)) = comp_best {
+            let better = match best {
+                None => true,
+                Some((_, best_precision)) => precision >= best_precision,
+            };
+            if better {
+                best = Some((ts, precision));
+            }
+        }
+    }
+    best.map(|(ts, _)| ts)
+}
+
+/// Date that orders the revisions of one series (supersession): a plausible date anywhere in
+/// the path relative to the project ([`embedded_path_date`]: file name or directory, most
+/// specific wins), else the last edit, else `now`. Unlike [`content_date`] a fresh mtime never
+/// beats the date in the file name, so editing an old handoff does not make it the newest of
+/// its series. Pass the path relative to the project: a dated project folder must not date
+/// every file in it.
+pub fn revision_date(doc_rel_path: &str, doc_mtime: f64, now: f64) -> f64 {
+    let horizon = now + FUTURE_SLACK_DAYS * DAY_SECS;
+    if let Some(pd) = embedded_path_date(doc_rel_path).filter(|ts| *ts <= horizon) {
+        return pd;
+    }
+    if doc_mtime.is_finite() && doc_mtime <= horizon {
+        doc_mtime
+    } else {
+        now
+    }
+}
+
+/// Content date by role. Records are events: a plausible path date is *the* event date even
+/// when the file was edited later (a transcript touched up in September still happened in
+/// July); without a path date the mtime stands in until recall reads the front matter. State
+/// and knowledge use [`content_date`], the newer of path date and last edit.
+pub fn content_date_for_role(
+    path: &str,
+    doc_mtime: f64,
+    now: f64,
+    role: Role,
+) -> (f64, &'static str) {
+    if role != Role::Record {
+        return content_date(path, doc_mtime, now);
+    }
+    let horizon = now + FUTURE_SLACK_DAYS * DAY_SECS;
+    if let Some(pd) = path_date(path).filter(|ts| *ts <= horizon) {
+        return (pd, "path-date");
+    }
+    if doc_mtime.is_finite() && doc_mtime <= horizon {
+        (doc_mtime, "mtime")
+    } else {
+        (now, "mtime")
     }
 }
 
@@ -438,16 +522,6 @@ fn parse_ymd(value: &str) -> Option<f64> {
     civil_ts(y, m, d)
 }
 
-/// True when any non-empty pattern is a case-insensitive substring of `path`.
-/// Records are point-in-time artifacts (transcripts, handoffs, meeting notes ...).
-pub fn is_record(path: &str, patterns: &[String]) -> bool {
-    let lower = path.to_ascii_lowercase();
-    patterns.iter().any(|p| {
-        let p = p.trim();
-        !p.is_empty() && lower.contains(p.to_ascii_lowercase().as_str())
-    })
-}
-
 /// Exponential decay `0.5 ^ (max(age, 0) / half_life)`; 1.0 for brand-new content.
 pub fn recency_score(age_days: f64, half_life_days: f64) -> f64 {
     let half_life = if half_life_days.is_finite() && half_life_days > 0.0 {
@@ -471,16 +545,39 @@ pub fn blend(score: f64, recency: f64, weight: f64) -> f64 {
 
 /// Display tier: `fresh` (< 14 d), `aging` (14..=35 d), `stale` (> 35 d); records are `record`.
 pub fn tier(age_days: f64, is_record: bool) -> &'static str {
-    if is_record {
-        return "record";
+    tier_for_role(
+        age_days,
+        if is_record {
+            Role::Record
+        } else {
+            Role::Knowledge
+        },
+    )
+}
+
+/// Display tier by role. Records are events and never stale: always `record`. State
+/// (handoffs, status, plans) older than 35 days is `verify`: it was the truth once and must be
+/// checked before it is repeated. Knowledge keeps `fresh` / `aging` / `stale`.
+pub fn tier_for_role(age_days: f64, role: Role) -> &'static str {
+    match role {
+        Role::Record => "record",
+        Role::State | Role::Knowledge => {
+            if age_days < FRESH_MAX_DAYS {
+                "fresh"
+            } else if age_days <= AGING_MAX_DAYS {
+                "aging"
+            } else if role == Role::State {
+                "verify"
+            } else {
+                "stale"
+            }
+        }
     }
-    if age_days < FRESH_MAX_DAYS {
-        "fresh"
-    } else if age_days <= AGING_MAX_DAYS {
-        "aging"
-    } else {
-        "stale"
-    }
+}
+
+/// True when a `state` document is old enough that its facts need re-checking (> 35 days).
+pub fn needs_verify(age_days: f64, role: Role) -> bool {
+    role == Role::State && age_days > AGING_MAX_DAYS
 }
 
 /// Age in days of `ts` relative to `now`, never negative.
@@ -802,17 +899,35 @@ mod tests {
     }
 
     #[test]
-    fn record_detection_is_case_insensitive_substring() {
-        let patterns: Vec<String> = ["transcript", "docs/sessions", "HANDOFF", ".srt"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        assert!(is_record("/x/Transcripts/2026-call.md", &patterns));
-        assert!(is_record("/x/docs/sessions/HANDOFF-2026.md", &patterns));
-        assert!(is_record("/x/media/call.SRT", &patterns));
-        assert!(!is_record("/x/src/main.rs", &patterns));
-        assert!(!is_record("/x/src/main.rs", &[]));
-        assert!(!is_record("/x/src/main.rs", &[" ".to_string()]));
+    fn records_are_dated_by_the_event_not_the_last_edit() {
+        let now = ymd(2026, 9, 19);
+        // A transcript from July, touched up in September: still a July event.
+        let (ts, src) = content_date_for_role(
+            "customer-signals/acme/20260715-workshop/transcript.txt",
+            ymd(2026, 9, 10),
+            now,
+            Role::Record,
+        );
+        assert_eq!((ts, src), (ymd(2026, 7, 15), "path-date"));
+        // The same file as knowledge would take the newer edit.
+        let (ts, src) = content_date_for_role(
+            "customer-signals/acme/20260715-workshop/transcript.txt",
+            ymd(2026, 9, 10),
+            now,
+            Role::Knowledge,
+        );
+        assert_eq!((ts, src), (ymd(2026, 9, 10), "mtime"));
+        // No path date: the mtime stands in.
+        let (ts, src) =
+            content_date_for_role("transcripts/call.txt", ymd(2026, 8, 1), now, Role::Record);
+        assert_eq!((ts, src), (ymd(2026, 8, 1), "mtime"));
+        // A future path date is implausible; a future mtime too.
+        let (ts, src) =
+            content_date_for_role("20271231-call.txt", ymd(2026, 8, 1), now, Role::Record);
+        assert_eq!((ts, src), (ymd(2026, 8, 1), "mtime"));
+        let (ts, src) =
+            content_date_for_role("transcripts/call.txt", ymd(2030, 1, 1), now, Role::Record);
+        assert_eq!((ts, src), (now, "mtime"));
     }
 
     #[test]
@@ -849,6 +964,17 @@ mod tests {
         assert_eq!(tier(400.0, false), "stale");
         assert_eq!(tier(400.0, true), "record");
         assert_eq!(tier(1.0, true), "record");
+        // By role: state turns to `verify` instead of `stale`; records never age out.
+        assert_eq!(tier_for_role(3.0, Role::State), "fresh");
+        assert_eq!(tier_for_role(20.0, Role::State), "aging");
+        assert_eq!(tier_for_role(36.0, Role::State), "verify");
+        assert_eq!(tier_for_role(36.0, Role::Knowledge), "stale");
+        assert_eq!(tier_for_role(36.0, Role::Record), "record");
+        assert_eq!(tier_for_role(1.0, Role::Record), "record");
+        assert!(needs_verify(36.0, Role::State));
+        assert!(!needs_verify(35.0, Role::State));
+        assert!(!needs_verify(400.0, Role::Knowledge));
+        assert!(!needs_verify(400.0, Role::Record));
     }
 
     #[test]

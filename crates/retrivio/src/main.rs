@@ -26,12 +26,15 @@ use serde_json::Value;
 use sha1::{Digest, Sha1};
 use xxhash_rust::xxh64;
 
+use crate::roles::{Role, TextShape};
+
 mod code_intel;
 mod documents;
 mod freshness;
 mod hook_install;
 mod lance_store;
 mod recall;
+mod roles;
 
 const APP_STATE_ACTIVE_MODEL_KEY: &str = "active_model_key";
 const APP_STATE_REEMBED_REQUIRED: &str = "reembed_required";
@@ -2761,7 +2764,11 @@ fn config_rows() -> Vec<(&'static str, &'static str)> {
         ),
         (
             "recall_min_abs_score",
-            "Recall: min absolute score for the top lead",
+            "Recall: min raw cosine similarity a lead must reach (semantic mode)",
+        ),
+        (
+            "search_min_abs_score",
+            "Search: min raw cosine similarity for file results (0 = off)",
         ),
         (
             "recall_band_ratio",
@@ -2864,6 +2871,7 @@ fn config_value_string(cfg: &ConfigValues, key: &str) -> Option<String> {
         "recall_max_leads" => Some(cfg.recall_max_leads.to_string()),
         "recall_min_score_ratio" => Some(format!("{:.6}", cfg.recall_min_score_ratio)),
         "recall_min_abs_score" => Some(format!("{:.6}", cfg.recall_min_abs_score)),
+        "search_min_abs_score" => Some(format!("{:.6}", cfg.search_min_abs_score)),
         "recall_band_ratio" => Some(format!("{:.6}", cfg.recall_band_ratio)),
         "recall_roots" => Some(cfg.recall_roots.clone()),
         "recall_excerpts" => Some(cfg.recall_excerpts.to_string()),
@@ -2871,6 +2879,16 @@ fn config_value_string(cfg: &ConfigValues, key: &str) -> Option<String> {
         "recall_semantic" => Some(cfg.recall_semantic.clone()),
         "recall_session_ttl_days" => Some(format!("{:.6}", cfg.recall_session_ttl_days)),
         _ => None,
+    }
+}
+
+/// A float setting must be a finite number. `nan`, `inf` and `infinity` parse as `f64`, but
+/// `clamp` passes NaN through and pins an infinity to a bound the user did not name, and a
+/// written NaN is then dropped at load with the default applied silently.
+fn parse_finite_f64(key: &str, value: &str) -> Result<f64, String> {
+    match value.parse::<f64>() {
+        Ok(v) if v.is_finite() => Ok(v),
+        _ => Err(format!("{} must be a finite number", key)),
     }
 }
 
@@ -3012,85 +3030,60 @@ fn config_set_value(cfg: &mut ConfigValues, key: &str, raw: &str) -> Result<(), 
             cfg.lexical_candidates = value
                 .parse::<i64>()
                 .map_err(|_| "lexical_candidates must be an integer".to_string())?
-                .clamp(10, 5000);
+                .clamp(20, 1000);
         }
         "vector_candidates" => {
             cfg.vector_candidates = value
                 .parse::<i64>()
                 .map_err(|_| "vector_candidates must be an integer".to_string())?
-                .clamp(10, 5000);
+                .clamp(20, 1000);
         }
         "rank_chunk_semantic_weight" => {
-            cfg.rank_chunk_semantic_weight = value
-                .parse::<f64>()
-                .map_err(|_| "rank_chunk_semantic_weight must be a number".to_string())?
-                .clamp(0.0, 1.0);
+            cfg.rank_chunk_semantic_weight =
+                parse_finite_f64("rank_chunk_semantic_weight", value)?.clamp(0.0, 1.0);
         }
         "rank_chunk_lexical_weight" => {
-            cfg.rank_chunk_lexical_weight = value
-                .parse::<f64>()
-                .map_err(|_| "rank_chunk_lexical_weight must be a number".to_string())?
-                .clamp(0.0, 1.0);
+            cfg.rank_chunk_lexical_weight =
+                parse_finite_f64("rank_chunk_lexical_weight", value)?.clamp(0.0, 1.0);
         }
         "rank_chunk_graph_weight" => {
-            cfg.rank_chunk_graph_weight = value
-                .parse::<f64>()
-                .map_err(|_| "rank_chunk_graph_weight must be a number".to_string())?
-                .clamp(0.0, 1.0);
+            cfg.rank_chunk_graph_weight =
+                parse_finite_f64("rank_chunk_graph_weight", value)?.clamp(0.0, 1.0);
         }
         "rank_quality_mix" => {
-            cfg.rank_quality_mix = value
-                .parse::<f64>()
-                .map_err(|_| "rank_quality_mix must be a number".to_string())?
-                .clamp(0.0, 1.0);
+            cfg.rank_quality_mix = parse_finite_f64("rank_quality_mix", value)?.clamp(0.0, 1.0);
         }
         "rank_relation_quality_good_boost" => {
-            cfg.rank_relation_quality_good_boost = value
-                .parse::<f64>()
-                .map_err(|_| "rank_relation_quality_good_boost must be a number".to_string())?
-                .clamp(0.0, 1.0);
+            cfg.rank_relation_quality_good_boost =
+                parse_finite_f64("rank_relation_quality_good_boost", value)?.clamp(0.0, 1.0);
         }
         "rank_relation_quality_weak_penalty" => {
-            cfg.rank_relation_quality_weak_penalty = value
-                .parse::<f64>()
-                .map_err(|_| "rank_relation_quality_weak_penalty must be a number".to_string())?
-                .clamp(0.0, 1.0);
+            cfg.rank_relation_quality_weak_penalty =
+                parse_finite_f64("rank_relation_quality_weak_penalty", value)?.clamp(0.0, 1.0);
         }
         "rank_relation_quality_wrong_penalty" => {
-            cfg.rank_relation_quality_wrong_penalty = value
-                .parse::<f64>()
-                .map_err(|_| "rank_relation_quality_wrong_penalty must be a number".to_string())?
-                .clamp(0.0, 1.0);
+            cfg.rank_relation_quality_wrong_penalty =
+                parse_finite_f64("rank_relation_quality_wrong_penalty", value)?.clamp(0.0, 1.0);
         }
         "rank_project_content_weight" => {
-            cfg.rank_project_content_weight = value
-                .parse::<f64>()
-                .map_err(|_| "rank_project_content_weight must be a number".to_string())?
-                .clamp(0.0, 2.0);
+            cfg.rank_project_content_weight =
+                parse_finite_f64("rank_project_content_weight", value)?.clamp(0.0, 2.0);
         }
         "rank_project_semantic_weight" => {
-            cfg.rank_project_semantic_weight = value
-                .parse::<f64>()
-                .map_err(|_| "rank_project_semantic_weight must be a number".to_string())?
-                .clamp(0.0, 2.0);
+            cfg.rank_project_semantic_weight =
+                parse_finite_f64("rank_project_semantic_weight", value)?.clamp(0.0, 2.0);
         }
         "rank_project_path_weight" => {
-            cfg.rank_project_path_weight = value
-                .parse::<f64>()
-                .map_err(|_| "rank_project_path_weight must be a number".to_string())?
-                .clamp(0.0, 2.0);
+            cfg.rank_project_path_weight =
+                parse_finite_f64("rank_project_path_weight", value)?.clamp(0.0, 2.0);
         }
         "rank_project_graph_weight" => {
-            cfg.rank_project_graph_weight = value
-                .parse::<f64>()
-                .map_err(|_| "rank_project_graph_weight must be a number".to_string())?
-                .clamp(0.0, 2.0);
+            cfg.rank_project_graph_weight =
+                parse_finite_f64("rank_project_graph_weight", value)?.clamp(0.0, 2.0);
         }
         "rank_project_frecency_weight" => {
-            cfg.rank_project_frecency_weight = value
-                .parse::<f64>()
-                .map_err(|_| "rank_project_frecency_weight must be a number".to_string())?
-                .clamp(0.0, 2.0);
+            cfg.rank_project_frecency_weight =
+                parse_finite_f64("rank_project_frecency_weight", value)?.clamp(0.0, 2.0);
         }
         "graph_seed_limit" => {
             cfg.graph_seed_limit = value
@@ -3105,34 +3098,22 @@ fn config_set_value(cfg: &mut ConfigValues, key: &str, raw: &str) -> Result<(), 
                 .clamp(8, 500);
         }
         "graph_same_project_high" => {
-            cfg.graph_same_project_high = value
-                .parse::<f64>()
-                .map_err(|_| "graph_same_project_high must be a number".to_string())?
-                .clamp(0.0, 1.0);
+            cfg.graph_same_project_high =
+                parse_finite_f64("graph_same_project_high", value)?.clamp(0.0, 1.0);
         }
         "graph_same_project_low" => {
-            cfg.graph_same_project_low = value
-                .parse::<f64>()
-                .map_err(|_| "graph_same_project_low must be a number".to_string())?
-                .clamp(0.0, 1.0);
+            cfg.graph_same_project_low =
+                parse_finite_f64("graph_same_project_low", value)?.clamp(0.0, 1.0);
         }
         "graph_related_base" => {
-            cfg.graph_related_base = value
-                .parse::<f64>()
-                .map_err(|_| "graph_related_base must be a number".to_string())?
-                .clamp(0.0, 1.0);
+            cfg.graph_related_base = parse_finite_f64("graph_related_base", value)?.clamp(0.0, 1.0);
         }
         "graph_related_scale" => {
-            cfg.graph_related_scale = value
-                .parse::<f64>()
-                .map_err(|_| "graph_related_scale must be a number".to_string())?
-                .clamp(0.0, 2.0);
+            cfg.graph_related_scale =
+                parse_finite_f64("graph_related_scale", value)?.clamp(0.0, 2.0);
         }
         "graph_related_cap" => {
-            cfg.graph_related_cap = value
-                .parse::<f64>()
-                .map_err(|_| "graph_related_cap must be a number".to_string())?
-                .clamp(0.0, 1.0);
+            cfg.graph_related_cap = parse_finite_f64("graph_related_cap", value)?.clamp(0.0, 1.0);
         }
         "hyde_enabled" => cfg.hyde_enabled = parse_bool_setting(key, value)?,
         "reranker_enabled" => cfg.reranker_enabled = parse_bool_setting(key, value)?,
@@ -3161,28 +3142,20 @@ fn config_set_value(cfg: &mut ConfigValues, key: &str, raw: &str) -> Result<(), 
                 .clamp(500, 30_000);
         }
         "rank_recency_weight" => {
-            cfg.rank_recency_weight = value
-                .parse::<f64>()
-                .map_err(|_| "rank_recency_weight must be a number".to_string())?
-                .clamp(0.0, 0.5);
+            cfg.rank_recency_weight =
+                parse_finite_f64("rank_recency_weight", value)?.clamp(0.0, 0.5);
         }
         "rank_recency_record_weight" => {
-            cfg.rank_recency_record_weight = value
-                .parse::<f64>()
-                .map_err(|_| "rank_recency_record_weight must be a number".to_string())?
-                .clamp(0.0, 0.5);
+            cfg.rank_recency_record_weight =
+                parse_finite_f64("rank_recency_record_weight", value)?.clamp(0.0, 0.5);
         }
         "recency_half_life_days" => {
-            cfg.recency_half_life_days = value
-                .parse::<f64>()
-                .map_err(|_| "recency_half_life_days must be a number".to_string())?
-                .clamp(1.0, 3650.0);
+            cfg.recency_half_life_days =
+                parse_finite_f64("recency_half_life_days", value)?.clamp(1.0, 3650.0);
         }
         "recency_record_half_life_days" => {
-            cfg.recency_record_half_life_days = value
-                .parse::<f64>()
-                .map_err(|_| "recency_record_half_life_days must be a number".to_string())?
-                .clamp(1.0, 3650.0);
+            cfg.recency_record_half_life_days =
+                parse_finite_f64("recency_record_half_life_days", value)?.clamp(1.0, 3650.0);
         }
         "recency_record_patterns" => {
             cfg.recency_record_patterns = split_csv_setting(value).join(",");
@@ -3205,22 +3178,19 @@ fn config_set_value(cfg: &mut ConfigValues, key: &str, raw: &str) -> Result<(), 
                 .clamp(1, 5);
         }
         "recall_min_score_ratio" => {
-            cfg.recall_min_score_ratio = value
-                .parse::<f64>()
-                .map_err(|_| "recall_min_score_ratio must be a number".to_string())?
-                .clamp(0.1, 1.0);
+            cfg.recall_min_score_ratio =
+                parse_finite_f64("recall_min_score_ratio", value)?.clamp(0.1, 1.0);
         }
         "recall_min_abs_score" => {
-            cfg.recall_min_abs_score = value
-                .parse::<f64>()
-                .map_err(|_| "recall_min_abs_score must be a number".to_string())?
-                .clamp(0.0, 1.0);
+            cfg.recall_min_abs_score =
+                parse_finite_f64("recall_min_abs_score", value)?.clamp(0.0, 1.0);
+        }
+        "search_min_abs_score" => {
+            cfg.search_min_abs_score =
+                parse_finite_f64("search_min_abs_score", value)?.clamp(0.0, 1.0);
         }
         "recall_band_ratio" => {
-            cfg.recall_band_ratio = value
-                .parse::<f64>()
-                .map_err(|_| "recall_band_ratio must be a number".to_string())?
-                .clamp(0.5, 1.0);
+            cfg.recall_band_ratio = parse_finite_f64("recall_band_ratio", value)?.clamp(0.5, 1.0);
         }
         "recall_roots" => {
             cfg.recall_roots = split_csv_setting(value).join(",");
@@ -3235,10 +3205,8 @@ fn config_set_value(cfg: &mut ConfigValues, key: &str, raw: &str) -> Result<(), 
             cfg.recall_semantic = v;
         }
         "recall_session_ttl_days" => {
-            cfg.recall_session_ttl_days = value
-                .parse::<f64>()
-                .map_err(|_| "recall_session_ttl_days must be a number".to_string())?
-                .clamp(1.0, 30.0);
+            cfg.recall_session_ttl_days =
+                parse_finite_f64("recall_session_ttl_days", value)?.clamp(1.0, 30.0);
         }
         _ => return Err(format!("unknown config key '{}'", key)),
     }
@@ -4695,14 +4663,14 @@ fn autotune_recommendation(
         }
 
         let lexical_vals = unique_i64(vec![
-            (best_cfg.lexical_candidates - 40).clamp(20, 5000),
-            best_cfg.lexical_candidates.clamp(20, 5000),
-            (best_cfg.lexical_candidates + 40).clamp(20, 5000),
+            (best_cfg.lexical_candidates - 40).clamp(20, 1000),
+            best_cfg.lexical_candidates.clamp(20, 1000),
+            (best_cfg.lexical_candidates + 40).clamp(20, 1000),
         ]);
         let vector_vals = unique_i64(vec![
-            (best_cfg.vector_candidates - 40).clamp(20, 5000),
-            best_cfg.vector_candidates.clamp(20, 5000),
-            (best_cfg.vector_candidates + 40).clamp(20, 5000),
+            (best_cfg.vector_candidates - 40).clamp(20, 1000),
+            best_cfg.vector_candidates.clamp(20, 1000),
+            (best_cfg.vector_candidates + 40).clamp(20, 1000),
         ]);
         for lexical in &lexical_vals {
             for vector in &vector_vals {
@@ -9792,9 +9760,10 @@ fn format_bytes(bytes: u64) -> String {
 fn run_search_cmd(args: &[OsString]) {
     if args.iter().any(|a| a == "-h" || a == "--help") {
         println!(
-            "usage: retrivio search [--view projects|files] [--limit <n>] [--since <days>] [--json] <query...>"
+            "usage: retrivio search [--view projects|files] [--limit <n>] [--since <days>] [--include-superseded] [--json] <query...>"
         );
         println!("  --since <days>  files view only: drop results whose content date is older");
+        println!("  --include-superseded  files view only: show older handoffs/status files of a series at full strength");
         println!("  --json          emit the same JSON payload as the API GET /search");
         return;
     }
@@ -9803,6 +9772,7 @@ fn run_search_cmd(args: &[OsString]) {
     let mut view = "projects".to_string();
     let mut json_output = false;
     let mut since_days: Option<f64> = None;
+    let mut include_superseded = false;
     let mut query_parts: Vec<String> = Vec::new();
 
     let parse_since = |v: &str| -> f64 {
@@ -9820,6 +9790,11 @@ fn run_search_cmd(args: &[OsString]) {
         let s = args[i].to_string_lossy().to_string();
         if s == "--json" {
             json_output = true;
+            i += 1;
+            continue;
+        }
+        if s == "--include-superseded" {
+            include_superseded = true;
             i += 1;
             continue;
         }
@@ -9914,6 +9889,8 @@ fn run_search_cmd(args: &[OsString]) {
     if view == "files" {
         let opts = RankOptions {
             since_days,
+            include_superseded,
+            min_raw_similarity: cfg.search_min_abs_score,
             ..RankOptions::default()
         };
         let rows = rank_files_native_with(&conn, &cfg, &query, limit, opts).unwrap_or_else(|e| {
@@ -13689,16 +13666,84 @@ fn hybrid_search_lance(
     get_or_open_lance(dummy, dim)?;
     let semantic_scores =
         with_lance_store(|store| lance_store::search_vectors(store, query_vector, semantic_limit))?;
+    if env::var("RETRIVIO_DEBUG_BACKFILL")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
+        let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+        for h in semantic_scores.values() {
+            lo = lo.min(h.raw_similarity);
+            hi = hi.max(h.raw_similarity);
+        }
+        let mut ids: Vec<i64> = semantic_scores.keys().copied().collect();
+        ids.sort_unstable();
+        let probe = env::var("RETRIVIO_DEBUG_CHUNK")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok());
+        eprintln!(
+            "lance: {} of {} requested vector hits, cosine {:.3} to {:.3}, id-set hash {:016x}{}",
+            semantic_scores.len(),
+            semantic_limit,
+            lo,
+            hi,
+            xxh64::xxh64(format!("{:?}", ids).as_bytes(), 0),
+            probe
+                .map(|id| format!(
+                    ", chunk {} {}",
+                    id,
+                    if semantic_scores.contains_key(&id) {
+                        "present"
+                    } else {
+                        "absent"
+                    }
+                ))
+                .unwrap_or_default()
+        );
+    }
 
     // 2. SQLite FTS5 BM25 search (existing function)
     let lexical_signals = search_lexical_chunks_sqlite(conn, query, lexical_limit)?;
+    if env::var("RETRIVIO_DEBUG_BACKFILL")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
+        let mut ids: Vec<i64> = lexical_signals.keys().copied().collect();
+        ids.sort_unstable();
+        let probe = env::var("RETRIVIO_DEBUG_CHUNK")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok());
+        eprintln!(
+            "fts: {} of {} requested keyword hits, id-set hash {:016x}{}",
+            lexical_signals.len(),
+            lexical_limit,
+            xxh64::xxh64(format!("{:?}", ids).as_bytes(), 0),
+            probe
+                .map(|id| format!(
+                    ", chunk {} {}",
+                    id,
+                    if lexical_signals.contains_key(&id) {
+                        "present"
+                    } else {
+                        "absent"
+                    }
+                ))
+                .unwrap_or_default()
+        );
+    }
     let lexical_scores: HashMap<i64, f64> = lexical_signals
         .iter()
         .map(|(id, sig)| (*id, sig.lexical))
         .collect();
 
-    // 3. Join with metadata via existing chunk_signals_for_ids()
-    chunk_signals_for_ids(conn, &semantic_scores, &lexical_scores)
+    // 3. Join with metadata via existing chunk_signals_for_ids(); lexical-only hits get their
+    //    cosine from the SQLite vectors so every candidate carries a raw similarity.
+    chunk_signals_for_ids(
+        conn,
+        &semantic_scores,
+        &lexical_scores,
+        &CoverageTerms::from_query(query),
+        Some((model_key, query_vector)),
+    )
 }
 
 fn pick_num3(value: f64) -> String {
@@ -14525,6 +14570,8 @@ fn handle_api_request(req: ApiRequest) -> (u16, Value) {
             if view == "files" {
                 let opts = RankOptions {
                     since_days,
+                    include_superseded: parse_bool_flag(req.query.get("include_superseded")),
+                    min_raw_similarity: cfg.search_min_abs_score,
                     ..RankOptions::default()
                 };
                 let rows = match rank_files_native_with(&conn, &cfg, &q, limit, opts) {
@@ -16005,20 +16052,21 @@ fn mcp_tool_specs() -> Vec<Value> {
         }),
         serde_json::json!({
             "name": "search_files",
-            "description": "Semantic search across indexed files (with project context). Results carry content_date, age_days, freshness_tier and is_record.",
+            "description": "Semantic search across indexed files (with project context). Results carry content_date, age_days, freshness_tier, role (state/knowledge/record), verify, noise, raw_similarity (cosine) and superseded_by (newer file of the same handoff/status series).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "query": {"type": "string"},
                     "limit": {"type": "integer", "default": 20},
-                    "since_days": {"type": "number", "description": "Only return files whose content date is within this many days."}
+                    "since_days": {"type": "number", "description": "Only return files whose content date is within this many days."},
+                    "include_superseded": {"type": "boolean", "default": false, "description": "Rank superseded state files (older handoffs of a series) at full strength; implied when the query asks for history explicitly (history, previous/earlier version, what did ... say, originally, changelog, timeline, back in, a month name, a year or a date)."}
                 },
                 "required": ["query"]
             }
         }),
         serde_json::json!({
             "name": "search_chunks",
-            "description": "Semantic+keyword search across indexed chunks/segments. Results carry content_date, age_days, freshness_tier and is_record.",
+            "description": "Semantic+keyword search across indexed chunks/segments. Results carry content_date, age_days, freshness_tier, role, verify, noise and raw_similarity (cosine).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -16308,10 +16356,16 @@ fn mcp_tool_call(name: &str, args: &Value) -> Result<Value, String> {
                 .unwrap_or(20)
                 .clamp(1, 100) as usize;
             let since_days = mcp_since_days(args);
+            let include_superseded = args
+                .get("include_superseded")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             ensure_native_embed_backend(&cfg, "mcp search_files")?;
             ensure_retrieval_backend_ready(&cfg, true, "mcp search_files")?;
             let opts = RankOptions {
                 since_days,
+                include_superseded,
+                min_raw_similarity: cfg.search_min_abs_score,
                 ..RankOptions::default()
             };
             let rows = rank_files_native_with(&conn, &cfg, &query, limit, opts)?;
@@ -18519,12 +18573,14 @@ struct EvidenceHit {
     relation: String,
     quality: f64,
     excerpt: String,
-    // Freshness (spec §4)
+    // Freshness (spec §4) and role (slice 3)
     content_date: f64,
     date_source: &'static str,
     age_days: f64,
     freshness_tier: String,
     is_record: bool,
+    role: &'static str,
+    raw_similarity: Option<f64>,
     recency: f64,
 }
 
@@ -18566,6 +18622,17 @@ pub(crate) struct RankedFileResult {
     pub(crate) age_days: f64,
     pub(crate) freshness_tier: String,
     pub(crate) is_record: bool,
+    // Roles, honesty and supersession (slice 3)
+    /// `state`, `knowledge` or `record`; see `roles.rs`.
+    pub(crate) role: &'static str,
+    /// True for `state` older than 35 days: the facts were current once and need re-checking.
+    pub(crate) verify: bool,
+    /// True when the best chunk is a machine artefact (chat dump, lockfile, minified code).
+    pub(crate) noise: bool,
+    /// Cosine similarity of the best chunk to the query; `None` in lexical-only mode.
+    pub(crate) raw_similarity: Option<f64>,
+    /// For `state` files, the newest file of the same series when this one is not it.
+    pub(crate) superseded_by: Option<String>,
 }
 
 #[derive(Clone)]
@@ -18582,13 +18649,17 @@ struct RankedChunkResult {
     relation: String,
     quality: f64,
     excerpt: String,
-    // Freshness (spec §4)
+    // Freshness (spec §4) and role (slice 3)
     doc_mtime: f64,
     content_date: f64,
     date_source: &'static str,
     age_days: f64,
     freshness_tier: String,
     is_record: bool,
+    role: &'static str,
+    verify: bool,
+    noise: bool,
+    raw_similarity: Option<f64>,
 }
 
 /// Optional knobs for the file/chunk ranking entry points.
@@ -18598,9 +18669,30 @@ pub(crate) struct RankOptions {
     pub(crate) since_days: Option<f64>,
     /// Skip embeddings entirely and rank from FTS5 lexical signals only (recall fallback).
     pub(crate) lexical_only: bool,
+    /// Show superseded `state` files at full strength (also implied by a history query).
+    pub(crate) include_superseded: bool,
+    /// Raw-cosine floor (0 = off). In semantic mode a candidate passes only with a finite
+    /// cosine at or above it: a missing or NaN cosine fails closed. `lexical_only` retrieval
+    /// has no cosine and applies no floor.
+    pub(crate) min_raw_similarity: f64,
 }
 
-/// Resolved freshness facts for one document (spec §4).
+/// A raw-cosine floor fails closed: a candidate passes only with a finite cosine at or above
+/// the floor. A floor of 0 is off and keeps everything, cosine or not.
+fn passes_raw_floor(raw: Option<f64>, floor: f64) -> bool {
+    if floor <= 0.0 {
+        return true;
+    }
+    matches!(raw, Some(r) if r.is_finite() && r >= floor)
+}
+
+/// Score multiplier for a `state` file that a newer file of the same series supersedes.
+const SUPERSEDED_FACTOR: f64 = 0.85;
+/// Score multiplier for a file whose role matches what the prompt asks for (records for
+/// "what did they say on the call", state for "current status").
+const ROLE_HINT_BOOST: f64 = 1.06;
+
+/// Resolved freshness facts for one document (spec §4), plus its role (slice 3).
 #[derive(Clone)]
 struct FreshnessInfo {
     doc_mtime: f64,
@@ -18609,6 +18701,8 @@ struct FreshnessInfo {
     age_days: f64,
     tier: &'static str,
     is_record: bool,
+    role: Role,
+    verify: bool,
     recency: f64,
 }
 
@@ -18639,10 +18733,22 @@ impl FreshnessCtx {
         }
     }
 
-    fn info(&self, path: &str, doc_mtime: f64) -> FreshnessInfo {
-        let (content_date, date_source) = freshness::content_date(path, doc_mtime, self.now);
+    /// Freshness and role for one document. The role comes from the path *relative to the
+    /// project* (components and file name) plus the shape of the retrieved chunk text; the
+    /// date comes from the absolute path (project folders carry dates too) and the mtime, by
+    /// role.
+    fn info(
+        &self,
+        doc_rel_path: &str,
+        doc_path: &str,
+        doc_mtime: f64,
+        shape: TextShape,
+    ) -> FreshnessInfo {
+        let role = roles::classify(doc_rel_path, shape, &self.record_patterns);
+        let (content_date, date_source) =
+            freshness::content_date_for_role(doc_path, doc_mtime, self.now, role);
         let age = freshness::age_days(self.now, content_date);
-        let is_record = freshness::is_record(path, &self.record_patterns);
+        let is_record = role.is_record();
         let half_life = if is_record {
             self.record_half_life
         } else {
@@ -18653,10 +18759,17 @@ impl FreshnessCtx {
             content_date,
             date_source,
             age_days: age,
-            tier: freshness::tier(age, is_record),
+            tier: freshness::tier_for_role(age, role),
             is_record,
+            role,
+            verify: freshness::needs_verify(age, role),
             recency: freshness::recency_score(age, half_life),
         }
+    }
+
+    /// [`Self::info`] for a retrieved chunk.
+    fn info_for(&self, row: &ChunkSignal) -> FreshnessInfo {
+        self.info(&row.doc_rel_path, &row.doc_path, row.doc_mtime, row.shape)
     }
 
     fn weight(&self, is_record: bool) -> f64 {
@@ -18745,6 +18858,10 @@ fn ranked_chunk_result_json(item: &RankedChunkResult) -> Value {
         "age_days": item.age_days,
         "freshness_tier": item.freshness_tier,
         "is_record": item.is_record,
+        "role": item.role,
+        "verify": item.verify,
+        "noise": item.noise,
+        "raw_similarity": item.raw_similarity,
     })
 }
 
@@ -18766,6 +18883,8 @@ fn evidence_hit_json(ev: &EvidenceHit) -> Value {
         "age_days": ev.age_days,
         "freshness_tier": ev.freshness_tier,
         "is_record": ev.is_record,
+        "role": ev.role,
+        "raw_similarity": ev.raw_similarity,
     })
 }
 
@@ -18791,6 +18910,11 @@ fn ranked_file_result_json(item: &RankedFileResult) -> Value {
         "age_days": item.age_days,
         "freshness_tier": item.freshness_tier,
         "is_record": item.is_record,
+        "role": item.role,
+        "verify": item.verify,
+        "noise": item.noise,
+        "raw_similarity": item.raw_similarity,
+        "superseded_by": item.superseded_by,
         "evidence": evidence,
     })
 }
@@ -18858,12 +18982,260 @@ struct ChunkSignal {
     doc_path: String,
     doc_rel_path: String,
     doc_mtime: f64,
+    /// Min-max normalised over the vector hits of this query (relative signal for fusion).
     semantic: f64,
     lexical: f64,
     graph: f64,
     relation: String,
     quality: f64,
     excerpt: String,
+    /// Cosine similarity to the query vector; `None` when no query vector was used.
+    raw_similarity: Option<f64>,
+    /// Shape of the chunk text (prose, transcript, chat dump).
+    shape: TextShape,
+    /// Machine artefact: chat dump, lockfile, minified code, `.jsonl`/`.log` dump.
+    noise: bool,
+    /// Every query term (or a capitalised name from the query) occurs in the chunk text.
+    strong_lexical: bool,
+}
+
+/// Facts about a chunk's text that the ranker needs at query time, computed once per row.
+struct TextFacts {
+    quality: f64,
+    shape: TextShape,
+    noise: bool,
+    strong_lexical: bool,
+}
+
+fn text_facts(doc_rel_path: &str, text: &str, cover: &CoverageTerms) -> TextFacts {
+    let shape = roles::text_shape(text);
+    TextFacts {
+        quality: content_quality_with_shape(doc_rel_path, text, shape),
+        shape,
+        noise: is_noise_artifact(doc_rel_path, shape),
+        strong_lexical: cover.strong_match(text),
+    }
+}
+
+/// Verbs and fillers that open task prompts. Capitalised only because they start the prompt or
+/// a sentence, they are never names ("Run the tests", "Summarize this", "Please review").
+const PROMPT_VERBS: &[&str] = &[
+    "run",
+    "read",
+    "write",
+    "fix",
+    "check",
+    "review",
+    "update",
+    "create",
+    "make",
+    "add",
+    "remove",
+    "delete",
+    "show",
+    "list",
+    "find",
+    "explain",
+    "tell",
+    "give",
+    "look",
+    "open",
+    "start",
+    "stop",
+    "test",
+    "build",
+    "deploy",
+    "install",
+    "describe",
+    "compare",
+    "help",
+    "please",
+    "use",
+    "try",
+    "continue",
+    "think",
+    "brainstorm",
+    "ultrathink",
+    "summarize",
+    "summarise",
+    "draft",
+    "plan",
+    "implement",
+    "refactor",
+    "debug",
+    "verify",
+    "validate",
+    "generate",
+    "analyze",
+    "analyse",
+    "investigate",
+    "search",
+    "print",
+    "save",
+    "commit",
+    "push",
+    "pull",
+    "merge",
+    "rebase",
+    "rewrite",
+    "edit",
+    "change",
+    "move",
+    "copy",
+    "rename",
+    "restart",
+    "rerun",
+    "retry",
+    "resume",
+    "note",
+    "remember",
+    "recall",
+    "consider",
+    "focus",
+    "ensure",
+    "prepare",
+    "propose",
+    "suggest",
+    "recommend",
+    "evaluate",
+    "measure",
+    "document",
+    "report",
+    "ship",
+    "release",
+    "track",
+    "watch",
+    "follow",
+    "handle",
+    "address",
+    "resolve",
+    "close",
+    "finish",
+    "complete",
+    "done",
+    "next",
+    "also",
+    "then",
+    "now",
+    "today",
+    "first",
+    "second",
+    "last",
+    "final",
+    "here",
+    "there",
+    "this",
+    "that",
+    "these",
+    "those",
+    "what",
+    "which",
+    "when",
+    "where",
+    "why",
+    "how",
+    "does",
+    "should",
+    "could",
+    "would",
+    "will",
+    "again",
+    "before",
+    "after",
+    "once",
+    "okay",
+];
+
+fn is_prompt_verb(lower: &str) -> bool {
+    PROMPT_VERBS.contains(&lower)
+}
+
+/// Query words used for lexical coverage: distinctive tokens (3+ characters, no stopwords,
+/// at most 12) and the capitalised names as typed ("Acme", "Globex"). A capitalised word is a
+/// name only when it is not the first word of the prompt or of a sentence, has four or more
+/// letters and is neither a stopword nor a prompt verb: "Run the tests" and "Read the handoff"
+/// yield no name.
+struct CoverageTerms {
+    terms: Vec<String>,
+    names: Vec<String>,
+}
+
+impl CoverageTerms {
+    fn from_query(query: &str) -> Self {
+        let mut terms: Vec<String> = Vec::new();
+        for tok in all_word_tokens(query) {
+            if tok.len() < 3 || recall::is_stopword(&tok) || terms.contains(&tok) {
+                continue;
+            }
+            terms.push(tok);
+            if terms.len() >= 12 {
+                break;
+            }
+        }
+        let mut names: Vec<String> = Vec::new();
+        for line in query.lines() {
+            let mut sentence_start = true;
+            for raw in line.split_whitespace() {
+                let ends_sentence = raw.ends_with(['.', '!', '?', ':', ';']);
+                let mut first_in_raw = true;
+                for word in raw.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
+                    if word.is_empty() {
+                        continue;
+                    }
+                    let at_start = sentence_start && first_in_raw;
+                    first_in_raw = false;
+                    let first_upper = word
+                        .chars()
+                        .next()
+                        .map(|c| c.is_uppercase())
+                        .unwrap_or(false);
+                    let letters = word.chars().filter(|c| c.is_alphabetic()).count();
+                    if at_start || !first_upper || letters < 4 {
+                        continue;
+                    }
+                    // Acronyms and ordinary Capitalised words both count.
+                    let lower = word.to_lowercase();
+                    if recall::is_stopword(&lower)
+                        || is_prompt_verb(&lower)
+                        || names.contains(&lower)
+                    {
+                        continue;
+                    }
+                    names.push(lower);
+                }
+                sentence_start = ends_sentence;
+            }
+        }
+        CoverageTerms { terms, names }
+    }
+
+    fn from_terms(terms: &[String]) -> Self {
+        CoverageTerms {
+            terms: terms
+                .iter()
+                .map(|t| t.to_lowercase())
+                .filter(|t| t.len() >= 3)
+                .take(12)
+                .collect(),
+            names: Vec::new(),
+        }
+    }
+
+    /// True when every term (two or more of them) occurs in `text` as a whole token, or a
+    /// capitalised name from the query does *together with* at least one other distinctive
+    /// query term. A name alone is a mention, not strong evidence.
+    fn strong_match(&self, text: &str) -> bool {
+        if self.terms.is_empty() && self.names.is_empty() {
+            return false;
+        }
+        let tokens: HashSet<String> = all_word_tokens(text).into_iter().collect();
+        if self.terms.len() >= 2 && self.terms.iter().all(|t| tokens.contains(t)) {
+            return true;
+        }
+        self.names
+            .iter()
+            .any(|n| tokens.contains(n) && self.terms.iter().any(|t| t != n && tokens.contains(t)))
+    }
 }
 
 fn print_project_results(results: &[RankedResult]) {
@@ -18900,22 +19272,30 @@ fn print_project_results(results: &[RankedResult]) {
 fn print_file_results(results: &[RankedFileResult]) {
     for (idx, item) in results.iter().enumerate() {
         println!(
-            "{:>2}. {}\n    project={}\n    chunk_id={} chunk_index={}\n    score={:.3} semantic={:.3} lexical={:.3} graph={:.3} relation={} quality={:.2} date={} age={}d tier={} src={}\n    {}",
+            "{:>2}. {}\n    project={}\n    chunk_id={} chunk_index={}\n    score={:.3} cos={} semantic={:.3} lexical={:.3} graph={:.3} relation={} quality={:.2} role={} date={} age={}d tier={} src={}{}\n    {}",
             idx + 1,
             item.path,
             item.project_path,
             item.chunk_id,
             item.chunk_index,
             item.score,
+            item.raw_similarity
+                .map(|c| format!("{:.3}", c))
+                .unwrap_or_else(|| "n/a".to_string()),
             item.semantic,
             item.lexical,
             item.graph,
             item.relation,
             item.quality,
+            item.role,
             freshness::format_ymd(item.content_date),
             item.age_days.round() as i64,
             item.freshness_tier,
             item.date_source,
+            item.superseded_by
+                .as_deref()
+                .map(|s| format!(" superseded_by={}", s))
+                .unwrap_or_default(),
             item.excerpt
         );
         for ev in item.evidence.iter().take(4) {
@@ -19201,7 +19581,7 @@ fn rank_projects_native(
         let fr = *frecency.get(&path).unwrap_or(&0.0);
         let gscore = *graph.get(&path).unwrap_or(&0.0);
         let path_kw = *path_keywords.get(&path).unwrap_or(&0.0);
-        let w = query_type.project_weights();
+        let w = query_type.project_weights(cfg);
         let mut score = (w.lexical * content)
             + (w.semantic * semantic)
             + (w.path_kw * path_kw)
@@ -19229,7 +19609,7 @@ fn rank_projects_native(
         } else {
             project_mtimes
                 .get(&path)
-                .map(|mt| fx.info(&path, *mt).recency)
+                .map(|mt| fx.info("", &path, *mt, TextShape::Prose).recency)
                 .unwrap_or(0.0)
         };
         score = freshness::blend(score, recency, fx.weight(false));
@@ -19244,7 +19624,11 @@ fn rank_projects_native(
             evidence: evidence.into_iter().take(4).collect(),
         });
     }
-    out.sort_by(|a, b| b.score.total_cmp(&a.score));
+    out.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then_with(|| a.path.cmp(&b.path))
+    });
     out.truncate(limit.max(1));
     Ok(out)
 }
@@ -19299,25 +19683,23 @@ pub(crate) fn rank_files_native_with(
         cfg.vector_candidates.max(1) as usize,
         cfg.lexical_candidates.max(1) as usize,
     );
+    let mut query_vector: Option<(String, Vec<f32>)> = None;
     let (project_semantic, mut fused) = if opts.lexical_only {
         let fused = search_lexical_chunks_sqlite(conn, q, std::cmp::max(160, lex_limit * 2))?;
         (HashMap::new(), fused)
     } else {
-        let (model_key, query_vector) = embed_query_cached(cfg, q)?;
-        let project_semantic = project_semantic_scores(
-            conn,
-            &model_key,
-            &query_vector,
-            std::cmp::max(120, sem_limit * 2),
-        )?;
+        let (model_key, vector) = embed_query_cached(cfg, q)?;
+        let project_semantic =
+            project_semantic_scores(conn, &model_key, &vector, std::cmp::max(120, sem_limit * 2))?;
         let fused = hybrid_search_lance(
             conn,
             &model_key,
             q,
-            &query_vector,
+            &vector,
             std::cmp::max(160, sem_limit * 4),
             std::cmp::max(120, lex_limit * 2),
         )?;
+        query_vector = Some((model_key, vector));
         (project_semantic, fused)
     };
     if fused.is_empty() {
@@ -19329,15 +19711,62 @@ pub(crate) fn rank_files_native_with(
         let path_signals = keyword_path_chunk_scores(conn, q, std::cmp::max(220, lex_limit * 3))?;
         if !path_signals.is_empty() {
             fused = fuse_chunk_signals(&path_signals, &fused);
+            // Path-keyword hits arrive without a cosine: give them one from the SQLite
+            // vectors so every candidate carries `raw_similarity`.
+            if let Some((model_key, query_vector)) = query_vector.as_ref() {
+                backfill_raw_similarity(conn, &mut fused, model_key, query_vector)?;
+            }
         }
     }
+    let debug_chunk: Option<i64> = env::var("RETRIVIO_DEBUG_CHUNK")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok());
+    if let Some(id) = debug_chunk {
+        eprintln!(
+            "trace {}: after fusion {} (query type {:?}, fused rows {})",
+            id,
+            fused
+                .get(&id)
+                .map(|r| format!(
+                    "present sem={:.3} lex={:.3} raw={:?} rel={}",
+                    r.semantic, r.lexical, r.raw_similarity, r.relation
+                ))
+                .unwrap_or_else(|| "absent".to_string()),
+            query_type,
+            fused.len()
+        );
+    }
     apply_graph_chunk_expansion(conn, &mut fused, cfg)?;
+    if let Some(id) = debug_chunk {
+        eprintln!(
+            "trace {}: after graph {}",
+            id,
+            fused
+                .get(&id)
+                .map(|r| format!("present graph={:.3} rel={}", r.graph, r.relation))
+                .unwrap_or_else(|| "absent".to_string())
+        );
+    }
 
     let frecency = frecency_scores(conn)?;
     let project_paths = list_project_paths(conn)?;
     let project_path_keywords = path_keyword_scores(&project_paths, q);
+    let role_hint = roles::role_hint(q);
+    let show_superseded = opts.include_superseded || roles::history_query(q);
+    // The absolute floor is on the raw cosine (an honest number), never on the min-max
+    // normalised semantic score, whose top is always 1.0. It fails closed: in semantic mode a
+    // candidate without a finite cosine (no stored vector, a malformed blob) is dropped.
+    // Lexical-only retrieval has no cosines and no floor.
+    let raw_floor = if opts.lexical_only {
+        0.0
+    } else {
+        opts.min_raw_similarity
+    };
     let mut by_file: HashMap<String, RankedFileResult> = HashMap::new();
     for row in fused.values() {
+        if !passes_raw_floor(row.raw_similarity, raw_floor) {
+            continue;
+        }
         let content = chunk_base_score(row, cfg);
         let project_sem = *project_semantic.get(&row.project_path).unwrap_or(&0.0);
         let fr = *frecency.get(&row.project_path).unwrap_or(&0.0);
@@ -19384,9 +19813,14 @@ pub(crate) fn rank_files_native_with(
         }
         score *= path_noise_penalty(&row.doc_rel_path);
         // Freshness (spec §4): blend once per candidate; the file keeps its best chunk.
-        let fresh = fx.info(&row.doc_path, row.doc_mtime);
+        let fresh = fx.info_for(row);
         if !fx.within_since(fresh.content_date, opts.since_days) {
             continue;
+        }
+        // Role nudge: a prompt about a call or transcript lifts records a little; one about
+        // current status lifts state. Small on purpose; relevance still decides.
+        if role_hint == Some(fresh.role) {
+            score *= ROLE_HINT_BOOST;
         }
         let base_score = score;
         score = fx.blend(score, &fresh);
@@ -19411,12 +19845,50 @@ pub(crate) fn rank_files_native_with(
             age_days: fresh.age_days,
             freshness_tier: fresh.tier.to_string(),
             is_record: fresh.is_record,
+            role: fresh.role.as_str(),
+            verify: fresh.verify,
+            noise: row.noise,
+            raw_similarity: row.raw_similarity,
+            superseded_by: None,
         };
+        // The file keeps its best chunk; an exact tie goes to the earlier chunk so the
+        // representative (and its cosine) does not depend on hash-map order.
         let prev = by_file.get(&row.doc_path);
-        if prev.is_none() || candidate.score > prev.map(|p| p.score).unwrap_or(0.0) {
+        let replace = match prev {
+            None => true,
+            Some(p) => {
+                candidate.score > p.score
+                    || (candidate.score == p.score && candidate.chunk_index < p.chunk_index)
+            }
+        };
+        if debug_chunk == Some(row.chunk_id) {
+            eprintln!(
+                "trace {}: scored {:.4} (base {:.4}, kw {:.3}, content {:.4}) prev {:?} -> {}",
+                row.chunk_id,
+                candidate.score,
+                candidate.base_score,
+                kw,
+                content,
+                prev.map(|p| (p.chunk_id, p.score)),
+                if replace { "inserted" } else { "kept previous" }
+            );
+        }
+        if replace {
             by_file.insert(row.doc_path.clone(), candidate);
         }
     }
+    if let Some(id) = debug_chunk {
+        let holder = by_file.values().find(|r| r.chunk_id == id);
+        eprintln!(
+            "trace {}: in by_file before collapse: {}",
+            id,
+            holder
+                .map(|r| format!("yes score={:.4}", r.score))
+                .unwrap_or_else(|| "no".to_string())
+        );
+    }
+    collapse_duplicate_files(conn, &mut by_file);
+    mark_superseded(&mut by_file, show_superseded, fx.now);
     for (doc_path, item) in &mut by_file {
         let mut support: Vec<EvidenceHit> = Vec::new();
         for row in fused.values() {
@@ -19445,9 +19917,144 @@ pub(crate) fn rank_files_native_with(
     }
 
     let mut out: Vec<RankedFileResult> = by_file.into_values().collect();
-    out.sort_by(|a, b| b.score.total_cmp(&a.score));
+    out.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then_with(|| a.path.cmp(&b.path))
+    });
     out.truncate(limit.max(1));
     Ok(out)
+}
+
+/// `content_hash` from the file manifest for each of `paths` (absolute), where known. This is
+/// the identity of a file's bytes (the whole file, not a chunk) that duplicate collapse uses
+/// in search and recall alike.
+pub(crate) fn file_content_hashes(conn: &Connection, paths: &[String]) -> HashMap<String, String> {
+    let mut out: HashMap<String, String> = HashMap::new();
+    for batch in paths.chunks(300) {
+        let placeholders = std::iter::repeat("?")
+            .take(batch.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT abs_path, content_hash FROM project_files WHERE abs_path IN ({})",
+            placeholders
+        );
+        let Ok(mut stmt) = conn.prepare(&sql) else {
+            return out;
+        };
+        let rows = stmt.query_map(params_from_iter(batch.iter()), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        });
+        let Ok(rows) = rows else {
+            return out;
+        };
+        for row in rows.flatten() {
+            out.insert(row.0, row.1);
+        }
+    }
+    out
+}
+
+/// Two files with the same manifest `content_hash` (identical bytes) are copies of one file
+/// when they also share their file name, or when one of them sits under a copy directory
+/// (`snapshot`, `snapshots`, `memory-snapshot`, `backup`, `backups`, `archive`, `archived`,
+/// `copy`). Two byte-identical documents that meet neither rule (a template pasted into two
+/// projects under different names) stay two results.
+pub(crate) fn same_file_copy(a_rel: &str, b_rel: &str) -> bool {
+    roles::file_name(a_rel).eq_ignore_ascii_case(roles::file_name(b_rel))
+        || roles::under_noise_dir(a_rel)
+        || roles::under_noise_dir(b_rel)
+}
+
+/// Copies of one file (see [`same_file_copy`]) collapse to one result: the copy that is not
+/// under a copy directory, then the shorter path, then the higher score, then the path. The
+/// survivor keeps its own score, cosine and evidence; it never inherits the removed copy's
+/// numbers. Two copies of a memory file in a snapshot folder and its source are one result.
+fn collapse_duplicate_files(conn: &Connection, by_file: &mut HashMap<String, RankedFileResult>) {
+    if by_file.len() < 2 {
+        return;
+    }
+    let paths: Vec<String> = by_file.keys().cloned().collect();
+    let hashes = file_content_hashes(conn, &paths);
+    let mut groups: HashMap<String, Vec<String>> = HashMap::new();
+    for (path, hash) in hashes {
+        if !hash.is_empty() && by_file.contains_key(&path) {
+            groups.entry(hash).or_default().push(path);
+        }
+    }
+    for members in groups.into_values() {
+        if members.len() < 2 {
+            continue;
+        }
+        let mut ordered = members.clone();
+        ordered.sort_by(|a, b| {
+            let (ra, rb) = (&by_file[a], &by_file[b]);
+            roles::under_noise_dir(&ra.doc_rel_path)
+                .cmp(&roles::under_noise_dir(&rb.doc_rel_path))
+                .then_with(|| a.len().cmp(&b.len()))
+                .then_with(|| rb.score.total_cmp(&ra.score))
+                .then_with(|| a.cmp(b))
+        });
+        let mut survivors: Vec<String> = Vec::new();
+        for m in ordered {
+            let is_copy = survivors
+                .iter()
+                .any(|s| same_file_copy(&by_file[s].doc_rel_path, &by_file[&m].doc_rel_path));
+            if is_copy {
+                by_file.remove(&m);
+            } else {
+                survivors.push(m);
+            }
+        }
+    }
+}
+
+/// Supersession, soft and state-only: among `state` files of one series (same project,
+/// parent directory and normalised stem) the newest by revision date (the date in the
+/// relative path, else the last edit: see [`freshness::revision_date`]) is the head; the
+/// others get `superseded_by = head` and, unless the query asks for history, a downrank.
+/// Nothing is removed; records and knowledge are never superseded. Ties on the revision date
+/// go to the higher score, then to the lexicographically later path.
+fn mark_superseded(by_file: &mut HashMap<String, RankedFileResult>, full_strength: bool, now: f64) {
+    let mut series: HashMap<String, Vec<String>> = HashMap::new();
+    for (path, item) in by_file.iter() {
+        if item.role == Role::State.as_str() {
+            series
+                .entry(roles::series_key(&item.project_path, &item.doc_rel_path))
+                .or_default()
+                .push(path.clone());
+        }
+    }
+    for members in series.into_values() {
+        if members.len() < 2 {
+            continue;
+        }
+        let newest = members
+            .iter()
+            .max_by(|a, b| {
+                let (ia, ib) = (&by_file[*a], &by_file[*b]);
+                let ra = freshness::revision_date(&ia.doc_rel_path, ia.doc_mtime, now);
+                let rb = freshness::revision_date(&ib.doc_rel_path, ib.doc_mtime, now);
+                ra.total_cmp(&rb)
+                    .then_with(|| ia.score.total_cmp(&ib.score))
+                    .then_with(|| a.cmp(b))
+            })
+            .cloned()
+            .expect("non-empty series");
+        for m in members {
+            if m == newest {
+                continue;
+            }
+            if let Some(item) = by_file.get_mut(&m) {
+                item.superseded_by = Some(newest.clone());
+                if !full_strength {
+                    item.score *= SUPERSEDED_FACTOR;
+                    item.base_score *= SUPERSEDED_FACTOR;
+                }
+            }
+        }
+    }
 }
 
 /// Generate a hypothetical code snippet that would answer the query (HyDE technique).
@@ -19640,9 +20247,35 @@ fn rank_chunks_native_with(
     // Tiered search: for large codebases (200+ projects), filter chunks
     // to only include those from the top-K most relevant projects.
     // This reduces scoring/expansion/re-ranking work dramatically.
+    // Chunks whose text carries every query term, or a capitalised name from the query,
+    // survive the cut wherever their project ranks: an exact name such as "Acme" must not
+    // vanish because its project is the 31st most similar overall.
     if use_tiered {
         let top_projects: HashSet<&String> = project_semantic.keys().collect();
-        fused.retain(|_id, row| top_projects.contains(&row.project_path));
+        let before = fused.len();
+        let mut kept_by_lexical = 0usize;
+        fused.retain(|_id, row| {
+            if top_projects.contains(&row.project_path) {
+                return true;
+            }
+            if row.strong_lexical {
+                kept_by_lexical += 1;
+                return true;
+            }
+            false
+        });
+        if env::var("RETRIVIO_DEBUG_TIERED")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+        {
+            eprintln!(
+                "tiered: {} candidates, {} kept ({} of them outside the top {} projects through lexical coverage)",
+                before,
+                fused.len(),
+                kept_by_lexical,
+                project_keep_top
+            );
+        }
         if fused.is_empty() {
             return Ok(Vec::new());
         }
@@ -19657,9 +20290,31 @@ fn rank_chunks_native_with(
                 if let Ok(hyde_scores) = with_lance_store(|store| {
                     lance_store::search_vectors(store, &hyde_vector, sem_limit)
                 }) {
-                    // Merge HyDE results: add new chunks or boost existing ones
-                    let hyde_signals = chunk_signals_for_ids(conn, &hyde_scores, &HashMap::new());
-                    if let Ok(new_signals) = hyde_signals {
+                    // Merge HyDE results: add new chunks or boost existing ones. The cosine
+                    // the search reports for a HyDE-only chunk is to the hypothetical text,
+                    // not to the query, so every HyDE-only hit gets its `raw_similarity`
+                    // recomputed against the real query vector (or `None` when no vector is
+                    // stored, which then fails the floor).
+                    let hyde_signals = chunk_signals_for_ids(
+                        conn,
+                        &hyde_scores,
+                        &HashMap::new(),
+                        &CoverageTerms::from_query(q),
+                        None,
+                    );
+                    if let Ok(mut new_signals) = hyde_signals {
+                        let hyde_only: Vec<i64> = new_signals
+                            .keys()
+                            .copied()
+                            .filter(|id| !fused.contains_key(id))
+                            .collect();
+                        recompute_raw_similarity(
+                            conn,
+                            &mut new_signals,
+                            &hyde_only,
+                            &model_key,
+                            &query_vector,
+                        )?;
                         for (chunk_id, mut signal) in new_signals {
                             if !fused.contains_key(&chunk_id) {
                                 // Scale down HyDE-only results to avoid dominating
@@ -19681,9 +20336,15 @@ fn rank_chunks_native_with(
 
     let frecency = frecency_scores(conn)?;
     let fx = FreshnessCtx::new(cfg);
+    // The same raw-cosine floor as the files view (`search_min_abs_score`, 0 = off), failing
+    // closed on a missing or NaN cosine.
+    let raw_floor = cfg.search_min_abs_score;
     let mut out: Vec<RankedChunkResult> = Vec::new();
     for row in fused.values() {
-        let fresh = fx.info(&row.doc_path, row.doc_mtime);
+        if !passes_raw_floor(row.raw_similarity, raw_floor) {
+            continue;
+        }
+        let fresh = fx.info_for(row);
         if !fx.within_since(fresh.content_date, since_days) {
             continue;
         }
@@ -19693,7 +20354,7 @@ fn rank_chunks_native_with(
         let kw = doc_keyword_score(&row.doc_rel_path, q);
         // Chunk-level scoring: blend content quality, project semantic, frecency,
         // keyword match, and graph signals. Weights adjust based on query type.
-        let score = match query_type {
+        let mut score = match query_type {
             QueryType::Symbol => {
                 (0.38 * content)
                     + (0.10 * project_sem)
@@ -19723,6 +20384,8 @@ fn rank_chunks_native_with(
                     + (0.10 * row.graph)
             }
         };
+        // Same path hygiene as file ranking (scratch, state and copy directories).
+        score *= path_noise_penalty(&row.doc_rel_path);
         out.push(RankedChunkResult {
             chunk_id: row.chunk_id,
             chunk_index: row.chunk_index,
@@ -19742,9 +20405,17 @@ fn rank_chunks_native_with(
             age_days: fresh.age_days,
             freshness_tier: fresh.tier.to_string(),
             is_record: fresh.is_record,
+            role: fresh.role.as_str(),
+            verify: fresh.verify,
+            noise: row.noise,
+            raw_similarity: row.raw_similarity,
         });
     }
-    out.sort_by(|a, b| b.score.total_cmp(&a.score));
+    out.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then_with(|| a.chunk_id.cmp(&b.chunk_id))
+    });
 
     // Cross-encoder re-ranking: take top pool_size candidates, score with LLM,
     // blend re-rank score with original score, then re-sort.
@@ -19762,7 +20433,11 @@ fn rank_chunks_native_with(
                     item.score = 0.70 * rs + 0.30 * item.score;
                 }
             }
-            out[..pool].sort_by(|a, b| b.score.total_cmp(&a.score));
+            out[..pool].sort_by(|a, b| {
+                b.score
+                    .total_cmp(&a.score)
+                    .then_with(|| a.chunk_id.cmp(&b.chunk_id))
+            });
         }
     }
 
@@ -19771,7 +20446,11 @@ fn rank_chunks_native_with(
         let recency = fx.recency_for(item.age_days, item.is_record);
         item.score = freshness::blend(item.score, recency, fx.weight(item.is_record));
     }
-    out.sort_by(|a, b| b.score.total_cmp(&a.score));
+    out.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then_with(|| a.chunk_id.cmp(&b.chunk_id))
+    });
 
     out.truncate(limit.max(1));
     Ok(out)
@@ -20107,8 +20786,6 @@ mod chunk_contract_tests {
             vec![
                 "transcript",
                 "customer-signals",
-                "docs/sessions",
-                "HANDOFF",
                 "meeting",
                 "call-notes",
                 ".srt"
@@ -20118,6 +20795,7 @@ mod chunk_contract_tests {
         assert_eq!(cfg.recall_max_leads, 3);
         assert_eq!(cfg.recall_min_score_ratio, 0.80);
         assert_eq!(cfg.recall_min_abs_score, 0.40);
+        assert_eq!(cfg.search_min_abs_score, 0.0);
         assert_eq!(cfg.recall_band_ratio, 0.90);
         assert_eq!(cfg.recall_roots, "");
         assert!(cfg.recall_root_list().is_empty());
@@ -20125,6 +20803,150 @@ mod chunk_contract_tests {
         assert!(!cfg.recall_system_message);
         assert_eq!(cfg.recall_semantic, "auto");
         assert_eq!(cfg.recall_session_ttl_days, 3.0);
+    }
+
+    /// A non-finite floor in the config is rejected (the default applies) and finite values
+    /// are clamped to [0, 1]: a floor must never be a number that every comparison fails.
+    #[test]
+    fn floors_reject_non_finite_values_and_clamp() {
+        let with = |k: &str, v: &str| {
+            let mut m = std::collections::HashMap::new();
+            m.insert(k.to_string(), v.to_string());
+            ConfigValues::from_map(m)
+        };
+        assert_eq!(
+            with("recall_min_abs_score", "nan").recall_min_abs_score,
+            0.40
+        );
+        assert_eq!(
+            with("recall_min_abs_score", "NaN").recall_min_abs_score,
+            0.40
+        );
+        assert_eq!(
+            with("recall_min_abs_score", "inf").recall_min_abs_score,
+            0.40
+        );
+        assert_eq!(
+            with("recall_min_abs_score", "-inf").recall_min_abs_score,
+            0.40
+        );
+        // Candidate counts are clamped to the documented range.
+        assert_eq!(with("lexical_candidates", "5000").lexical_candidates, 1000);
+        assert_eq!(with("vector_candidates", "1").vector_candidates, 20);
+        assert_eq!(with("lexical_candidates", "300").lexical_candidates, 300);
+        assert_eq!(with("reranker_pool_size", "999").reranker_pool_size, 200);
+        assert_eq!(
+            ConfigValues::from_map(std::collections::HashMap::new()).lexical_candidates,
+            120
+        );
+        assert_eq!(with("recall_min_abs_score", "2").recall_min_abs_score, 1.0);
+        assert_eq!(with("recall_min_abs_score", "-1").recall_min_abs_score, 0.0);
+        assert_eq!(
+            with("recall_min_abs_score", "0.5").recall_min_abs_score,
+            0.5
+        );
+        assert_eq!(
+            with("search_min_abs_score", "nan").search_min_abs_score,
+            0.0
+        );
+        assert_eq!(
+            with("search_min_abs_score", "inf").search_min_abs_score,
+            0.0
+        );
+        assert_eq!(
+            with("search_min_abs_score", "0.3").search_min_abs_score,
+            0.3
+        );
+    }
+
+    /// Every float setting rejects a non-finite value with one clear error and is left as it
+    /// was: `nan` passes `clamp` unchanged and `inf` pins to a bound the user never named, and
+    /// a written NaN is dropped at load with the default applied silently. Finite values still
+    /// parse and clamp as before.
+    #[test]
+    fn float_settings_reject_non_finite_values() {
+        const FLOAT_KEYS: &[&str] = &[
+            "rank_chunk_semantic_weight",
+            "rank_chunk_lexical_weight",
+            "rank_chunk_graph_weight",
+            "rank_quality_mix",
+            "rank_relation_quality_good_boost",
+            "rank_relation_quality_weak_penalty",
+            "rank_relation_quality_wrong_penalty",
+            "rank_project_content_weight",
+            "rank_project_semantic_weight",
+            "rank_project_path_weight",
+            "rank_project_graph_weight",
+            "rank_project_frecency_weight",
+            "graph_same_project_high",
+            "graph_same_project_low",
+            "graph_related_base",
+            "graph_related_scale",
+            "graph_related_cap",
+            "rank_recency_weight",
+            "rank_recency_record_weight",
+            "recency_half_life_days",
+            "recency_record_half_life_days",
+            "recall_min_score_ratio",
+            "recall_min_abs_score",
+            "search_min_abs_score",
+            "recall_band_ratio",
+            "recall_session_ttl_days",
+        ];
+        let mut cfg = ConfigValues::from_map(std::collections::HashMap::new());
+        for key in FLOAT_KEYS {
+            let shown = config_value_string(&cfg, key)
+                .unwrap_or_else(|| panic!("config_value_string missing {}", key));
+            let before = format!("{:?}", cfg);
+            for bad in [
+                "nan",
+                "NaN",
+                "inf",
+                "-inf",
+                "+infinity",
+                "Infinity",
+                "abc",
+                "",
+            ] {
+                let err = config_set_value(&mut cfg, key, bad)
+                    .expect_err(&format!("{} accepted {:?}", key, bad));
+                assert_eq!(err, format!("{} must be a finite number", key), "{:?}", bad);
+                assert_eq!(
+                    config_value_string(&cfg, key).unwrap(),
+                    shown,
+                    "{} {:?}",
+                    key,
+                    bad
+                );
+                assert_eq!(
+                    format!("{:?}", cfg),
+                    before,
+                    "nothing changed on {} {:?}",
+                    key,
+                    bad
+                );
+            }
+        }
+        // The two floors, which the load path also guards, still take finite values and clamp.
+        config_set_value(&mut cfg, "recall_min_abs_score", "0.35").unwrap();
+        assert_eq!(cfg.recall_min_abs_score, 0.35);
+        config_set_value(&mut cfg, "recall_min_abs_score", "-3").unwrap();
+        assert_eq!(cfg.recall_min_abs_score, 0.0);
+        config_set_value(&mut cfg, "search_min_abs_score", "1e9").unwrap();
+        assert_eq!(cfg.search_min_abs_score, 1.0);
+        config_set_value(&mut cfg, "search_min_abs_score", " 0.4 ").unwrap();
+        assert_eq!(cfg.search_min_abs_score, 0.4);
+        // Written and read back, the floors are the finite values, never a default fallback.
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tmp")
+            .join(format!("test-config-finite-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("create tmp config dir");
+        let path = dir.join("config.toml");
+        write_config_file(&path, &cfg).expect("write config");
+        let back = ConfigValues::from_map(load_config_values(&path));
+        assert_eq!(back.recall_min_abs_score, 0.0);
+        assert_eq!(back.search_min_abs_score, 0.4);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -20163,6 +20985,7 @@ mod chunk_contract_tests {
             "recall_max_leads",
             "recall_min_score_ratio",
             "recall_min_abs_score",
+            "search_min_abs_score",
             "recall_band_ratio",
             "recall_roots",
             "recall_excerpts",
@@ -20229,18 +21052,60 @@ mod chunk_contract_tests {
         let cfg = ConfigValues::from_map(std::collections::HashMap::new());
         let now = 1_800_000_000.0;
         let fx = FreshnessCtx::at(&cfg, now);
-        let living = fx.info("/p/notes/plan.md", now - 21.0 * 86_400.0);
+        let living = fx.info(
+            "notes/plan.md",
+            "/p/notes/plan.md",
+            now - 21.0 * 86_400.0,
+            TextShape::Prose,
+        );
         assert_eq!(living.date_source, "mtime");
         assert!(!living.is_record);
+        assert_eq!(living.role, Role::Knowledge);
         assert_eq!(living.tier, "aging");
+        assert!(!living.verify);
         assert!((living.recency - 0.5).abs() < 1e-9);
         assert!((fx.blend(1.0, &living) - (0.88 + 0.12 * 0.5)).abs() < 1e-9);
-        let record = fx.info("/p/transcripts/call.md", now - 90.0 * 86_400.0);
+        let record = fx.info(
+            "transcripts/call.md",
+            "/p/transcripts/call.md",
+            now - 90.0 * 86_400.0,
+            TextShape::Prose,
+        );
         assert!(record.is_record);
+        assert_eq!(record.role, Role::Record);
         assert_eq!(record.tier, "record");
         assert!((record.recency - 0.5).abs() < 1e-9);
         assert!((fx.blend(1.0, &record) - (0.96 + 0.04 * 0.5)).abs() < 1e-9);
         assert!((fx.recency_for(record.age_days, true) - record.recency).abs() < 1e-12);
+        // State: living decay, `verify` past 35 days; the role never comes from the project
+        // folder name (`202609-ai-handoff` here), only from the relative path.
+        let state = fx.info(
+            "docs/sessions/HANDOFF-2026-01-01.md",
+            "/p/202609-ai-handoff/docs/sessions/HANDOFF-2026-01-01.md",
+            now - 40.0 * 86_400.0,
+            TextShape::Prose,
+        );
+        assert_eq!(state.role, Role::State);
+        assert_eq!(state.tier, "verify");
+        assert!(state.verify);
+        assert!(!state.is_record);
+        let plain = fx.info(
+            "AGENTS.md",
+            "/p/202609-ai-handoff/AGENTS.md",
+            now - 1.0 * 86_400.0,
+            TextShape::Prose,
+        );
+        assert_eq!(plain.role, Role::Knowledge);
+        assert_eq!(plain.tier, "fresh");
+        // Records take the event date from the path even when edited later.
+        let event = fx.info(
+            "customer-signals/Acme/20260715-call/transcript.txt",
+            "/p/x/customer-signals/Acme/20260715-call/transcript.txt",
+            now - 2.0 * 86_400.0,
+            TextShape::Prose,
+        );
+        assert_eq!(event.date_source, "path-date");
+        assert!(event.age_days > 60.0, "{}", event.age_days);
         assert!(fx.within_since(now - 5.0 * 86_400.0, Some(7.0)));
         assert!(!fx.within_since(now - 8.0 * 86_400.0, Some(7.0)));
         assert!(fx.within_since(now - 800.0 * 86_400.0, None));
@@ -20312,10 +21177,14 @@ mod chunk_contract_tests {
             age_days: 3.5,
             freshness_tier: "fresh".to_string(),
             is_record: false,
+            role: "knowledge",
+            verify: false,
+            noise: false,
+            raw_similarity: Some(0.41),
         };
         let json = ranked_chunk_result_json(&item);
         let obj = json.as_object().expect("expected object");
-        assert_eq!(obj.len(), 18);
+        assert_eq!(obj.len(), 22);
         for key in [
             "chunk_id",
             "chunk_index",
@@ -20335,9 +21204,15 @@ mod chunk_contract_tests {
             "age_days",
             "freshness_tier",
             "is_record",
+            "role",
+            "verify",
+            "noise",
+            "raw_similarity",
         ] {
             assert!(obj.contains_key(key), "missing key: {}", key);
         }
+        assert_eq!(obj["role"], "knowledge");
+        assert_eq!(obj["raw_similarity"], 0.41);
     }
 
     #[test]
@@ -21044,7 +21919,11 @@ fn related_chunks_native(
     if out.is_empty() {
         return Ok((source, Vec::new()));
     }
-    out.sort_by(|a, b| b.score.total_cmp(&a.score));
+    out.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then_with(|| a.chunk_id.cmp(&b.chunk_id))
+    });
     out.truncate(limit.max(1));
     Ok((source, out))
 }
@@ -21349,7 +22228,7 @@ fn search_lexical_chunks_sqlite(
     if fts.is_empty() {
         return Ok(HashMap::new());
     }
-    lexical_chunk_signals_for_match(conn, &fts, limit)
+    lexical_chunk_signals_for_match(conn, &fts, limit, &CoverageTerms::from_query(query))
 }
 
 /// FTS5 MATCH expression that ORs quoted terms (double quotes escaped by doubling).
@@ -21379,13 +22258,15 @@ pub(crate) fn lexical_file_candidates(
         return Vec::new();
     }
     let chunk_limit = (limit.max(1) * 8).clamp(40, 600);
-    let Ok(signals) = lexical_chunk_signals_for_match(conn, &fts, chunk_limit) else {
+    let Ok(signals) =
+        lexical_chunk_signals_for_match(conn, &fts, chunk_limit, &CoverageTerms::from_terms(terms))
+    else {
         return Vec::new();
     };
     let fx = FreshnessCtx::new(cfg);
     let mut by_file: HashMap<String, RankedFileResult> = HashMap::new();
     for row in signals.values() {
-        let fresh = fx.info(&row.doc_path, row.doc_mtime);
+        let fresh = fx.info_for(row);
         let score = fx.blend(row.lexical, &fresh);
         let replace = by_file
             .get(&row.doc_path)
@@ -21417,6 +22298,11 @@ pub(crate) fn lexical_file_candidates(
                 age_days: fresh.age_days,
                 freshness_tier: fresh.tier.to_string(),
                 is_record: fresh.is_record,
+                role: fresh.role.as_str(),
+                verify: fresh.verify,
+                noise: row.noise,
+                raw_similarity: None,
+                superseded_by: None,
             },
         );
     }
@@ -21434,6 +22320,7 @@ fn lexical_chunk_signals_for_match(
     conn: &Connection,
     fts: &str,
     limit: usize,
+    cover: &CoverageTerms,
 ) -> Result<HashMap<i64, ChunkSignal>, String> {
     let mut stmt = conn
         .prepare(
@@ -21497,6 +22384,7 @@ LIMIT ?2
         } else {
             1.0 - ((bm25 - lo) / span)
         };
+        let facts = text_facts(&doc_rel_path, &text, cover);
         out.insert(
             chunk_id,
             ChunkSignal {
@@ -21504,17 +22392,22 @@ LIMIT ?2
                 chunk_index,
                 project_path,
                 doc_path,
-                doc_rel_path: doc_rel_path.clone(),
+                doc_rel_path,
                 doc_mtime,
                 semantic: 0.0,
                 lexical: lexical.clamp(0.0, 1.0),
                 graph: 0.0,
                 relation: "direct".to_string(),
-                quality: content_quality(&doc_rel_path, &text),
+                quality: facts.quality,
                 excerpt: clip_text(&text, 190),
+                raw_similarity: None,
+                shape: facts.shape,
+                noise: facts.noise,
+                strong_lexical: facts.strong_lexical,
             },
         );
     }
+    apply_file_shapes(conn, &mut out)?;
     Ok(out)
 }
 
@@ -21562,6 +22455,7 @@ fn keyword_path_chunk_scores(
     if q_tokens.is_empty() {
         return Ok(HashMap::new());
     }
+    let cover = CoverageTerms::from_query(query);
     let mut out: HashMap<i64, ChunkSignal> = HashMap::new();
     let per_token_limit = (keep_top.max(1) * 3).clamp(50, 2500);
     // File matches take at most three quarters of a word's budget so project-path matches
@@ -21643,19 +22537,26 @@ LIMIT ?2
         if lexical <= 0.0 {
             return;
         }
-        let entry = out.entry(chunk_id).or_insert_with(|| ChunkSignal {
-            chunk_id,
-            chunk_index,
-            project_path: project_path.clone(),
-            doc_path: doc_path.clone(),
-            doc_rel_path: doc_rel_path.clone(),
-            doc_mtime,
-            semantic: 0.0,
-            lexical,
-            graph: 0.0,
-            relation: "path_keyword".to_string(),
-            quality: content_quality(&doc_rel_path, &text),
-            excerpt: clip_text(&text, 190),
+        let entry = out.entry(chunk_id).or_insert_with(|| {
+            let facts = text_facts(&doc_rel_path, &text, &cover);
+            ChunkSignal {
+                chunk_id,
+                chunk_index,
+                project_path: project_path.clone(),
+                doc_path: doc_path.clone(),
+                doc_rel_path: doc_rel_path.clone(),
+                doc_mtime,
+                semantic: 0.0,
+                lexical,
+                graph: 0.0,
+                relation: "path_keyword".to_string(),
+                quality: facts.quality,
+                excerpt: clip_text(&text, 190),
+                raw_similarity: None,
+                shape: facts.shape,
+                noise: facts.noise,
+                strong_lexical: facts.strong_lexical,
+            }
         });
         if lexical > entry.lexical {
             entry.lexical = lexical;
@@ -21711,13 +22612,23 @@ LIMIT ?2
     }
     drop(absorb);
 
-    if out.len() <= keep_top.max(1) {
-        return Ok(out);
-    }
-    let mut pairs: Vec<(i64, ChunkSignal)> = out.into_iter().collect();
-    pairs.sort_by(|a, b| b.1.lexical.total_cmp(&a.1.lexical));
-    pairs.truncate(keep_top.max(1));
-    Ok(pairs.into_iter().collect())
+    let mut out: HashMap<i64, ChunkSignal> = if out.len() <= keep_top.max(1) {
+        out
+    } else {
+        let mut pairs: Vec<(i64, ChunkSignal)> = out.into_iter().collect();
+        pairs.sort_by(|a, b| {
+            b.1.lexical
+                .total_cmp(&a.1.lexical)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        pairs.truncate(keep_top.max(1));
+        pairs.into_iter().collect()
+    };
+    // The retained rows take the file-level shape of their `.txt` file, as the FTS and vector
+    // candidates do: a path query hits every chunk of the file, and the cut may keep a later
+    // chunk whose own text says nothing about the role or the noise flag.
+    apply_file_shapes(conn, &mut out)?;
+    Ok(out)
 }
 
 fn semantic_chunk_scores(
@@ -21807,7 +22718,7 @@ WHERE pcv.model = ?1
     if scored.is_empty() {
         return Ok(HashMap::new());
     }
-    scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+    scored.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
     scored.truncate(keep_top.max(1));
     let lo = scored.iter().map(|r| r.0).fold(f64::INFINITY, f64::min);
     let hi = scored.iter().map(|r| r.0).fold(f64::NEG_INFINITY, f64::max);
@@ -21821,6 +22732,7 @@ WHERE pcv.model = ?1
         } else {
             (score - lo) / span
         };
+        let facts = text_facts(&doc_rel_path, &text, &CoverageTerms::from_query(""));
         out.insert(
             chunk_id,
             ChunkSignal {
@@ -21828,17 +22740,22 @@ WHERE pcv.model = ?1
                 chunk_index,
                 project_path,
                 doc_path,
-                doc_rel_path: doc_rel_path.clone(),
+                doc_rel_path,
                 doc_mtime,
                 semantic: semantic.clamp(0.0, 1.0),
                 lexical: 0.0,
                 graph: 0.0,
                 relation: "direct".to_string(),
-                quality: content_quality(&doc_rel_path, &text),
+                quality: facts.quality,
                 excerpt: clip_text(&text, 190),
+                raw_similarity: Some(((score * 2.0) - 1.0).clamp(-1.0, 1.0)),
+                shape: facts.shape,
+                noise: facts.noise,
+                strong_lexical: facts.strong_lexical,
             },
         );
     }
+    apply_file_shapes(conn, &mut out)?;
     Ok(out)
 }
 
@@ -21888,7 +22805,7 @@ fn apply_graph_chunk_expansion(
             (row.chunk_id, seed_score, row.project_path.clone())
         })
         .collect();
-    seeds.sort_by(|a, b| b.1.total_cmp(&a.1));
+    seeds.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     seeds.truncate(seed_limit.max(1));
     if seeds.is_empty() {
         return Ok(());
@@ -21949,7 +22866,7 @@ fn apply_graph_chunk_expansion(
 }
 
 fn evidence_hit_from_chunk(row: &ChunkSignal, score: f64, fx: &FreshnessCtx) -> EvidenceHit {
-    let fresh = fx.info(&row.doc_path, row.doc_mtime);
+    let fresh = fx.info_for(row);
     EvidenceHit {
         chunk_id: row.chunk_id,
         chunk_index: row.chunk_index,
@@ -21967,14 +22884,100 @@ fn evidence_hit_from_chunk(row: &ChunkSignal, score: f64, fx: &FreshnessCtx) -> 
         age_days: fresh.age_days,
         freshness_tier: fresh.tier.to_string(),
         is_record: fresh.is_record,
+        role: fresh.role.as_str(),
+        raw_similarity: row.raw_similarity,
         recency: fresh.recency,
     }
 }
 
+/// For `.txt` files the shape that decides the role (and the noise flag) is the *file's*,
+/// read once from its first chunk, so every chunk of a long transcript or chat dump is judged
+/// alike whichever chunk the query hit. Rows of other file types keep the shape of their own
+/// text (only `.txt` roles depend on the shape). The first 4 KB of the file decide: a `.txt`
+/// transcript whose "transcript" heading or timecodes start later is not recognised.
+fn apply_file_shapes(
+    conn: &Connection,
+    rows: &mut HashMap<i64, ChunkSignal>,
+) -> Result<(), String> {
+    let started = std::time::Instant::now();
+    let mut file_shape: HashMap<String, TextShape> = HashMap::new();
+    let mut need: Vec<String> = Vec::new();
+    for row in rows.values() {
+        if !row.doc_rel_path.to_ascii_lowercase().ends_with(".txt") {
+            continue;
+        }
+        if row.chunk_index == 0 {
+            file_shape.insert(row.doc_path.clone(), row.shape);
+        } else {
+            need.push(row.doc_path.clone());
+        }
+    }
+    need.sort();
+    need.dedup();
+    need.retain(|p| !file_shape.contains_key(p));
+    let looked_up = need.len();
+    for batch in need.chunks(300) {
+        let placeholders = std::iter::repeat("?")
+            .take(batch.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT doc_path, text FROM project_chunks WHERE chunk_index = 0 AND doc_path IN ({})",
+            placeholders
+        );
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| format!("failed preparing first-chunk lookup: {}", e))?;
+        let found = stmt
+            .query_map(params_from_iter(batch.iter()), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| format!("failed querying first chunks: {}", e))?;
+        for row in found {
+            let (doc_path, text) =
+                row.map_err(|e| format!("failed reading first-chunk row: {}", e))?;
+            file_shape.insert(doc_path, roles::text_shape(&text));
+        }
+    }
+    if env::var("RETRIVIO_DEBUG_BACKFILL")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
+        eprintln!(
+            "file-shapes: {} rows, {} .txt files with a first chunk to look up, in {} ms",
+            rows.len(),
+            looked_up,
+            started.elapsed().as_millis()
+        );
+    }
+    if file_shape.is_empty() {
+        return Ok(());
+    }
+    for row in rows.values_mut() {
+        let Some(shape) = file_shape.get(&row.doc_path).copied() else {
+            continue;
+        };
+        if shape == row.shape {
+            continue;
+        }
+        // Re-derive what the shape decided: the dump multiplier on quality and the noise flag.
+        if row.shape == TextShape::ChatDump && shape != TextShape::ChatDump {
+            row.quality = (row.quality / 0.35).clamp(0.08, 1.0);
+        } else if row.shape != TextShape::ChatDump && shape == TextShape::ChatDump {
+            row.quality = (row.quality * 0.35).clamp(0.08, 1.0);
+        }
+        row.shape = shape;
+        row.noise = is_noise_artifact(&row.doc_rel_path, shape);
+    }
+    Ok(())
+}
+
 fn chunk_signals_for_ids(
     conn: &Connection,
-    semantic_scores: &HashMap<i64, f64>,
+    semantic_scores: &HashMap<i64, lance_store::VectorHit>,
     lexical_scores: &HashMap<i64, f64>,
+    cover: &CoverageTerms,
+    query_vector: Option<(&str, &[f32])>,
 ) -> Result<HashMap<i64, ChunkSignal>, String> {
     let mut all_ids: Vec<i64> = semantic_scores
         .keys()
@@ -21986,6 +22989,20 @@ fn chunk_signals_for_ids(
     }
     all_ids.sort_unstable();
     all_ids.dedup();
+
+    // Cosine for the chunks the vector search did not return (lexical-only hits), from the
+    // vectors SQLite keeps: the same number the vector search reports for its own hits.
+    let missing: Vec<i64> = all_ids
+        .iter()
+        .copied()
+        .filter(|id| !semantic_scores.contains_key(id))
+        .collect();
+    let backfilled: HashMap<i64, f64> = match query_vector {
+        Some((model_key, qv)) if !missing.is_empty() => {
+            cosine_from_sqlite_vectors(conn, model_key, qv, &missing)?
+        }
+        _ => HashMap::new(),
+    };
 
     let mut out: HashMap<i64, ChunkSignal> = HashMap::new();
     for batch in all_ids.chunks(300) {
@@ -22035,6 +23052,11 @@ WHERE pc.id IN ({})
         for row in rows {
             let (chunk_id, project_path, doc_path, doc_rel_path, chunk_index, text, doc_mtime) =
                 row.map_err(|e| format!("failed reading chunk metadata lookup row: {}", e))?;
+            let facts = text_facts(&doc_rel_path, &text, cover);
+            let hit = semantic_scores.get(&chunk_id).copied();
+            let raw_similarity = hit
+                .map(|h| h.raw_similarity)
+                .or_else(|| backfilled.get(&chunk_id).copied());
             out.insert(
                 chunk_id,
                 ChunkSignal {
@@ -22042,17 +23064,141 @@ WHERE pc.id IN ({})
                     chunk_index,
                     project_path,
                     doc_path,
-                    doc_rel_path: doc_rel_path.clone(),
+                    doc_rel_path,
                     doc_mtime,
-                    semantic: *semantic_scores.get(&chunk_id).unwrap_or(&0.0),
+                    semantic: hit.map(|h| h.score).unwrap_or(0.0),
                     lexical: *lexical_scores.get(&chunk_id).unwrap_or(&0.0),
                     graph: 0.0,
                     relation: "direct".to_string(),
-                    quality: content_quality(&doc_rel_path, &text),
+                    quality: facts.quality,
                     excerpt: clip_text(&text, 190),
+                    raw_similarity,
+                    shape: facts.shape,
+                    noise: facts.noise,
+                    strong_lexical: facts.strong_lexical,
                 },
             );
         }
+    }
+    apply_file_shapes(conn, &mut out)?;
+    Ok(out)
+}
+
+/// Fill in `raw_similarity` for fused candidates that still lack one (chunks found only by the
+/// path-keyword scan), from the vectors SQLite keeps.
+fn backfill_raw_similarity(
+    conn: &Connection,
+    fused: &mut HashMap<i64, ChunkSignal>,
+    model_key: &str,
+    query_vector: &[f32],
+) -> Result<(), String> {
+    let missing: Vec<i64> = fused
+        .iter()
+        .filter(|(_, row)| row.raw_similarity.is_none())
+        .map(|(id, _)| *id)
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let found = cosine_from_sqlite_vectors(conn, model_key, query_vector, &missing)?;
+    for (id, cos) in found {
+        if let Some(row) = fused.get_mut(&id) {
+            row.raw_similarity = Some(cos);
+        }
+    }
+    Ok(())
+}
+
+/// Overwrite `raw_similarity` of the rows named by `ids` with the cosine to `query_vector`
+/// read from the vectors SQLite keeps; a row without a stored vector gets `None`. Used for
+/// HyDE-only hits, whose search cosine is to the hypothetical text and not to the query.
+fn recompute_raw_similarity(
+    conn: &Connection,
+    rows: &mut HashMap<i64, ChunkSignal>,
+    ids: &[i64],
+    model_key: &str,
+    query_vector: &[f32],
+) -> Result<(), String> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let found = cosine_from_sqlite_vectors(conn, model_key, query_vector, ids)?;
+    for id in ids {
+        if let Some(row) = rows.get_mut(id) {
+            row.raw_similarity = found.get(id).copied();
+        }
+    }
+    Ok(())
+}
+
+/// Cosine similarity between `query_vector` and the stored vectors of `chunk_ids` (for the
+/// configured model), read from SQLite. Chunks without a stored vector, with a blob of the
+/// wrong length or with a non-finite cosine are absent. `RETRIVIO_DEBUG_BACKFILL=1` prints
+/// one line per call to stderr with the number of vector blobs read and the time taken.
+fn cosine_from_sqlite_vectors(
+    conn: &Connection,
+    model_key: &str,
+    query_vector: &[f32],
+    chunk_ids: &[i64],
+) -> Result<HashMap<i64, f64>, String> {
+    let qnorm = vector_norm(query_vector);
+    let mut out: HashMap<i64, f64> = HashMap::new();
+    if !(qnorm > 0.0) || !qnorm.is_finite() || chunk_ids.is_empty() {
+        return Ok(out);
+    }
+    let started = std::time::Instant::now();
+    let mut blobs_read = 0usize;
+    for batch in chunk_ids.chunks(300) {
+        let placeholders = std::iter::repeat("?")
+            .take(batch.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT chunk_id, norm, vector FROM project_chunk_vectors WHERE model = ?1 AND chunk_id IN ({})",
+            placeholders
+        );
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| format!("failed preparing chunk vector lookup: {}", e))?;
+        let mut binds: Vec<rusqlite::types::Value> = Vec::with_capacity(batch.len() + 1);
+        binds.push(rusqlite::types::Value::Text(model_key.to_string()));
+        binds.extend(batch.iter().map(|id| rusqlite::types::Value::Integer(*id)));
+        let rows = stmt
+            .query_map(params_from_iter(binds.iter()), |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, f64>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            })
+            .map_err(|e| format!("failed querying chunk vectors: {}", e))?;
+        for row in rows {
+            let (chunk_id, norm, blob) =
+                row.map_err(|e| format!("failed reading chunk vector row: {}", e))?;
+            blobs_read += 1;
+            let vec = blob_to_f32_vec(&blob);
+            let vnorm = if norm > 0.0 { norm } else { vector_norm(&vec) };
+            if !(vnorm > 0.0) || !vnorm.is_finite() || vec.len() != query_vector.len() {
+                continue;
+            }
+            let cos = cosine_raw(query_vector, &vec, qnorm, vnorm);
+            if !cos.is_finite() {
+                continue;
+            }
+            out.insert(chunk_id, cos.clamp(-1.0, 1.0));
+        }
+    }
+    if env::var("RETRIVIO_DEBUG_BACKFILL")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
+        eprintln!(
+            "backfill: {} of {} requested vectors read from SQLite, {} with a finite cosine, in {} ms",
+            blobs_read,
+            chunk_ids.len(),
+            out.len(),
+            started.elapsed().as_millis()
+        );
     }
     Ok(out)
 }
@@ -22233,7 +23379,27 @@ fn clip_text(text: &str, max_chars: usize) -> String {
     clipped
 }
 
+/// Content quality multiplier for a chunk: 1.0 for ordinary text, lower for machine
+/// artefacts. Noise is judged from the text and the file type, never from a directory name
+/// such as `sessions/`: a handoff in `docs/sessions/` is a note like any other.
 fn content_quality(doc_rel_path: &str, text: &str) -> f64 {
+    content_quality_with_shape(doc_rel_path, text, roles::text_shape(text))
+}
+
+/// Machine artefacts by file type and text shape: chat dumps (`Human:`/`Assistant:` turns or
+/// JSON-lines message records) in any file, `.jsonl`/`.log` files, lockfiles, minified code.
+fn is_noise_artifact(doc_rel_path: &str, shape: TextShape) -> bool {
+    let name = doc_rel_path.to_lowercase();
+    shape == TextShape::ChatDump
+        || name.ends_with(".jsonl")
+        || name.ends_with(".log")
+        || name.ends_with("package-lock.json")
+        || name.ends_with("yarn.lock")
+        || name.ends_with("pnpm-lock.yaml")
+        || name.ends_with(".min.js")
+}
+
+fn content_quality_with_shape(doc_rel_path: &str, text: &str, shape: TextShape) -> f64 {
     let n = text.chars().count().max(1) as f64;
     let letters = text.chars().filter(|ch| ch.is_alphabetic()).count() as f64;
     let punctuation_like = text
@@ -22279,8 +23445,12 @@ fn content_quality(doc_rel_path: &str, text: &str) -> f64 {
     if name.ends_with(".metadata.json") {
         score *= 0.70;
     }
-    if name.contains("session_") || format!("/{}/", name).contains("/sessions/") {
+    // Chat dumps are machine artefacts whatever their extension (`.txt`, `.json`, `.md`
+    // exports); `.jsonl` and `.log` files are dumps by construction.
+    if shape == TextShape::ChatDump {
         score *= 0.35;
+    } else if name.ends_with(".jsonl") || name.ends_with(".log") {
+        score *= 0.60;
     }
     if name.ends_with(".min.js") {
         score *= 0.55;
@@ -22708,8 +23878,11 @@ impl QueryType {
         QueryType::NaturalLanguage
     }
 
-    /// Get the ranking weights for project-level scoring.
-    fn project_weights(&self) -> QueryWeights {
+    /// Ranking weights for project-level scoring. Natural-language queries, the common case
+    /// and the one `retrivio autotune` tunes, read the `rank_project_*` config keys
+    /// (`rank_project_content_weight` weighs the chunk-evidence content score, which the
+    /// `lexical` slot carries); the three query-shape profiles stay fixed.
+    fn project_weights(&self, cfg: &ConfigValues) -> QueryWeights {
         match self {
             //                        semantic  lexical  path_kw  graph  frecency
             QueryType::Symbol => QueryWeights {
@@ -22720,11 +23893,11 @@ impl QueryType {
                 frecency: 0.10,
             },
             QueryType::NaturalLanguage => QueryWeights {
-                semantic: 0.58,
-                lexical: 0.14,
-                path_kw: 0.10,
-                graph: 0.10,
-                frecency: 0.08,
+                semantic: cfg.rank_project_semantic_weight,
+                lexical: cfg.rank_project_content_weight,
+                path_kw: cfg.rank_project_path_weight,
+                graph: cfg.rank_project_graph_weight,
+                frecency: cfg.rank_project_frecency_weight,
             },
             QueryType::CodePattern => QueryWeights {
                 semantic: 0.40,
@@ -22892,19 +24065,152 @@ VALUES (1, 1, '/p/retrivio/docs/sessions/handoff.md', 'docs/sessions/handoff.md'
         let proj = keyword_path_chunk_scores(&conn, "retrivio", 50).expect("scores");
         assert!(proj.contains_key(&1) && proj.contains_key(&2) && !proj.contains_key(&3));
     }
+
+    /// A path query hits every chunk of a `.txt` file. The rows the scan keeps take the
+    /// file's shape (its first chunk), as the FTS and vector candidates do, so a later chunk of
+    /// a transcript is a record and a later chunk of a chat dump is noise, whether or not the
+    /// first chunk survived the `keep_top` cut. A `.md` file keeps the shape of its own chunk.
+    #[test]
+    fn keyword_path_rows_take_the_txt_file_shape() {
+        let conn = Connection::open_in_memory().expect("open in-memory sqlite");
+        init_schema(&conn).expect("init schema");
+        let prose =
+            "The team walked through the quarterly roadmap and the staffing plan in detail.";
+        let transcript_head =
+            "# Meeting Transcript **Date:** Monday, April 13, 2026\n\n## Summary\nThe team discussed the roadmap.\n";
+        let dump_head = "Human: plan the migration\n\nAssistant: The migration moves in three waves.\n\nHuman: and the budget?\n\nAssistant: One budget line per wave.\n\nHuman: ok\n\nAssistant: fine\n";
+        assert_eq!(roles::text_shape(transcript_head), TextShape::Transcript);
+        assert_eq!(roles::text_shape(dump_head), TextShape::ChatDump);
+        assert_eq!(roles::text_shape(prose), TextShape::Prose);
+        // Chunk 0 of each file gets the highest id: ties in the scan are cut by ascending chunk
+        // id, so `keep_top = 1` keeps the last chunk and drops the first.
+        conn.execute(
+            "INSERT INTO projects(id, path, title, summary, project_mtime, last_indexed) VALUES (1, '/p/acme', 'acme', 'a', 0, 0)",
+            [],
+        )
+        .expect("seed project");
+        let rows: [(i64, &str, &str, i64, &str); 7] = [
+            (
+                13,
+                "/p/acme/notes/roadmap-call.txt",
+                "notes/roadmap-call.txt",
+                0,
+                transcript_head,
+            ),
+            (
+                12,
+                "/p/acme/notes/roadmap-call.txt",
+                "notes/roadmap-call.txt",
+                1,
+                prose,
+            ),
+            (
+                11,
+                "/p/acme/notes/roadmap-call.txt",
+                "notes/roadmap-call.txt",
+                2,
+                prose,
+            ),
+            (
+                23,
+                "/p/acme/exports/chat-export.txt",
+                "exports/chat-export.txt",
+                0,
+                dump_head,
+            ),
+            (
+                21,
+                "/p/acme/exports/chat-export.txt",
+                "exports/chat-export.txt",
+                2,
+                prose,
+            ),
+            (
+                33,
+                "/p/acme/minutes/board-sync.md",
+                "minutes/board-sync.md",
+                0,
+                transcript_head,
+            ),
+            (
+                31,
+                "/p/acme/minutes/board-sync.md",
+                "minutes/board-sync.md",
+                1,
+                prose,
+            ),
+        ];
+        for (id, doc_path, rel, index, text) in rows {
+            conn.execute(
+                "INSERT INTO project_chunks(id, project_id, doc_path, doc_rel_path, doc_mtime, chunk_index, token_count, text_hash, text, updated_at) VALUES (?1, 1, ?2, ?3, 0, ?4, 3, ?5, ?6, 0)",
+                params![id, doc_path, rel, index, format!("h{}", id), text],
+            )
+            .expect("seed chunk");
+        }
+        let none: Vec<String> = Vec::new();
+
+        // Every chunk retained: the later chunks carry the first chunk's shape.
+        let all = keyword_path_chunk_scores(&conn, "notes/roadmap-call", 50).expect("scores");
+        let mut ids: Vec<i64> = all.keys().copied().collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![11, 12, 13]);
+        for id in [11, 12, 13] {
+            assert_eq!(all[&id].shape, TextShape::Transcript, "chunk id {}", id);
+            assert!(!all[&id].noise);
+            assert_eq!(
+                roles::classify(&all[&id].doc_rel_path, all[&id].shape, &none),
+                Role::Record,
+                "chunk id {}",
+                id
+            );
+        }
+
+        // The cut kept only the last chunk: the first chunk is looked up for its shape.
+        let cut = keyword_path_chunk_scores(&conn, "notes/roadmap-call", 1).expect("scores");
+        assert_eq!(cut.keys().copied().collect::<Vec<_>>(), vec![11]);
+        assert_eq!(cut[&11].chunk_index, 2);
+        assert_eq!(cut[&11].shape, TextShape::Transcript);
+        assert!(!cut[&11].noise);
+        assert_eq!(
+            roles::classify(&cut[&11].doc_rel_path, cut[&11].shape, &none),
+            Role::Record
+        );
+
+        // A later chunk of a chat dump is noise with the dump's quality multiplier.
+        let dump = keyword_path_chunk_scores(&conn, "exports/chat-export", 1).expect("scores");
+        assert_eq!(dump.keys().copied().collect::<Vec<_>>(), vec![21]);
+        assert_eq!(dump[&21].shape, TextShape::ChatDump);
+        assert!(dump[&21].noise, "noise from the file's first chunk");
+        assert!(dump[&21].quality <= 0.36, "{}", dump[&21].quality);
+        assert_eq!(
+            roles::classify(&dump[&21].doc_rel_path, dump[&21].shape, &none),
+            Role::Knowledge
+        );
+
+        // Only `.txt` roles depend on the shape: the `.md` chunk keeps its own.
+        let md = keyword_path_chunk_scores(&conn, "minutes/board-sync", 1).expect("scores");
+        assert_eq!(md.keys().copied().collect::<Vec<_>>(), vec![31]);
+        assert_eq!(md[&31].shape, TextShape::Prose);
+        assert!(!md[&31].noise);
+    }
 }
 
+/// Penalty for paths that are unlikely to be the primary copy of anything: scratch and
+/// state directories, copies (`snapshot`, `backup`, `archive`, `copy` directories) and data
+/// files. Judged on directory *components* of the path relative to the project.
 fn path_noise_penalty(doc_rel_path: &str) -> f64 {
-    let p = doc_rel_path.to_lowercase();
+    let p = doc_rel_path.replace('\\', "/").to_lowercase();
+    let mut dirs: Vec<&str> = p.split('/').filter(|c| !c.is_empty()).collect();
+    dirs.pop();
     let mut penalty = 1.0f64;
-    if p.starts_with("tmp/") || p.contains("/tmp/") {
+    if dirs.iter().any(|d| *d == "tmp") {
         penalty *= 0.55;
     }
-    if p.starts_with("state/") || p.contains("/state/") {
+    if dirs.iter().any(|d| *d == "state") {
         penalty *= 0.72;
     }
-    if p.starts_with("archived/") || p.contains("/archived/") {
-        penalty *= 0.82;
+    if dirs.iter().any(|d| roles::is_noise_dir(d)) {
+        penalty *= 0.85;
     }
     if p.ends_with(".json") {
         penalty *= 0.92;
@@ -23110,6 +24416,8 @@ struct ConfigValues {
     recall_min_score_ratio: f64,
     recall_min_abs_score: f64,
     recall_band_ratio: f64,
+    /// Raw-cosine floor for `search` results (0 = off); slice 3.
+    search_min_abs_score: f64,
     recall_roots: String,
     recall_excerpts: bool,
     recall_system_message: bool,
@@ -23118,8 +24426,10 @@ struct ConfigValues {
 }
 
 /// Default comma-separated path patterns that mark a document as a point-in-time record.
-const DEFAULT_RECENCY_RECORD_PATTERNS: &str =
-    "transcript,customer-signals,docs/sessions,HANDOFF,meeting,call-notes,.srt";
+/// Matched against path components relative to the project (see `roles.rs`), in addition to
+/// the built-in record rules. Handoffs and `docs/sessions` are `state`, not records, and the
+/// built-in state rules win over these patterns.
+const DEFAULT_RECENCY_RECORD_PATTERNS: &str = "transcript,customer-signals,meeting,call-notes,.srt";
 
 fn parse_bool_config(
     map: &std::collections::HashMap<String, String>,
@@ -23284,14 +24594,19 @@ impl ConfigValues {
             .and_then(|v| v.parse::<i64>().ok())
             .unwrap_or(120)
             .clamp(0, 86_400);
+        // Candidate counts are clamped at load so a hand-edited config cannot make one query
+        // read an unbounded number of vector blobs (the bounds are documented in the README
+        // under "Retrieval Pipeline").
         let lexical_candidates = map
             .get("lexical_candidates")
             .and_then(|v| v.parse::<i64>().ok())
-            .unwrap_or(120);
+            .unwrap_or(120)
+            .clamp(20, 1000);
         let vector_candidates = map
             .get("vector_candidates")
             .and_then(|v| v.parse::<i64>().ok())
-            .unwrap_or(120);
+            .unwrap_or(120)
+            .clamp(20, 1000);
         let rank_chunk_semantic_weight = map
             .get("rank_chunk_semantic_weight")
             .and_then(|v| v.parse::<f64>().ok())
@@ -23464,10 +24779,29 @@ impl ConfigValues {
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(0.80)
             .clamp(0.1, 1.0);
+        // Raw-cosine floor for recall leads (slice 3). Calibrated on the private scorecard with
+        // Titan Text Embeddings v2 (floor -> leads on the seven negative prompts / lead-hit on
+        // 29 positives): 0.30 -> 13/14, 0.35 -> 7/14, 0.40 -> 4/14, 0.45 -> 4/12,
+        // 0.50 -> 1/12, 0.55 -> 0/10. 0.40 keeps every positive lead the lower floors find,
+        // and 0.45 is dominated by it (the same four negative leads, two positives fewer), so
+        // 0.40 is the default. The negative leads that survive at 0.40 are instruction-shaped
+        // prompts ("read the handoff", "run the tests") whose cosines overlap with real
+        // questions; no floor separates them. The recall gate (slice 4) handles those by prompt
+        // shape, not the floor. 0.1.x configs carry 0.40 from when this key compared a fusion
+        // score; under the new meaning that value is the default, so they need no change.
+        // A non-finite value (`nan`, `inf`) is rejected and the default applies; both floors are
+        // clamped to [0, 1].
         let recall_min_abs_score = map
             .get("recall_min_abs_score")
             .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite())
             .unwrap_or(0.40)
+            .clamp(0.0, 1.0);
+        let search_min_abs_score = map
+            .get("search_min_abs_score")
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .unwrap_or(0.0)
             .clamp(0.0, 1.0);
         let recall_band_ratio = map
             .get("recall_band_ratio")
@@ -23557,6 +24891,7 @@ impl ConfigValues {
             recall_min_score_ratio,
             recall_min_abs_score,
             recall_band_ratio,
+            search_min_abs_score,
             recall_roots,
             recall_excerpts,
             recall_system_message,
@@ -23748,6 +25083,7 @@ fn write_config_file(path: &Path, cfg: &ConfigValues) -> Result<(), String> {
         format!("recall_max_leads = {}", cfg.recall_max_leads),
         format!("recall_min_score_ratio = {:.6}", cfg.recall_min_score_ratio),
         format!("recall_min_abs_score = {:.6}", cfg.recall_min_abs_score),
+        format!("search_min_abs_score = {:.6}", cfg.search_min_abs_score),
         format!("recall_band_ratio = {:.6}", cfg.recall_band_ratio),
         format!("recall_roots = \"{}\"", toml_escape(&cfg.recall_roots)),
         format!("recall_excerpts = {}", cfg.recall_excerpts),
@@ -35014,7 +36350,33 @@ fn load_config_values(path: &Path) -> std::collections::HashMap<String, String> 
         }
         out.insert(key, val);
     }
+    if let Some(patterns) = out.get("recency_record_patterns") {
+        warn_legacy_record_patterns(patterns);
+    }
     out
+}
+
+/// One note per process, on stderr, when `recency_record_patterns` carries an entry written
+/// for the pre-0.2.0 rule (a substring of the absolute path): since 0.2.0 patterns match path
+/// components relative to the project, so `a/b` means consecutive directories and an absolute
+/// or `~` path never matches.
+fn warn_legacy_record_patterns(patterns: &str) {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    let legacy: Vec<String> = split_csv_setting(patterns)
+        .into_iter()
+        .filter(|p| roles::legacy_record_pattern(p))
+        .collect();
+    if legacy.is_empty() || WARNED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    eprintln!(
+        "retrivio: recency_record_patterns {} matched as path components relative to the project since 0.2.0 (`a/b` = consecutive directories; an absolute or `~` path never matches), no longer as substrings of the absolute path; handoffs and docs/sessions are state regardless. Edit the key to silence this note.",
+        legacy
+            .iter()
+            .map(|p| format!("\"{}\"", p))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
 }
 
 fn home_dir() -> Option<PathBuf> {
@@ -35039,4 +36401,816 @@ fn expand_tilde<S: AsRef<str>>(s: S) -> PathBuf {
 fn shell_escape(s: &str) -> String {
     let escaped = s.replace('\'', "'\"'\"'");
     format!("'{}'", escaped)
+}
+
+#[cfg(test)]
+mod ranking_honesty_tests {
+    use super::test_support::*;
+    use super::*;
+
+    fn write(path: &Path, text: &str) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("mkdir");
+        }
+        fs::write(path, text).expect("write");
+    }
+
+    fn at(y: i64, m: u32, d: u32) -> SystemTime {
+        let secs = freshness::days_from_civil(y, m, d) as u64 * 86_400 + 43_200;
+        UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    const SPEC: &str = "# Otter migration design\n\nThe otter migration moves the otter fleet to the new habitat store in three waves, one per region, with a pricing tier per wave.\n";
+
+    /// One project with a three-handoff series, a transcript dated by its path but edited
+    /// today, a spec, a snapshot copy of the spec and a chat-log dump.
+    fn fixture(store: &TestStore) -> (PathBuf, PathBuf) {
+        let root = store.corpus_root("root");
+        // Two projects under the root so discovery reads it as a workspace (a lone child
+        // directory would be unwrapped as the project itself).
+        write(
+            &root.join("beta").join("notes.md"),
+            "# Beta\n\nUnrelated notes on zebra habitats and quarterly tax filing checklists.\n",
+        );
+        let proj = root.join("acme");
+        write(
+            &proj.join("README.md"),
+            "# Acme\n\nProject notes for the otter habitat programme.\n",
+        );
+        let handoffs = [
+            ("HANDOFF-2026-06-10.md", (2026, 6, 10), "# Handoff 2026-06-10\n\nOtter migration handoff. State: the otter migration plan is drafted. Next step: the pricing review with the habitat team.\n"),
+            ("HANDOFF-2026-06-19.md", (2026, 6, 19), "# Handoff 2026-06-19\n\nOtter migration handoff. State: pricing review done, two tiers agreed. Next step: the pilot cut-over of the otter migration.\n"),
+            ("HANDOFF-2026-06-24.md", (2026, 6, 24), "# Handoff 2026-06-24\n\nOtter migration handoff. State: pilot cut-over of the otter migration complete. Next step: the retrospective and wave two.\n"),
+        ];
+        for (name, (y, m, d), text) in handoffs {
+            let p = proj.join("docs").join("sessions").join(name);
+            write(&p, text);
+            set_mtime(&p, at(y, m, d));
+        }
+        // A transcript in a plain notes folder: the role comes from the text shape, the date
+        // from the path prefix; the file itself was edited today.
+        write(
+            &proj.join("notes").join("20260413-otter-pricing-call.txt"),
+            "# Meeting Transcript **Date:** Monday, April 13, 2026\n\n## Summary\nThe team discussed otter migration pricing tiers.\n\nAlice: what does the otter pricing look like\nBob: three tiers, one per wave\nAlice: and the migration timeline\nBob: pilot in June\n",
+        );
+        write(&proj.join("specs").join("otter-migration-design.md"), SPEC);
+        write(
+            &proj
+                .join("memory-snapshot")
+                .join("specs")
+                .join("otter-migration-design.md"),
+            SPEC,
+        );
+        write(
+            &proj.join("exports").join("otter-chat-dump.txt"),
+            "Human: plan the otter migration in three waves\n\nAssistant: The otter migration moves the otter fleet to the new habitat store in three waves.\n\nHuman: and the pricing tier per wave?\n\nAssistant: One pricing tier per wave.\n",
+        );
+        (root, proj)
+    }
+
+    fn find<'a>(
+        rows: &'a [RankedFileResult],
+        suffix: &str,
+    ) -> Option<(usize, &'a RankedFileResult)> {
+        rows.iter()
+            .enumerate()
+            .find(|(_, r)| r.path.ends_with(suffix))
+    }
+
+    #[test]
+    fn roles_supersession_dedup_noise_and_floor_on_a_fixture_project() {
+        let store = TestStore::new("ranking-honesty");
+        let (root, _proj) = fixture(&store);
+        store.track(&root);
+        let cfg = store.cfg(&root, &[("embed_backend", "hash")]);
+        let embedder = TestEmbedder::new(&cfg, true);
+        let stats = store.index(&cfg, &embedder, false).expect("index");
+        let conn = store.conn();
+        let projects: Vec<String> = {
+            let mut st = conn
+                .prepare("SELECT path FROM projects ORDER BY path")
+                .unwrap();
+            st.query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(stats.updated_projects, 2, "projects: {:?}", projects);
+        assert_eq!(stats.files_selected, 9);
+
+        // Handoffs: state, never penalised as "sessions" noise, newest first, the older two
+        // carry `superseded_by`, and at 89+ days they are `verify`, not `stale`.
+        let q = "otter migration handoff next step";
+        let rows =
+            rank_files_native_with(&conn, &cfg, q, 10, RankOptions::default()).expect("rank");
+        let (i24, h24) = find(&rows, "HANDOFF-2026-06-24.md").expect("newest handoff");
+        let (i19, h19) = find(&rows, "HANDOFF-2026-06-19.md").expect("middle handoff");
+        let (i10, h10) = find(&rows, "HANDOFF-2026-06-10.md").expect("oldest handoff");
+        for (h, day) in [
+            (h24, "2026-06-24"),
+            (h19, "2026-06-19"),
+            (h10, "2026-06-10"),
+        ] {
+            assert_eq!(h.role, "state", "{}", h.path);
+            assert!(
+                h.quality > 0.99,
+                "handoff penalised: {} q={}",
+                h.path,
+                h.quality
+            );
+            assert!(!h.noise);
+            assert!(
+                h.raw_similarity.is_some(),
+                "every candidate carries a cosine"
+            );
+            assert_eq!(h.freshness_tier, "verify", "{} age {}", h.path, h.age_days);
+            assert!(h.verify);
+            // State takes the newer of path date and last edit; both fall on the same day here.
+            assert_eq!(freshness::format_ymd(h.content_date), day, "{}", h.path);
+        }
+        assert!(h24.superseded_by.is_none(), "{:?}", h24.superseded_by);
+        assert_eq!(h19.superseded_by.as_deref(), Some(h24.path.as_str()));
+        assert_eq!(h10.superseded_by.as_deref(), Some(h24.path.as_str()));
+        assert!(
+            i24 < i19 && i24 < i10,
+            "newest first: {} {} {}",
+            i24,
+            i19,
+            i10
+        );
+
+        // Editing the oldest handoff today (a typo fix: new content, mtime now) does not make
+        // it the head: series order follows the revision date (the date in the file name),
+        // not the last edit, although the content date does move to the edit.
+        let oldest = _proj
+            .join("docs")
+            .join("sessions")
+            .join("HANDOFF-2026-06-10.md");
+        let original = fs::read_to_string(&oldest).unwrap();
+        write(&oldest, &format!("{}\nTypo fixed later.\n", original));
+        set_mtime(&oldest, SystemTime::now());
+        let stats = store.index(&cfg, &embedder, false).expect("reindex");
+        assert!(stats.files_selected >= 1);
+        let touched =
+            rank_files_native_with(&conn, &cfg, q, 10, RankOptions::default()).expect("rank");
+        let (_, t24) = find(&touched, "HANDOFF-2026-06-24.md").unwrap();
+        let (_, t10) = find(&touched, "HANDOFF-2026-06-10.md").unwrap();
+        assert_eq!(t10.date_source, "mtime", "content date moved to the edit");
+        assert!(t10.age_days < 1.0, "{}", t10.age_days);
+        assert!(t24.superseded_by.is_none(), "{:?}", t24.superseded_by);
+        assert_eq!(
+            t10.superseded_by.as_deref(),
+            Some(t24.path.as_str()),
+            "the edited June 10 handoff stays superseded by June 24"
+        );
+        write(&oldest, &original);
+        set_mtime(&oldest, at(2026, 6, 10));
+        store.index(&cfg, &embedder, false).expect("reindex");
+
+        // History or the flag: superseded files stay marked but rank at full strength.
+        let strong = rank_files_native_with(
+            &conn,
+            &cfg,
+            q,
+            10,
+            RankOptions {
+                include_superseded: true,
+                ..RankOptions::default()
+            },
+        )
+        .expect("rank");
+        let (_, s19) = find(&strong, "HANDOFF-2026-06-19.md").unwrap();
+        assert_eq!(s19.superseded_by.as_deref(), Some(h24.path.as_str()));
+        assert!(
+            s19.score > h19.score
+                && (s19.base_score - h19.base_score / SUPERSEDED_FACTOR).abs() < 1e-9,
+            "flag restores full strength: {} vs {}",
+            s19.score,
+            h19.score
+        );
+        let hist = rank_files_native_with(
+            &conn,
+            &cfg,
+            "what did the otter migration handoff say in June",
+            10,
+            RankOptions::default(),
+        )
+        .expect("rank");
+        let (_, x19) = find(&hist, "HANDOFF-2026-06-19.md").unwrap();
+        let (_, x24) = find(&hist, "HANDOFF-2026-06-24.md").unwrap();
+        assert!(x19.superseded_by.is_some() && x24.superseded_by.is_none());
+        assert!((x19.base_score / x19.quality) > 0.0);
+        // Same downrank factor absent: the two base scores are not 0.85 apart by construction.
+        assert!(
+            (x19.base_score - x24.base_score).abs() < (1.0 - SUPERSEDED_FACTOR) * x24.base_score,
+            "history query shows the series at full strength: {} vs {}",
+            x19.base_score,
+            x24.base_score
+        );
+
+        // Transcript: a record dated by the event in its path, although edited today.
+        let rows = rank_files_native_with(
+            &conn,
+            &cfg,
+            "otter pricing call transcript",
+            10,
+            RankOptions::default(),
+        )
+        .expect("rank");
+        let (_, t) = find(&rows, "20260413-otter-pricing-call.txt").expect("transcript");
+        assert_eq!(t.role, "record");
+        assert_eq!(t.freshness_tier, "record");
+        assert_eq!(t.date_source, "path-date");
+        assert_eq!(freshness::format_ymd(t.content_date), "2026-04-13");
+        assert!(t.age_days > 100.0, "{}", t.age_days);
+        assert!(!t.verify);
+
+        // Spec vs snapshot copy vs chat dump.
+        let rows = rank_files_native_with(
+            &conn,
+            &cfg,
+            "otter migration three waves habitat store",
+            10,
+            RankOptions::default(),
+        )
+        .expect("rank");
+        let (ispec, spec) = find(&rows, "specs/otter-migration-design.md").expect("spec");
+        assert!(!spec.path.contains("memory-snapshot"));
+        assert!(
+            find(&rows, "memory-snapshot/specs/otter-migration-design.md").is_none(),
+            "identical snapshot copy collapsed into the original: {:?}",
+            rows.iter().map(|r| &r.path).collect::<Vec<_>>()
+        );
+        assert_eq!(spec.role, "knowledge");
+        assert!(!spec.noise && spec.quality > 0.99);
+        let (idump, dump) = find(&rows, "exports/otter-chat-dump.txt").expect("dump");
+        assert!(dump.noise, "chat dump flagged as noise");
+        assert!(dump.quality <= 0.36, "dump quality {}", dump.quality);
+        assert!(ispec < idump, "spec {} above dump {}", ispec, idump);
+
+        // Raw-cosine floor: an unrelated query returns nothing once the floor sits between
+        // the unrelated and the related top cosine; the related query still answers.
+        let related = rank_files_native_with(&conn, &cfg, q, 10, RankOptions::default()).unwrap();
+        let unrelated_q = "zebra quarterly tax filing checklist";
+        let unrelated =
+            rank_files_native_with(&conn, &cfg, unrelated_q, 10, RankOptions::default()).unwrap();
+        let top_raw = |rows: &[RankedFileResult]| {
+            rows.iter()
+                .filter_map(|r| r.raw_similarity)
+                .fold(f64::NEG_INFINITY, f64::max)
+        };
+        let (rel_top, unrel_top) = (top_raw(&related), top_raw(&unrelated));
+        assert!(
+            rel_top > unrel_top,
+            "related {} unrelated {}",
+            rel_top,
+            unrel_top
+        );
+        let floor = (rel_top + unrel_top) / 2.0;
+        let opts = RankOptions {
+            min_raw_similarity: floor,
+            ..RankOptions::default()
+        };
+        assert!(
+            rank_files_native_with(&conn, &cfg, unrelated_q, 10, opts)
+                .unwrap()
+                .is_empty(),
+            "unrelated query under the floor {}",
+            floor
+        );
+        assert!(!rank_files_native_with(&conn, &cfg, q, 10, opts)
+            .unwrap()
+            .is_empty());
+        // The floor is stated in raw cosine, never in the normalised score whose top is 1.0.
+        assert!(related.iter().any(|r| (r.semantic - 1.0).abs() < 1e-9));
+        assert!(unrelated.iter().any(|r| (r.semantic - 1.0).abs() < 1e-9));
+    }
+
+    /// Duplicate collapse uses one identity, the whole-file manifest hash, and two rules: same
+    /// file name, or one copy under a copy directory. Byte-identical documents under different
+    /// names in different projects stay two results, and the survivor keeps its own score.
+    #[test]
+    fn duplicate_collapse_uses_file_identity_and_copy_rules() {
+        let store = TestStore::new("dup-identity");
+        let root = store.corpus_root("root");
+        let acme = root.join("acme");
+        let beta = root.join("beta");
+        let gamma = root.join("gamma");
+        write(
+            &acme.join("README.md"),
+            "# Acme\n\nOtter habitat programme.\n",
+        );
+        write(
+            &beta.join("README.md"),
+            "# Beta\n\nOtter partner programme.\n",
+        );
+        write(
+            &gamma.join("README.md"),
+            "# Gamma\n\nOtter research programme.\n",
+        );
+        // Same name and bytes in two projects: copies of one file.
+        write(&acme.join("specs").join("otter-migration-design.md"), SPEC);
+        write(&beta.join("specs").join("otter-migration-design.md"), SPEC);
+        // Same bytes, another name, no copy directory: another document.
+        write(&gamma.join("design").join("otter-design-v1.md"), SPEC);
+        // Same bytes under a copy directory, yet another name: a copy.
+        write(&gamma.join("archive").join("old-otter.md"), SPEC);
+        store.track(&root);
+        let cfg = store.cfg(&root, &[("embed_backend", "hash")]);
+        let embedder = TestEmbedder::new(&cfg, true);
+        store.index(&cfg, &embedder, false).expect("index");
+        let conn = store.conn();
+        let q = "otter migration three waves habitat store";
+        let rows = rank_files_native_with(&conn, &cfg, q, 20, RankOptions::default()).unwrap();
+        let spec_copies: Vec<&RankedFileResult> = rows
+            .iter()
+            .filter(|r| r.path.ends_with("specs/otter-migration-design.md"))
+            .collect();
+        assert_eq!(
+            spec_copies.len(),
+            1,
+            "same name and bytes collapse: {:?}",
+            rows.iter().map(|r| &r.path).collect::<Vec<_>>()
+        );
+        assert!(
+            find(&rows, "design/otter-design-v1.md").is_some(),
+            "a byte-identical document under another name stays"
+        );
+        assert!(
+            find(&rows, "archive/old-otter.md").is_none(),
+            "a copy under a copy directory folds into an original"
+        );
+
+        // The survivor keeps its own numbers: the archive copy scores higher but loses to the
+        // original by the copy-directory rule, and the original's score stays what it was.
+        let paths: Vec<String> = rows.iter().map(|r| r.path.clone()).collect();
+        let hashes = file_content_hashes(&conn, &paths);
+        let (_, kept) = find(&rows, "specs/otter-migration-design.md").unwrap();
+        let copy_path =
+            normalize_path(&gamma.join("archive").join("old-otter.md").to_string_lossy())
+                .to_string_lossy()
+                .to_string();
+        assert_eq!(
+            hashes.get(&kept.path),
+            file_content_hashes(&conn, &[copy_path.clone()]).get(&copy_path),
+            "both copies share the manifest hash"
+        );
+        let mut copy = kept.clone();
+        copy.path = copy_path.clone();
+        copy.doc_rel_path = "archive/old-otter.md".to_string();
+        copy.project_path = normalize_path(&gamma.to_string_lossy())
+            .to_string_lossy()
+            .to_string();
+        copy.score = kept.score + 0.5;
+        copy.base_score = kept.base_score + 0.5;
+        copy.raw_similarity = Some(0.999);
+        let mut by_file: HashMap<String, RankedFileResult> = HashMap::new();
+        by_file.insert(kept.path.clone(), kept.clone());
+        by_file.insert(copy_path.clone(), copy);
+        collapse_duplicate_files(&conn, &mut by_file);
+        assert_eq!(by_file.len(), 1);
+        let survivor = by_file.values().next().unwrap();
+        assert_eq!(survivor.path, kept.path, "the original survives");
+        assert!(
+            (survivor.score - kept.score).abs() < 1e-12
+                && (survivor.base_score - kept.base_score).abs() < 1e-12
+                && survivor.raw_similarity == kept.raw_similarity,
+            "the survivor keeps its own score and cosine, not the copy's higher ones"
+        );
+        assert!(same_file_copy("a/x.md", "b/X.MD"));
+        assert!(same_file_copy("a/x.md", "backup/y.md"));
+        assert!(same_file_copy(
+            "memory-snapshot/-u/MEMORY.md",
+            "memory/notes.md"
+        ));
+        assert!(!same_file_copy("a/x.md", "b/y.md"));
+    }
+
+    /// Ranking is reproducible: when candidates tie, the cut and the order follow the chunk
+    /// id or the path, never the hash-map iteration order. The path-keyword scan is the case
+    /// that showed on the live store (one query's file list changed between two identical
+    /// processes because its tied `lexical = 0.4` rows were truncated in hash-map order).
+    #[test]
+    fn ranking_is_deterministic_across_calls() {
+        let store = TestStore::new("deterministic");
+        let (root, _proj) = fixture(&store);
+        store.track(&root);
+        let cfg = store.cfg(&root, &[("embed_backend", "hash")]);
+        let embedder = TestEmbedder::new(&cfg, true);
+        store.index(&cfg, &embedder, false).expect("index");
+        let conn = store.conn();
+        // "otter" is in the name of five fixture files: every chunk of them ties at
+        // lexical 1.0, and keep_top = 2 forces a cut among the ties.
+        let first: Vec<i64> = {
+            let mut v: Vec<i64> = keyword_path_chunk_scores(&conn, "otter", 2)
+                .unwrap()
+                .keys()
+                .copied()
+                .collect();
+            v.sort_unstable();
+            v
+        };
+        assert_eq!(first.len(), 2);
+        for _ in 0..6 {
+            let mut again: Vec<i64> = keyword_path_chunk_scores(&conn, "otter", 2)
+                .unwrap()
+                .keys()
+                .copied()
+                .collect();
+            again.sort_unstable();
+            assert_eq!(again, first, "the cut among tied rows is stable");
+        }
+        let order = |q: &str| -> Vec<(String, i64)> {
+            rank_files_native_with(&conn, &cfg, q, 20, RankOptions::default())
+                .unwrap()
+                .into_iter()
+                .map(|r| (r.path, r.chunk_id))
+                .collect()
+        };
+        for q in [
+            "otter",
+            "otter migration handoff next step",
+            "docs/sessions",
+        ] {
+            let a = order(q);
+            for _ in 0..4 {
+                assert_eq!(order(q), a, "{}", q);
+            }
+        }
+    }
+
+    /// A long `.txt` transcript and a long `.txt` chat dump: whichever chunk a query hits, the
+    /// role (record) and the noise flag come from the file's first chunk, so they are the same
+    /// for every chunk. Plain `.md` files keep the shape of the retrieved chunk.
+    #[test]
+    fn txt_role_and_noise_are_stable_across_chunks() {
+        let store = TestStore::new("txt-file-shape");
+        let root = store.corpus_root("root");
+        write(
+            &root.join("beta").join("notes.md"),
+            "# Beta\n\nUnrelated notes on zebra habitats and quarterly tax filing checklists.\n",
+        );
+        let proj = root.join("acme");
+        write(&proj.join("README.md"), "# Acme\n\nProject notes.\n");
+        // Chunks are 1000 characters: the markers sit in the first chunk, the searched-for words
+        // ("pelican invoice reconciliation") only in the third.
+        let filler =
+            "The team walked through the quarterly roadmap and the staffing plan in detail. ";
+        let mut transcript = String::from("# Meeting Transcript **Date:** Monday, April 13, 2026\n\n## Summary\nThe team discussed the roadmap.\n\n");
+        while transcript.len() < 2300 {
+            transcript.push_str(filler);
+        }
+        transcript.push_str(
+            "Then the pelican invoice reconciliation was assigned to the finance lead.\n",
+        );
+        write(&proj.join("notes").join("roadmap-call.txt"), &transcript);
+        let mut dump = String::from("Human: plan the migration\n\nAssistant: The migration moves in three waves.\n\nHuman: and the budget?\n\nAssistant: One budget line per wave.\n\nHuman: ok\n\nAssistant: ");
+        while dump.len() < 2300 {
+            dump.push_str(filler);
+        }
+        dump.push_str("The walrus ledger export runs nightly after the close.\n");
+        write(&proj.join("exports").join("chat-export.txt"), &dump);
+        store.track(&root);
+        let cfg = store.cfg(&root, &[("embed_backend", "hash")]);
+        let embedder = TestEmbedder::new(&cfg, true);
+        store.index(&cfg, &embedder, false).expect("index");
+        let conn = store.conn();
+        let n_chunks = |name: &str| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM project_chunks WHERE doc_rel_path = ?1",
+                params![name],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert!(n_chunks("notes/roadmap-call.txt") >= 3);
+        assert!(n_chunks("exports/chat-export.txt") >= 3);
+
+        let rows = rank_files_native_with(
+            &conn,
+            &cfg,
+            "pelican invoice reconciliation",
+            10,
+            RankOptions::default(),
+        )
+        .unwrap();
+        let (_, t) = find(&rows, "roadmap-call.txt").expect("transcript");
+        assert!(
+            t.chunk_index >= 2,
+            "the hit is a later chunk: {}",
+            t.chunk_index
+        );
+        assert_eq!(t.role, "record", "role from the file's first chunk");
+        assert!(!t.noise);
+        let rows = rank_files_native_with(
+            &conn,
+            &cfg,
+            "walrus ledger export nightly",
+            10,
+            RankOptions::default(),
+        )
+        .unwrap();
+        let (_, d) = find(&rows, "chat-export.txt").expect("dump");
+        assert!(d.chunk_index >= 2, "{}", d.chunk_index);
+        assert!(d.noise, "noise from the file's first chunk");
+        assert!(d.quality <= 0.36, "{}", d.quality);
+        assert_eq!(d.role, "knowledge");
+        // Chunk view agrees with the files view.
+        let mut quiet = cfg.clone();
+        quiet.reranker_enabled = false;
+        let chunks =
+            rank_chunks_native_with(&conn, &quiet, "walrus ledger export nightly", 10, None)
+                .unwrap();
+        let c = chunks
+            .iter()
+            .find(|c| c.path.ends_with("chat-export.txt"))
+            .expect("dump chunk");
+        assert!(c.noise && c.chunk_index >= 2);
+    }
+
+    /// A chunk row with no vector anywhere (found by FTS only) and one whose SQLite vector is
+    /// NaN: both carry `raw_similarity = None` and fail any floor above zero, in the files and
+    /// the chunks view; a candidate with a real cosine above the floor stays.
+    #[test]
+    fn raw_floor_fails_closed_on_missing_and_nan_cosines() {
+        assert!(passes_raw_floor(None, 0.0));
+        assert!(passes_raw_floor(Some(f64::NAN), 0.0), "floor 0 is off");
+        assert!(!passes_raw_floor(None, 0.4));
+        assert!(!passes_raw_floor(Some(f64::NAN), 0.4));
+        assert!(!passes_raw_floor(Some(f64::INFINITY), 0.4));
+        assert!(!passes_raw_floor(Some(0.399), 0.4));
+        assert!(passes_raw_floor(Some(0.4), 0.4));
+        assert!(passes_raw_floor(Some(0.9), 0.4));
+
+        let store = TestStore::new("raw-floor-closed");
+        let (root, proj) = fixture(&store);
+        store.track(&root);
+        let mut cfg = store.cfg(
+            &root,
+            &[("embed_backend", "hash"), ("reranker_enabled", "false")],
+        );
+        let embedder = TestEmbedder::new(&cfg, true);
+        store.index(&cfg, &embedder, false).expect("index");
+        let conn = store.conn();
+        let project_id: i64 = conn
+            .query_row(
+                "SELECT id FROM projects WHERE path = ?1",
+                params![normalize_path(&proj.to_string_lossy())
+                    .to_string_lossy()
+                    .to_string()],
+                |r| r.get(0),
+            )
+            .expect("acme project id");
+        let now = now_ts();
+        let q = "zebra quarterly tax filing checklist";
+        let insert_chunk = |name: &str, text: &str| -> i64 {
+            let doc_path = proj.join("notes").join(name).to_string_lossy().to_string();
+            conn.execute(
+                "INSERT INTO project_chunks(project_id, doc_path, doc_rel_path, doc_mtime, chunk_index, token_count, text_hash, text, updated_at) VALUES (?1, ?2, ?3, ?4, 0, 12, ?5, ?6, ?4)",
+                params![project_id, doc_path, format!("notes/{}", name), now, format!("h-{}", name), text],
+            )
+            .expect("insert chunk");
+            conn.last_insert_rowid()
+        };
+        // Found by the keyword search, no vector in SQLite or LanceDB.
+        let no_vec = insert_chunk(
+            "zebra-no-vector.md",
+            "Zebra quarterly tax filing checklist for the zebra habitat, first draft.",
+        );
+        // A stored vector that is all NaN: the cosine is not finite.
+        let nan_vec = insert_chunk(
+            "zebra-nan-vector.md",
+            "Zebra quarterly tax filing checklist for the zebra habitat, second draft.",
+        );
+        let model_key = model_key_for_cfg(&cfg);
+        let dim = cfg.local_embed_dim.max(1) as usize;
+        let nan_blob: Vec<u8> = std::iter::repeat(f32::NAN.to_le_bytes())
+            .take(dim)
+            .flatten()
+            .collect();
+        conn.execute(
+            "INSERT INTO project_chunk_vectors(chunk_id, model, dim, norm, vector) VALUES (?1, ?2, ?3, 1.0, ?4)",
+            params![nan_vec, model_key, dim as i64, nan_blob],
+        )
+        .expect("insert nan vector");
+
+        let open = rank_files_native_with(&conn, &cfg, q, 20, RankOptions::default()).unwrap();
+        let (_, a) = find(&open, "zebra-no-vector.md").expect("lexical hit without a vector");
+        let (_, b) = find(&open, "zebra-nan-vector.md").expect("lexical hit with a NaN vector");
+        let (_, beta) = find(&open, "beta/notes.md").expect("the real zebra note");
+        assert_eq!(a.raw_similarity, None, "{}", a.path);
+        assert_eq!(b.raw_similarity, None, "{}", b.path);
+        let beta_raw = beta.raw_similarity.expect("real cosine");
+        assert!(beta_raw.is_finite() && beta_raw > 0.0, "{}", beta_raw);
+
+        let floor = beta_raw / 2.0;
+        let closed = rank_files_native_with(
+            &conn,
+            &cfg,
+            q,
+            20,
+            RankOptions {
+                min_raw_similarity: floor,
+                ..RankOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(find(&closed, "beta/notes.md").is_some());
+        assert!(
+            find(&closed, "zebra-no-vector.md").is_none(),
+            "a missing cosine fails the floor: {:?}",
+            closed.iter().map(|r| &r.path).collect::<Vec<_>>()
+        );
+        assert!(find(&closed, "zebra-nan-vector.md").is_none());
+
+        // Chunk view, same floor through `search_min_abs_score`.
+        cfg.search_min_abs_score = floor;
+        let chunks = rank_chunks_native_with(&conn, &cfg, q, 20, None).unwrap();
+        assert!(chunks.iter().any(|c| c.path.ends_with("beta/notes.md")));
+        assert!(!chunks.iter().any(|c| c.path.contains("zebra-no-vector")));
+        assert!(!chunks.iter().any(|c| c.path.contains("zebra-nan-vector")));
+        cfg.search_min_abs_score = 0.0;
+        let chunks = rank_chunks_native_with(&conn, &cfg, q, 20, None).unwrap();
+        assert!(chunks.iter().any(|c| c.path.contains("zebra-no-vector")));
+        let _ = no_vec;
+    }
+
+    /// The cosine reported for a hit found through a different vector (HyDE) is recomputed
+    /// against the real query vector from the SQLite copy of the chunk vectors, agrees with
+    /// LanceDB's cosine for the same query, and is `None` when the vector is gone.
+    #[test]
+    fn hyde_only_hits_are_rescored_against_the_real_query_vector() {
+        let store = TestStore::new("hyde-rescore");
+        let (root, _proj) = fixture(&store);
+        store.track(&root);
+        let cfg = store.cfg(&root, &[("embed_backend", "hash")]);
+        let embedder = TestEmbedder::new(&cfg, true);
+        store.index(&cfg, &embedder, false).expect("index");
+        let conn = store.conn();
+        let (model_key, qv) = embed_query_cached(&cfg, "otter migration pricing tiers").unwrap();
+        let (_, hyde_vec) =
+            embed_query_cached(&cfg, "fn migrate_otters() { let waves = 3; }").unwrap();
+        // What the HyDE pass sees: hits scored against the hypothetical text.
+        let hyde_hits = with_lance_store(|s| lance_store::search_vectors(s, &hyde_vec, 5)).unwrap();
+        assert!(!hyde_hits.is_empty());
+        let mut signals = chunk_signals_for_ids(
+            &conn,
+            &hyde_hits,
+            &HashMap::new(),
+            &CoverageTerms::from_query(""),
+            None,
+        )
+        .unwrap();
+        let ids: Vec<i64> = signals.keys().copied().collect();
+        recompute_raw_similarity(&conn, &mut signals, &ids, &model_key, &qv).unwrap();
+        let real = hybrid_search_lance(
+            &conn,
+            &model_key,
+            "otter migration pricing tiers",
+            &qv,
+            50,
+            50,
+        )
+        .unwrap();
+        let from_sqlite = cosine_from_sqlite_vectors(&conn, &model_key, &qv, &ids).unwrap();
+        let mut differs_from_hyde = 0usize;
+        for id in &ids {
+            let got = signals[id]
+                .raw_similarity
+                .expect("cosine to the real query");
+            assert!((got - from_sqlite[id]).abs() < 1e-9);
+            let lance = real[id].raw_similarity.expect("lance cosine");
+            assert!(
+                (got - lance).abs() < 1e-5,
+                "chunk {}: sqlite {} vs lance {}",
+                id,
+                got,
+                lance
+            );
+            if (got - hyde_hits[id].raw_similarity).abs() > 1e-6 {
+                differs_from_hyde += 1;
+            }
+        }
+        assert!(
+            differs_from_hyde > 0,
+            "the HyDE cosine is not the query cosine"
+        );
+        // No stored vector: no cosine, so the floor fails closed.
+        let victim = ids[0];
+        conn.execute(
+            "DELETE FROM project_chunk_vectors WHERE chunk_id = ?1",
+            params![victim],
+        )
+        .unwrap();
+        recompute_raw_similarity(&conn, &mut signals, &[victim], &model_key, &qv).unwrap();
+        assert_eq!(signals[&victim].raw_similarity, None);
+        assert!(!passes_raw_floor(signals[&victim].raw_similarity, 0.01));
+    }
+
+    #[test]
+    fn noise_is_judged_from_text_and_file_type_not_from_sessions_directories() {
+        let prose = "# Handoff\n\nState of the work: the migration plan is drafted and the next step is the pricing review.";
+        assert!((content_quality("docs/sessions/HANDOFF-2026-06-10.md", prose) - 1.0).abs() < 1e-9);
+        assert!((content_quality("session_notes/x.md", prose) - 1.0).abs() < 1e-9);
+        let dump = "Human: fix the tests\n\nAssistant: Running them now.\n\nHuman: ok\n";
+        assert!((content_quality("exports/dump.txt", dump) - 0.35).abs() < 1e-9);
+        assert!((content_quality("docs/dump.md", dump) - 0.35).abs() < 1e-9);
+        let jsonl = "{\"type\":\"user\",\"message\":{\"role\":\"user\"}}\n{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\"}}\n";
+        assert!((content_quality("logs/session.jsonl", jsonl) - 0.35).abs() < 1e-9);
+        assert!((content_quality("logs/run.log", "started\nfinished\n") - 0.60).abs() < 1e-9);
+        assert!((content_quality("logs/run.jsonl", "{\"a\": 1}\n") - 0.60).abs() < 1e-9);
+        assert!(
+            (content_quality(
+                "package-lock.json",
+                "{\"name\": \"x\", \"lockfileVersion\": 3}"
+            ) - 0.35)
+                .abs()
+                < 1e-9
+        );
+        assert!(is_noise_artifact("x/package-lock.json", TextShape::Prose));
+        assert!(is_noise_artifact("x/app.min.js", TextShape::Prose));
+        assert!(is_noise_artifact("x/notes.md", TextShape::ChatDump));
+        assert!(!is_noise_artifact(
+            "docs/sessions/HANDOFF.md",
+            TextShape::Prose
+        ));
+        assert!(!is_noise_artifact("notes/call.txt", TextShape::Transcript));
+
+        // Path penalties are about directory components, never about the file name.
+        assert!((path_noise_penalty("docs/sessions/HANDOFF.md") - 1.0).abs() < 1e-9);
+        assert!(
+            (path_noise_penalty("memory-snapshot/-Users-x/memory/MEMORY.md") - 0.85).abs() < 1e-9
+        );
+        assert!((path_noise_penalty("docs/Backups/old.md") - 0.85).abs() < 1e-9);
+        assert!((path_noise_penalty("archived/meeting-transcribe/DESIGN.md") - 0.85).abs() < 1e-9);
+        assert!((path_noise_penalty("archive/x.md") - 0.85).abs() < 1e-9);
+        assert!((path_noise_penalty("snapshot.md") - 1.0).abs() < 1e-9);
+        assert!((path_noise_penalty("tmp/x.md") - 0.55).abs() < 1e-9);
+        assert!((path_noise_penalty("infra/state/x.tfstate") - 0.72).abs() < 1e-9);
+        assert!((path_noise_penalty("data/x.json") - 0.92).abs() < 1e-9);
+        assert!((path_noise_penalty("tmp/backup/x.json") - 0.55 * 0.85 * 0.92).abs() < 1e-9);
+    }
+
+    #[test]
+    fn coverage_terms_mark_strong_lexical_matches() {
+        let cover = CoverageTerms::from_query("what do we know about Acme and S3 Tables");
+        assert_eq!(cover.names, vec!["acme".to_string(), "tables".to_string()]);
+        assert!(cover.terms.contains(&"acme".to_string()));
+        assert!(!cover.terms.contains(&"what".to_string()));
+        assert!(
+            !cover.strong_match("Notes from the Acme briefing on 2026-07-15."),
+            "a name alone is a mention"
+        );
+        assert!(
+            cover.strong_match("What we know about the Acme briefing."),
+            "a name joined by another distinctive term"
+        );
+        assert!(!cover.strong_match("Nothing about that customer here."));
+        assert!(
+            cover.strong_match("acme know tables s3 about"),
+            "every term present"
+        );
+        // Capitalised only because they open the prompt or a sentence: not names.
+        assert!(CoverageTerms::from_query("Run the tests").names.is_empty());
+        assert!(CoverageTerms::from_query("Read the handoff")
+            .names
+            .is_empty());
+        assert!(CoverageTerms::from_query("Summarize this").names.is_empty());
+        assert!(!CoverageTerms::from_query("Run the tests").strong_match("cargo run --release"));
+        assert_eq!(
+            CoverageTerms::from_query("Read the Acme handoff. Summarize it for Globex").names,
+            vec!["acme".to_string(), "globex".to_string()]
+        );
+        assert_eq!(
+            CoverageTerms::from_query("Tell me about Globex\nThen Acme").names,
+            vec!["globex".to_string(), "acme".to_string()],
+            "a new line starts a sentence"
+        );
+        assert!(
+            CoverageTerms::from_query("what about AWS and EBC")
+                .names
+                .is_empty(),
+            "three letters are not enough"
+        );
+        assert_eq!(
+            CoverageTerms::from_query("please Review the Acme deck").names,
+            vec!["acme".to_string()],
+            "a prompt verb is not a name even mid-sentence"
+        );
+        let two = CoverageTerms::from_query("lancedb compaction");
+        assert!(two.names.is_empty());
+        assert!(two.strong_match("LanceDB compaction runs in the watcher sweep"));
+        assert!(
+            !two.strong_match("LanceDB versions pile up"),
+            "one of two terms"
+        );
+        let one = CoverageTerms::from_query("compaction");
+        assert!(
+            !one.strong_match("compaction"),
+            "a single common word is not strong evidence"
+        );
+        assert!(!CoverageTerms::from_query("").strong_match("anything"));
+        let lex = CoverageTerms::from_terms(&["S3Tables".to_string(), "cost".to_string()]);
+        assert!(lex.strong_match("s3tables cost allocation"));
+    }
 }
