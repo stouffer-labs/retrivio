@@ -30,6 +30,7 @@ use crate::roles::{Role, TextShape};
 
 mod code_intel;
 mod documents;
+mod dossier;
 mod freshness;
 mod hook_install;
 mod lance_store;
@@ -709,6 +710,7 @@ fn main() {
         "prune" => run_prune_cmd(&args[1..]),
         "watch" => run_watch_cmd(&args[1..]),
         "search" => run_search_cmd(&args[1..]),
+        "dossier" => run_dossier_cmd(&args[1..]),
         "recall" => recall::run_recall_cmd(&args[1..]),
         "hook" => hook_install::run_hook_cmd(&args[1..]),
         "service" => hook_install::run_service_cmd(&args[1..]),
@@ -984,6 +986,7 @@ fn print_help() {
     );
     println!("  retrivio watch [--interval <seconds>] [--debounce-ms <ms>] [--once] [--quiet]");
     println!("  retrivio search [--view projects|files] [--limit <n>] <query...>");
+    println!("  retrivio dossier [--limit <n>] [--json] <topic...>   # cross-folder topic dossier: top projects, entry files, related projects");
     println!(
         "  retrivio pick [--query <text>] [--view projects|files] [--limit <n>] [--emit-path-file <path>]"
     );
@@ -2782,6 +2785,10 @@ fn config_rows() -> Vec<(&'static str, &'static str)> {
         ("recall_system_message", "Recall: emit as system message"),
         ("recall_semantic", "Recall: semantic retrieval mode"),
         (
+            "recall_dossier",
+            "Recall: automatic topic dossier (shadow logs the gate, auto applies it, off)",
+        ),
+        (
             "recall_session_ttl_days",
             "Recall: session memory TTL (days)",
         ),
@@ -2793,6 +2800,7 @@ fn config_enum_options(key: &str) -> Option<Vec<&'static str>> {
         "embed_backend" => Some(EMBED_BACKENDS.to_vec()),
         "retrieval_backend" => Some(vec!["lancedb"]),
         "recall_semantic" => Some(vec!["auto", "on", "off"]),
+        "recall_dossier" => Some(vec!["shadow", "auto", "off"]),
         "hyde_enabled"
         | "reranker_enabled"
         | "recall_excerpts"
@@ -2877,6 +2885,7 @@ fn config_value_string(cfg: &ConfigValues, key: &str) -> Option<String> {
         "recall_excerpts" => Some(cfg.recall_excerpts.to_string()),
         "recall_system_message" => Some(cfg.recall_system_message.to_string()),
         "recall_semantic" => Some(cfg.recall_semantic.clone()),
+        "recall_dossier" => Some(cfg.recall_dossier.clone()),
         "recall_session_ttl_days" => Some(format!("{:.6}", cfg.recall_session_ttl_days)),
         _ => None,
     }
@@ -3203,6 +3212,13 @@ fn config_set_value(cfg: &mut ConfigValues, key: &str, raw: &str) -> Result<(), 
                 return Err("recall_semantic must be one of: auto, on, off".to_string());
             }
             cfg.recall_semantic = v;
+        }
+        "recall_dossier" => {
+            let v = value.to_lowercase();
+            if !matches!(v.as_str(), "shadow" | "auto" | "off") {
+                return Err("recall_dossier must be one of: shadow, auto, off".to_string());
+            }
+            cfg.recall_dossier = v;
         }
         "recall_session_ttl_days" => {
             cfg.recall_session_ttl_days =
@@ -9586,7 +9602,7 @@ fn run_prune(
     // While a re-embed is pending (model changed), sqlite may hold vectors of two models under
     // the same chunk ids; reconciling against the new model would drop the old rows LanceDB
     // still serves. `reembed` rebuilds LanceDB wholesale when it completes.
-    let reembed_pending = reembed_requirement_reason(&conn, cfg)?.is_some();
+    let reembed_pending = persist_reembed_requirement(&conn, cfg)?.is_some();
     if reembed_pending {
         println!("  note: a re-embed is pending; LanceDB reconciliation skipped until `retrivio reembed` completes");
     }
@@ -9757,6 +9773,87 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+/// `retrivio dossier <topic> [--limit N] [--json]`: the explicit cross-folder dossier.
+fn run_dossier_cmd(args: &[OsString]) {
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        println!("usage: retrivio dossier [--limit <n>] [--json] <topic...>");
+        println!(
+            "  One fused retrieval pass grouped by project: the top {} (at most {}) projects that hold material about the topic, each with its best entry file (role, date, cosine), the newest evidence date, the number of distinct files and a one-line reason; then related projects from the project graph.",
+            dossier::DEFAULT_LIMIT,
+            dossier::MAX_LIMIT
+        );
+        println!("  --limit <n>  projects to list (1-{})", dossier::MAX_LIMIT);
+        println!("  --json       emit the topic-dossier-v1 payload (the MCP tool topic_dossier returns the same)");
+        return;
+    }
+    let mut limit = dossier::DEFAULT_LIMIT;
+    let mut json_output = false;
+    let mut topic_parts: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    while i < args.len() {
+        let s = args[i].to_string_lossy().to_string();
+        if s == "--json" {
+            json_output = true;
+        } else if s == "--limit" {
+            i += 1;
+            let v = arg_value(args, i, "--limit");
+            limit = v.parse::<usize>().unwrap_or_else(|_| {
+                eprintln!("error: --limit must be an integer");
+                process::exit(2);
+            });
+        } else if let Some(v) = s.strip_prefix("--limit=") {
+            limit = v.parse::<usize>().unwrap_or_else(|_| {
+                eprintln!("error: --limit must be an integer");
+                process::exit(2);
+            });
+        } else if s.starts_with('-') && topic_parts.is_empty() {
+            eprintln!("error: unknown option '{}'", s);
+            process::exit(2);
+        } else {
+            topic_parts.push(s);
+        }
+        i += 1;
+    }
+    if topic_parts.is_empty() {
+        eprintln!("error: topic is empty");
+        process::exit(2);
+    }
+    let topic = topic_parts.join(" ");
+    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let cfg = ConfigValues::from_map(load_config_values(&config_path(&cwd)));
+    ensure_retrieval_backend_ready(&cfg, true, "dossier").unwrap_or_else(|e| {
+        eprintln!("error: {}", e);
+        process::exit(1);
+    });
+    ensure_native_embed_backend(&cfg, "dossier").unwrap_or_else(|e| {
+        eprintln!("error: {}", e);
+        process::exit(1);
+    });
+    let dbp = db_path(&cwd);
+    if !dbp.is_file() {
+        eprintln!(
+            "error: no index at {}; run `retrivio index` first",
+            dbp.display()
+        );
+        process::exit(1);
+    }
+    let conn = open_db_read_only(&dbp).unwrap_or_else(|e| {
+        eprintln!("error: {}", e);
+        process::exit(1);
+    });
+    let d = dossier::build(&conn, &cfg, &topic, limit.clamp(1, dossier::MAX_LIMIT)).unwrap_or_else(
+        |e| {
+            eprintln!("error: {}", e);
+            process::exit(1);
+        },
+    );
+    if json_output {
+        println!("{}", dossier::to_json(&d));
+    } else {
+        println!("{}", dossier::render_text(&d));
+    }
+}
+
 fn run_search_cmd(args: &[OsString]) {
     if args.iter().any(|a| a == "-h" || a == "--help") {
         println!(
@@ -9881,7 +9978,15 @@ fn run_search_cmd(args: &[OsString]) {
     });
 
     let dbp = db_path(&cwd);
-    let conn = open_db_rw(&dbp).unwrap_or_else(|e| {
+    if !dbp.is_file() {
+        eprintln!(
+            "error: no index at {}; run `retrivio index` first",
+            dbp.display()
+        );
+        process::exit(1);
+    }
+    // Search only reads; a read-only connection never contends with the watcher's writes.
+    let conn = open_db_read_only(&dbp).unwrap_or_else(|e| {
         eprintln!("error: {}", e);
         process::exit(1);
     });
@@ -10136,38 +10241,88 @@ fn watch_scope_line(scope: &IndexScope) -> String {
 /// Compact LanceDB when it holds more than `threshold` versions on disk; 0 disables. Called
 /// from the watcher's periodic sweep, so a busy day of small writes cannot grow the store
 /// without bound (Slice 0 measured 1,793 versions and 3.7 GB before this existed).
-fn lance_compaction_due(versions: usize, threshold: i64) -> bool {
-    threshold > 0 && versions as i64 > threshold
+/// Compaction is due when the table holds more versions *or* more data fragments than the
+/// threshold. Versions count writes since the last cleanup; fragments count the files a
+/// vector search has to open, which keep growing while the version count is held down by
+/// the prune pass below.
+fn lance_compaction_due(versions: usize, fragments: usize, threshold: i64) -> bool {
+    threshold > 0 && (versions as i64 > threshold || fragments as i64 > threshold)
 }
 
+/// Watcher-side LanceDB hygiene after a sweep or a polling pass.
+///
+/// Two steps. When the compaction threshold is passed, fragments are rewritten and every
+/// version older than the grace period is dropped (`lance_store::optimize`). Otherwise, when
+/// the store still holds versions older than the grace period, they are dropped on their own
+/// (`lance_store::prune_versions`), which is what returns the disk space a compaction could
+/// not: the versions committed within the grace window before a compaction keep every
+/// pre-compaction fragment alive (measured on the live store: 625 MB -> 1.04 GB right after
+/// a compaction, with 148 dead files of 652 MB still on disk 45 minutes later), and only a
+/// later cleanup can remove them once those versions have aged.
 fn maybe_compact_lance(cwd: &Path, cfg: &ConfigValues, label: &str) {
+    if !lance_store_is_open() {
+        return;
+    }
     let lance_dir = data_dir(cwd).join("lance");
+    let grace = cfg.lance_version_grace_secs.max(0) as u64;
     let versions_before = lance_store::version_count(&lance_dir);
-    if !lance_compaction_due(versions_before, cfg.lance_compact_versions) || !lance_store_is_open()
-    {
+    let fragments_before = lance_store::fragment_count(&lance_dir);
+    if lance_compaction_due(
+        versions_before,
+        fragments_before,
+        cfg.lance_compact_versions,
+    ) {
+        let size_before = lance_store::dir_size_bytes(&lance_dir);
+        let t = Instant::now();
+        match with_lance_store(|store| lance_store::optimize(store, grace)) {
+            Ok(report) => println!(
+                "[{}] {} lancedb compacted: versions {} -> {}, fragments {} -> {} (threshold {}), {} -> {} on disk, rewrote {} fragments into {}, dropped {} old versions ({})",
+                chrono_like_now(),
+                label,
+                versions_before,
+                lance_store::version_count(&lance_dir),
+                fragments_before,
+                lance_store::fragment_count(&lance_dir),
+                cfg.lance_compact_versions,
+                format_bytes(size_before),
+                format_bytes(lance_store::dir_size_bytes(&lance_dir)),
+                report.fragments_removed,
+                report.fragments_added,
+                report.old_versions,
+                format_duration_ms(t.elapsed().as_millis() as u64)
+            ),
+            Err(e) => eprintln!(
+                "[{}] {} warning: LanceDB compaction failed ({} versions, {} fragments on disk): {}",
+                chrono_like_now(),
+                label,
+                versions_before,
+                fragments_before,
+                e
+            ),
+        }
+        return;
+    }
+    if lance_store::stale_version_count(&lance_dir, grace) == 0 {
         return;
     }
     let size_before = lance_store::dir_size_bytes(&lance_dir);
     let t = Instant::now();
-    match with_lance_store(|store| {
-        lance_store::optimize(store, cfg.lance_version_grace_secs.max(0) as u64)
-    }) {
+    match with_lance_store(|store| lance_store::prune_versions(store, grace)) {
         Ok(report) => println!(
-            "[{}] {} lancedb compacted: versions {} -> {} (threshold {}), {} -> {} on disk, rewrote {} fragments into {}, dropped {} old versions ({})",
+            "[{}] {} lancedb pruned: versions {} -> {}, fragments {} -> {}, {} -> {} on disk, dropped {} old versions ({})",
             chrono_like_now(),
             label,
             versions_before,
             lance_store::version_count(&lance_dir),
-            cfg.lance_compact_versions,
+            fragments_before,
+            lance_store::fragment_count(&lance_dir),
             format_bytes(size_before),
             format_bytes(lance_store::dir_size_bytes(&lance_dir)),
-            report.fragments_removed,
-            report.fragments_added,
             report.old_versions,
             format_duration_ms(t.elapsed().as_millis() as u64)
         ),
         Err(e) => eprintln!(
-            "[{}] {} warning: LanceDB compaction failed ({} versions on disk): {}",
+            "[{}] {} warning: LanceDB version prune failed ({} versions on disk): {}",
             chrono_like_now(),
             label,
             versions_before,
@@ -10176,15 +10331,21 @@ fn maybe_compact_lance(cwd: &Path, cfg: &ConfigValues, label: &str) {
     }
 }
 
-/// Map changed paths onto what to index: a path inside a known project forces that project
+/// Map changed paths onto what to index: a path inside a known project targets that project
 /// (as a project, never as a root to discover); a path under a tracked root but outside every
 /// known project (a new directory) sends discovery to that root.
+///
+/// Nothing is forced: the targeted project goes through the ordinary change gate and the
+/// manifest fast path, so only the files whose size, mtime or content changed are read and
+/// chunked, and the full keep set still prunes what left the corpus (a deleted file changes
+/// the scan signature, so the project is re-collected and its rows go). Only `refresh`
+/// forces a full re-chunk.
 fn derive_watch_targets(
     pending_paths: &HashSet<PathBuf>,
     tracked_roots: &[TrackedRoot],
-) -> (IndexScope, HashSet<PathBuf>) {
+) -> IndexScope {
     if pending_paths.is_empty() || tracked_roots.is_empty() {
-        return (IndexScope::projects(Vec::new()), HashSet::new());
+        return IndexScope::projects(Vec::new());
     }
     let discovery = discover_projects_full(tracked_roots);
     let root_paths: Vec<PathBuf> = tracked_roots.iter().map(|r| r.path.clone()).collect();
@@ -10213,12 +10374,10 @@ fn derive_watch_targets(
         }
     }
 
-    let force_paths: HashSet<PathBuf> = project_set.iter().cloned().collect();
-    let scope = IndexScope::Targets {
+    IndexScope::Targets {
         roots: root_set.into_iter().collect(),
         projects: project_set.into_iter().collect(),
-    };
-    (scope, force_paths)
+    }
 }
 
 /// The tracked roots as the store has them now. Reloaded before every watcher run so a root
@@ -10253,6 +10412,10 @@ fn refresh_watch_roots(
     }
     Ok(roots)
 }
+
+/// Event paths verified by content hash in one watcher batch at most (see
+/// [`run_native_index_verifying`]); a larger batch relies on the stat gate alone.
+const WATCH_VERIFY_MAX: usize = 200;
 
 fn run_watch_event_loop(
     cwd: &Path,
@@ -10309,7 +10472,24 @@ fn run_watch_event_loop(
             // Roots as of now: events under a root removed since the last run map to no
             // target and are dropped here.
             let roots = refresh_watch_roots(cwd, cfg, &mut stream, &mut root_paths)?;
-            let (scope, force_paths) = derive_watch_targets(&pending_paths, &roots);
+            let scope = derive_watch_targets(&pending_paths, &roots);
+            // The event paths themselves: their content hash is checked even when size and
+            // mtime are unchanged (an edit that restores the timestamp). A storm of events
+            // (a checkout, a generated tree) falls back to the stat gate instead of hashing
+            // hundreds of files.
+            let mut verify_paths: HashSet<PathBuf> = pending_paths
+                .iter()
+                .map(|p| normalize_watch_path(p))
+                .filter(|p| watch_path_relevant(p))
+                .collect();
+            if verify_paths.len() > WATCH_VERIFY_MAX {
+                println!(
+                    "[{}] watch: {} event paths in one batch; content verification skipped for this batch (size and mtime gate only)",
+                    chrono_like_now(),
+                    verify_paths.len()
+                );
+                verify_paths.clear();
+            }
             pending_paths.clear();
             last_event_at = None;
             if scope.is_empty() {
@@ -10318,13 +10498,17 @@ fn run_watch_event_loop(
             println!("{}", watch_scope_line(&scope));
             ensure_retrieval_backend_ready(cfg, true, "watch events")?;
             let writer = acquire_writer_lock_for_watch(cwd)?;
-            let stats = run_native_index(
+            // Event scans use the manifest fast path (nothing forced): a project with one
+            // edited file reads and embeds that file only; the files the events named are
+            // verified by content hash.
+            let stats = run_native_index_verifying(
                 cwd,
                 cfg,
                 &writer,
                 scope,
                 false,
-                force_paths,
+                HashSet::new(),
+                verify_paths,
                 false,
                 !quiet,
                 "watch events",
@@ -13937,7 +14121,7 @@ fn handle_search_pick_request(req: &ApiRequest) -> (u16, String) {
     if let Err(e) = ensure_retrieval_backend_ready(&cfg, true, "api search/pick") {
         return (503, e);
     }
-    let conn = match open_db_rw(&db_path(&cwd)) {
+    let conn = match open_db_read_only(&db_path(&cwd)) {
         Ok(v) => v,
         Err(e) => return (500, e),
     };
@@ -14562,7 +14746,7 @@ fn handle_api_request(req: ApiRequest) -> (u16, Value) {
             if let Err(e) = ensure_retrieval_backend_ready(&cfg, true, "api search") {
                 return (503, serde_json::json!({"error": e}));
             }
-            let conn = match open_db_rw(&db_path(&cwd)) {
+            let conn = match open_db_read_only(&db_path(&cwd)) {
                 Ok(v) => v,
                 Err(e) => return (500, serde_json::json!({"error": e})),
             };
@@ -14608,7 +14792,7 @@ fn handle_api_request(req: ApiRequest) -> (u16, Value) {
             if let Err(e) = ensure_retrieval_backend_ready(&cfg, true, "api chunks/search") {
                 return (503, serde_json::json!({"error": e}));
             }
-            let conn = match open_db_rw(&db_path(&cwd)) {
+            let conn = match open_db_read_only(&db_path(&cwd)) {
                 Ok(v) => v,
                 Err(e) => return (500, serde_json::json!({"error": e})),
             };
@@ -14648,7 +14832,7 @@ fn handle_api_request(req: ApiRequest) -> (u16, Value) {
             if let Err(e) = ensure_retrieval_backend_ready(&cfg, true, "api chunks/related") {
                 return (503, serde_json::json!({"error": e}));
             }
-            let conn = match open_db_rw(&db_path(&cwd)) {
+            let conn = match open_db_read_only(&db_path(&cwd)) {
                 Ok(v) => v,
                 Err(e) => return (500, serde_json::json!({"error": e})),
             };
@@ -14681,7 +14865,7 @@ fn handle_api_request(req: ApiRequest) -> (u16, Value) {
             }
             let max_chars = parse_limit(req.query.get("max_chars"), 8000, 500_000);
             let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            let conn = match open_db_rw(&db_path(&cwd)) {
+            let conn = match open_db_read_only(&db_path(&cwd)) {
                 Ok(v) => v,
                 Err(e) => return (500, serde_json::json!({"error": e})),
             };
@@ -14729,7 +14913,7 @@ fn handle_api_request(req: ApiRequest) -> (u16, Value) {
             let max_chars = parse_limit(req.query.get("max_chars"), 120_000, 2_000_000);
             let normalized_path = normalize_path(&raw_path).to_string_lossy().to_string();
             let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            let conn = match open_db_rw(&db_path(&cwd)) {
+            let conn = match open_db_read_only(&db_path(&cwd)) {
                 Ok(v) => v,
                 Err(e) => return (500, serde_json::json!({"error": e})),
             };
@@ -14804,7 +14988,7 @@ fn handle_api_request(req: ApiRequest) -> (u16, Value) {
             if let Err(e) = ensure_retrieval_backend_ready(&cfg, true, "api context/pack") {
                 return (503, serde_json::json!({"error": e}));
             }
-            let conn = match open_db_rw(&db_path(&cwd)) {
+            let conn = match open_db_read_only(&db_path(&cwd)) {
                 Ok(v) => v,
                 Err(e) => return (500, serde_json::json!({"error": e})),
             };
@@ -14867,7 +15051,7 @@ fn handle_api_request(req: ApiRequest) -> (u16, Value) {
             if let Err(e) = ensure_retrieval_backend_ready(&cfg, true, "api context/pack") {
                 return (503, serde_json::json!({"error": e}));
             }
-            let conn = match open_db_rw(&db_path(&cwd)) {
+            let conn = match open_db_read_only(&db_path(&cwd)) {
                 Ok(v) => v,
                 Err(e) => return (500, serde_json::json!({"error": e})),
             };
@@ -14923,7 +15107,7 @@ fn handle_api_request(req: ApiRequest) -> (u16, Value) {
             }
             let limit = parse_limit(req.query.get("limit"), 100, 2000);
             let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            let conn = match open_db_rw(&db_path(&cwd)) {
+            let conn = match open_db_read_only(&db_path(&cwd)) {
                 Ok(v) => v,
                 Err(e) => return (500, serde_json::json!({"error": e})),
             };
@@ -15102,7 +15286,7 @@ fn handle_api_request(req: ApiRequest) -> (u16, Value) {
             let limit = parse_limit(req.query.get("limit"), 20, 500);
             let target = normalize_path(&path).to_string_lossy().to_string();
             let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            let conn = match open_db_rw(&db_path(&cwd)) {
+            let conn = match open_db_read_only(&db_path(&cwd)) {
                 Ok(v) => v,
                 Err(e) => return (500, serde_json::json!({"error": e})),
             };
@@ -15149,7 +15333,7 @@ fn handle_api_request(req: ApiRequest) -> (u16, Value) {
                 .filter(|v| !v.is_empty());
             let limit = parse_limit(req.query.get("limit"), 120, 600);
             let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            let conn = match open_db_rw(&db_path(&cwd)) {
+            let conn = match open_db_read_only(&db_path(&cwd)) {
                 Ok(v) => v,
                 Err(e) => return (500, serde_json::json!({"error": e})),
             };
@@ -15170,7 +15354,7 @@ fn handle_api_request(req: ApiRequest) -> (u16, Value) {
             }
             let limit = parse_limit(req.query.get("limit"), 40, 400);
             let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            let conn = match open_db_rw(&db_path(&cwd)) {
+            let conn = match open_db_read_only(&db_path(&cwd)) {
                 Ok(v) => v,
                 Err(e) => return (500, serde_json::json!({"error": e})),
             };
@@ -15201,7 +15385,7 @@ fn handle_api_request(req: ApiRequest) -> (u16, Value) {
             if let Err(e) = ensure_retrieval_backend_ready(&cfg, true, "api graph/view/related") {
                 return (503, serde_json::json!({"error": e}));
             }
-            let conn = match open_db_rw(&db_path(&cwd)) {
+            let conn = match open_db_read_only(&db_path(&cwd)) {
                 Ok(v) => v,
                 Err(e) => return (500, serde_json::json!({"error": e})),
             };
@@ -16065,6 +16249,18 @@ fn mcp_tool_specs() -> Vec<Value> {
             }
         }),
         serde_json::json!({
+            "name": "topic_dossier",
+            "description": "Cross-folder topic dossier for broad questions (\"what do we know about X\", \"everything about Y\"): one retrieval pass grouped by project. Returns the top projects (default 6, max 8) that hold material about the topic, each with its best entry file (path, role, content_date, age_days, freshness_tier, verify, raw_similarity, why), the newest evidence date, the number of distinct files, a one-line reason and a weak flag when its best cosine sits under the recall floor; then related projects from the project graph and an instruction. Use search_files for a specific document and pack_context for depth on one project.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "topic": {"type": "string", "description": "The entity or topic, e.g. a customer, system or initiative name with a few words of context."},
+                    "limit": {"type": "integer", "default": 6, "description": "Projects to return (1-8)."}
+                },
+                "required": ["topic"]
+            }
+        }),
+        serde_json::json!({
             "name": "search_chunks",
             "description": "Semantic+keyword search across indexed chunks/segments. Results carry content_date, age_days, freshness_tier, role, verify, noise and raw_similarity (cosine).",
             "inputSchema": {
@@ -16264,7 +16460,7 @@ fn mcp_status_resource() -> Result<String, String> {
     let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let cfg = ConfigValues::from_map(load_config_values(&config_path(&cwd)));
     let dbp = db_path(&cwd);
-    let conn = open_db_rw(&dbp)?;
+    let conn = open_db_read_only(&dbp)?;
     let roots = list_tracked_roots_conn(&conn)?;
     let projects: i64 = conn
         .query_row("SELECT COUNT(*) FROM projects", [], |row| row.get(0))
@@ -16371,6 +16567,27 @@ fn mcp_tool_call(name: &str, args: &Value) -> Result<Value, String> {
             let rows = rank_files_native_with(&conn, &cfg, &query, limit, opts)?;
             let results: Vec<Value> = rows.iter().map(ranked_file_result_json).collect();
             Ok(serde_json::json!({"query": query, "count": results.len(), "results": results}))
+        }
+        "topic_dossier" => {
+            let topic = args
+                .get("topic")
+                .and_then(|v| v.as_str())
+                .or_else(|| args.get("query").and_then(|v| v.as_str()))
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            if topic.is_empty() {
+                return Err("topic must be non-empty".to_string());
+            }
+            let limit = args
+                .get("limit")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(dossier::DEFAULT_LIMIT as i64)
+                .clamp(1, dossier::MAX_LIMIT as i64) as usize;
+            ensure_native_embed_backend(&cfg, "mcp topic_dossier")?;
+            ensure_retrieval_backend_ready(&cfg, true, "mcp topic_dossier")?;
+            let d = dossier::build(&conn, &cfg, &topic, limit)?;
+            Ok(dossier::to_json(&d))
         }
         "search_chunks" => {
             let query = args
@@ -17820,6 +18037,38 @@ fn run_native_index(
     emit_progress: bool,
     reason: &str,
 ) -> Result<IndexStats, String> {
+    run_native_index_verifying(
+        cwd,
+        cfg,
+        writer,
+        scope,
+        force_all,
+        force_paths,
+        HashSet::new(),
+        remove_missing,
+        emit_progress,
+        reason,
+    )
+}
+
+/// [`run_native_index`] with `verify_paths`: files (absolute) whose content hash is checked
+/// against the manifest even when their size and mtime are unchanged, and whose project is
+/// not skipped by the change gate on that account. The watcher passes the paths of the events
+/// it received, so an edit that keeps the byte length and restores the timestamp (the one
+/// change the stat-based gate cannot see) is still picked up, at the cost of reading and
+/// hashing exactly those files.
+fn run_native_index_verifying(
+    cwd: &Path,
+    cfg: &ConfigValues,
+    writer: &WriterLock,
+    scope: IndexScope,
+    force_all: bool,
+    force_paths: HashSet<PathBuf>,
+    verify_paths: HashSet<PathBuf>,
+    remove_missing: bool,
+    emit_progress: bool,
+    reason: &str,
+) -> Result<IndexStats, String> {
     set_extra_skip_dirs(cfg);
     let embedder = build_embedder(cfg)?;
     run_native_index_with_embedder(
@@ -17830,6 +18079,7 @@ fn run_native_index(
         scope,
         force_all,
         force_paths,
+        verify_paths,
         remove_missing,
         emit_progress,
         reason,
@@ -17852,15 +18102,22 @@ fn run_native_index_with_embedder(
     scope: IndexScope,
     force_all: bool,
     force_paths: HashSet<PathBuf>,
+    verify_paths: HashSet<PathBuf>,
     remove_missing: bool,
     emit_progress: bool,
     reason: &str,
 ) -> Result<IndexStats, String> {
     let t_start = Instant::now();
+    let verify_paths: Vec<PathBuf> = verify_paths
+        .iter()
+        .map(|p| normalize_path(&p.to_string_lossy()))
+        .collect();
     reset_embed_runtime_metrics();
     let dbp = db_path(cwd);
     let conn = open_db_writer(&dbp, writer)?;
     if reason != "reembed" {
+        // A writer: record a model change the read paths could only report.
+        persist_reembed_requirement(&conn, cfg)?;
         ensure_reembed_ready(&conn, cfg, &format!("{} indexing", reason))?;
     }
     // `remove_missing` drops every project row not visited by this run; on a scoped run that
@@ -18026,6 +18283,8 @@ fn run_native_index_with_embedder(
         manifest: FileManifest,
         /// Read and chunk every file, not only the changed ones.
         rechunk_all: bool,
+        /// Relative paths whose content hash is checked even when their stat is unchanged.
+        verify: HashSet<String>,
         /// The stored row, whose title, summary and vector are reused when unchanged.
         existing: Option<ExistingProject>,
     }
@@ -18044,6 +18303,10 @@ fn run_native_index_with_embedder(
             &caps,
             shallow_projects.contains(project_dir),
         );
+        // Event paths inside this project that the scan selected: a deleted or excluded path
+        // verifies nothing (a deletion moves the signature anyway).
+        let mut verify = verify_rel_paths(Path::new(&project_path), &verify_paths);
+        verify.retain(|rel| scan.selected.iter().any(|c| c.rel_path == *rel));
         if !scan.complete() && emit_progress {
             progress_clear_line();
             println!(
@@ -18072,7 +18335,10 @@ fn run_native_index_with_embedder(
                 let chunk_count = count_project_chunks(&conn, row.id)?;
                 let chunk_vec_count = count_project_chunk_vectors(&conn, row.id, &identity)?;
                 let chunk_vec_ready = chunk_count == 0 || chunk_vec_count >= chunk_count;
-                if project_vec_ready && chunk_vec_ready {
+                // A file named by an event is verified by content hash even though the
+                // signature did not move: the project goes to the collector, which reads
+                // and hashes exactly that file (`verify`), nothing else.
+                if project_vec_ready && chunk_vec_ready && verify.is_empty() {
                     stats.skipped_projects += 1;
                     if !scan.complete() {
                         stats.projects_incomplete += 1;
@@ -18107,7 +18373,9 @@ fn run_native_index_with_embedder(
                 }
                 // Vectors are missing for chunks no file change would revisit: check every
                 // file's chunks against the stored identities.
-                rechunk_all = true;
+                if !(project_vec_ready && chunk_vec_ready) {
+                    rechunk_all = true;
+                }
                 if emit_progress && !chunk_vec_ready && chunk_count > 0 {
                     progress_clear_line();
                     println!(
@@ -18148,6 +18416,7 @@ fn run_native_index_with_embedder(
             scan,
             manifest,
             rechunk_all,
+            verify,
             existing,
         });
     }
@@ -18172,13 +18441,14 @@ fn run_native_index_with_embedder(
                     let results = &results;
                     let caps = &caps;
                     let handle = s.spawn(move || {
-                        let corpus = collect_project_corpus(
+                        let corpus = collect_project_corpus_verifying(
                             &pw.dir,
                             &pw.scan,
                             caps,
                             max_chars,
                             &pw.manifest,
                             pw.rechunk_all,
+                            &pw.verify,
                         );
                         if let Ok(mut vec) = results.lock() {
                             vec.push((pw.idx, corpus));
@@ -18580,8 +18850,12 @@ struct EvidenceHit {
     freshness_tier: String,
     is_record: bool,
     role: &'static str,
+    verify: bool,
+    noise: bool,
     raw_similarity: Option<f64>,
     recency: f64,
+    /// Which signals contributed (slice 4); see [`why_string`].
+    why: String,
 }
 
 #[derive(Clone)]
@@ -18633,6 +18907,9 @@ pub(crate) struct RankedFileResult {
     pub(crate) raw_similarity: Option<f64>,
     /// For `state` files, the newest file of the same series when this one is not it.
     pub(crate) superseded_by: Option<String>,
+    /// Which signals contributed to the score (slice 4): a compact `+`-joined list such as
+    /// `semantic:0.61+lexical:0.40+graph:same_project+recency:fresh`; see [`why_string`].
+    pub(crate) why: String,
 }
 
 #[derive(Clone)]
@@ -18660,6 +18937,12 @@ struct RankedChunkResult {
     verify: bool,
     noise: bool,
     raw_similarity: Option<f64>,
+    /// Label only (slice 4): the newest `state` file of the same series among the files in
+    /// this result set when this chunk's file is not it. Chunk search never downranks or
+    /// collapses on it.
+    superseded_by: Option<String>,
+    /// Which signals contributed (slice 4); see [`why_string`].
+    why: String,
 }
 
 /// Optional knobs for the file/chunk ranking entry points.
@@ -18688,6 +18971,188 @@ fn passes_raw_floor(raw: Option<f64>, floor: f64) -> bool {
 
 /// Score multiplier for a `state` file that a newer file of the same series supersedes.
 const SUPERSEDED_FACTOR: f64 = 0.85;
+/// Score multiplier for a summary page about another project (slice 4 experiment): a file
+/// whose stem is the name of another indexed project (`projects/202608-acme-rollout.md` next
+/// to a project directory `202608-acme-rollout`), living outside that project, with evidence
+/// that it is a digest and not a document that happens to share the name (see
+/// [`is_summary_page`]). Such pages are AI-written digests of the source project and crowd the
+/// source documents out of the top results; the mild penalty lets the sources win ties.
+const SUMMARY_PAGE_FACTOR: f64 = 0.85;
+
+/// [`SUMMARY_PAGE_FACTOR`], or `RETRIVIO_SUMMARY_PAGE_FACTOR` (0.5 to 1.0) when set, read
+/// once; the override exists so a factor sweep can run one binary against the scorecard.
+fn summary_page_factor() -> f64 {
+    static FACTOR: OnceLock<f64> = OnceLock::new();
+    *FACTOR.get_or_init(|| {
+        env::var("RETRIVIO_SUMMARY_PAGE_FACTOR")
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|f| f.is_finite())
+            .map(|f| f.clamp(0.5, 1.0))
+            .unwrap_or(SUMMARY_PAGE_FACTOR)
+    })
+}
+
+/// Directories whose files are digests by convention: `projects/`, `summaries/`, `handoff*`.
+fn summary_dir_evidence(doc_rel_path: &str) -> bool {
+    Path::new(doc_rel_path)
+        .parent()
+        .map(|dir| {
+            dir.components().any(|c| {
+                let name = c.as_os_str().to_string_lossy().to_lowercase();
+                name == "projects" || name == "summaries" || name.starts_with("handoff")
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Text evidence: the chunk names three or more distinct paths inside the project it is
+/// named after (`<name>/docs/plan.md`, `.../<name>/src/main.rs`), the way a digest points
+/// back at its sources; a document that merely shares the name does not.
+const SUMMARY_TEXT_MIN_PATHS: usize = 3;
+
+fn text_references_project(text: &str, stem: &str) -> bool {
+    if stem.is_empty() {
+        return false;
+    }
+    let needle = format!("{}/", stem);
+    let mut seen: HashSet<String> = HashSet::new();
+    for raw in text.split_whitespace() {
+        let token = raw
+            .trim_matches(|c: char| !(c.is_alphanumeric() || matches!(c, '/' | '.' | '_' | '-')));
+        let lower = token.to_lowercase();
+        if let Some(idx) = lower.find(&needle) {
+            let boundary_ok = idx == 0 || lower.as_bytes()[idx - 1] == b'/';
+            let tail = &lower[idx + needle.len()..];
+            if boundary_ok && !tail.is_empty() && tail.chars().any(|c| c.is_alphanumeric()) {
+                seen.insert(lower[idx..].to_string());
+                if seen.len() >= SUMMARY_TEXT_MIN_PATHS {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Lowercased names that identify a summary page: every indexed project's directory name,
+/// plus `<root name>-<project name>` for projects that sit directly under a tracked root
+/// (the shape a handoff digest uses for `AI-Activity/Foo` -> `AI-Activity-Foo.md`).
+fn summary_page_stems(conn: &Connection, project_paths: &[String]) -> HashSet<String> {
+    let roots: Vec<PathBuf> = list_tracked_roots_conn(conn).unwrap_or_default();
+    let mut stems: HashSet<String> = HashSet::new();
+    for p in project_paths {
+        let path = Path::new(p);
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        stems.insert(name.to_lowercase());
+        if let Some(parent) = path.parent() {
+            if roots.iter().any(|r| r == parent) {
+                if let Some(root_name) = parent.file_name().and_then(|s| s.to_str()) {
+                    stems.insert(format!("{}-{}", root_name, name).to_lowercase());
+                }
+            }
+        }
+    }
+    stems
+}
+
+/// The other project's name the file's stem spells, when it does (lowercased); `None` for a
+/// file not named after another indexed project (the project's own README-like `<project>.md`
+/// is not a summary of another project).
+fn summary_page_stem(
+    doc_rel_path: &str,
+    project_path: &str,
+    stems: &HashSet<String>,
+) -> Option<String> {
+    let file_name = Path::new(doc_rel_path)
+        .file_name()
+        .and_then(|s| s.to_str())?;
+    let stem = match file_name.rsplit_once('.') {
+        Some((s, ext)) if !s.is_empty() && ext.chars().all(|c| c.is_ascii_alphanumeric()) => s,
+        _ => file_name,
+    }
+    .to_lowercase();
+    if !stems.contains(&stem) {
+        return None;
+    }
+    let own = Path::new(project_path)
+        .file_name()
+        .map(|s| s.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    (stem != own).then_some(stem)
+}
+
+/// Decides, once per document and for the duration of one ranking call, whether a file is a
+/// summary page of another project (see [`SUMMARY_PAGE_FACTOR`]): its stem names another
+/// indexed project *and* there is evidence it is a digest: it lives under a `projects/`,
+/// `summaries/` or `handoff*` directory, or the file's text (every chunk of it, so paths
+/// spread over chunks count) names three or more paths of that project. A `docs/Globex.md`
+/// in a vendor comparison or an `integrations/Acme.md` that merely shares a project's name is
+/// left alone. The text is read from the store only for the rare documents whose stem
+/// matches and whose directory says nothing, once per document whatever the number of its
+/// chunks among the candidates; every chunk of a document gets the same verdict.
+struct SummaryPageJudge {
+    stems: HashSet<String>,
+    verdicts: HashMap<String, bool>,
+}
+
+impl SummaryPageJudge {
+    fn new(conn: &Connection, project_paths: &[String]) -> Self {
+        SummaryPageJudge {
+            stems: summary_page_stems(conn, project_paths),
+            verdicts: HashMap::new(),
+        }
+    }
+
+    fn is_summary_page(
+        &mut self,
+        conn: &Connection,
+        doc_path: &str,
+        doc_rel_path: &str,
+        project_path: &str,
+    ) -> bool {
+        let Some(stem) = summary_page_stem(doc_rel_path, project_path, &self.stems) else {
+            return false;
+        };
+        if let Some(v) = self.verdicts.get(doc_path) {
+            return *v;
+        }
+        let verdict = summary_dir_evidence(doc_rel_path) || {
+            // The stem may carry the root prefix (`ai-activity-foo` for `AI-Activity/Foo`);
+            // paths in the text use the project directory name, so try the bare name too.
+            let bare = self
+                .stems
+                .iter()
+                .filter(|s| stem.ends_with(&format!("-{}", s)) && s.len() < stem.len())
+                .max_by_key(|s| s.len())
+                .cloned();
+            let text = document_text(conn, doc_path);
+            text_references_project(&text, &stem)
+                || bare
+                    .as_deref()
+                    .map(|b| text_references_project(&text, b))
+                    .unwrap_or(false)
+        };
+        self.verdicts.insert(doc_path.to_string(), verdict);
+        verdict
+    }
+}
+
+/// Every chunk text of a document, in chunk order, joined by spaces; empty when unknown.
+fn document_text(conn: &Connection, doc_path: &str) -> String {
+    let Ok(mut stmt) =
+        conn.prepare("SELECT text FROM project_chunks WHERE doc_path = ?1 ORDER BY chunk_index")
+    else {
+        return String::new();
+    };
+    let Ok(rows) = stmt.query_map(params![doc_path], |row| row.get::<_, String>(0)) else {
+        return String::new();
+    };
+    rows.flatten().collect::<Vec<_>>().join(" ")
+}
+
 /// Score multiplier for a file whose role matches what the prompt asks for (records for
 /// "what did they say on the call", state for "current status").
 const ROLE_HINT_BOOST: f64 = 1.06;
@@ -18820,6 +19285,112 @@ struct RelatedChunkResult {
     lexical: f64,
     quality: f64,
     excerpt: String,
+    // The same deterministic fields as every other chunk result (slice 4).
+    doc_mtime: f64,
+    content_date: f64,
+    date_source: &'static str,
+    age_days: f64,
+    freshness_tier: String,
+    is_record: bool,
+    role: &'static str,
+    verify: bool,
+    noise: bool,
+    raw_similarity: Option<f64>,
+    superseded_by: Option<String>,
+    why: String,
+}
+
+/// A related chunk built from a ranked chunk of the same query (or of the source text): the
+/// ranked fields are carried through, the relation fields are added.
+fn related_chunk_from_ranked(
+    row: &RankedChunkResult,
+    relation: String,
+    relation_weight: f64,
+    relation_quality: String,
+    relation_quality_multiplier: f64,
+    score: f64,
+) -> RelatedChunkResult {
+    RelatedChunkResult {
+        chunk_id: row.chunk_id,
+        chunk_index: row.chunk_index,
+        path: row.path.clone(),
+        project_path: row.project_path.clone(),
+        doc_rel_path: row.doc_rel_path.clone(),
+        relation,
+        relation_weight,
+        relation_quality,
+        relation_quality_multiplier,
+        score,
+        semantic: row.semantic,
+        lexical: row.lexical,
+        quality: row.quality,
+        excerpt: row.excerpt.clone(),
+        doc_mtime: row.doc_mtime,
+        content_date: row.content_date,
+        date_source: row.date_source,
+        age_days: row.age_days,
+        freshness_tier: row.freshness_tier.clone(),
+        is_record: row.is_record,
+        role: row.role,
+        verify: row.verify,
+        noise: row.noise,
+        raw_similarity: row.raw_similarity,
+        superseded_by: row.superseded_by.clone(),
+        why: row.why.clone(),
+    }
+}
+
+/// The compact, deterministic account of the signals behind a result's score (slice 4), the
+/// same on every surface (CLI `--json`, API, MCP, the hook block, the dossier):
+/// `semantic:<cosine>` when the vector search found the chunk (`cosine:<c>` when only the
+/// keyword or path search did and the cosine was backfilled), `lexical:<0..1>` when the FTS
+/// matched, `graph:<seed|same_project|related_project>` when the project graph raised it,
+/// `path` when the path matched query words, `recency:<fresh|aging>` when a young date lifted
+/// it, `role` when the prompt's role hint did, `path-penalty` when a scratch or copy directory
+/// lowered it, `noise` when the text is a machine artefact; `superseded` is appended by the
+/// supersession step. Parts are joined with `+`; the string is empty only when no signal fired.
+fn why_string(
+    row: &ChunkSignal,
+    kw: f64,
+    role_boost: bool,
+    fresh: &FreshnessInfo,
+    path_penalty: f64,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    match row.raw_similarity {
+        Some(cos) if row.semantic > 0.0 => parts.push(format!("semantic:{:.2}", cos)),
+        Some(cos) => parts.push(format!("cosine:{:.2}", cos)),
+        None => {}
+    }
+    if row.lexical > 0.0 {
+        parts.push(format!("lexical:{:.2}", row.lexical));
+    }
+    if row.graph > 0.0 && row.relation != "direct" && row.relation != "lexical" {
+        parts.push(format!("graph:{}", row.relation));
+    }
+    if kw >= 0.20 {
+        parts.push("path".to_string());
+    }
+    if matches!(fresh.tier, "fresh" | "aging") && fresh.recency >= 0.5 {
+        parts.push(format!("recency:{}", fresh.tier));
+    }
+    if role_boost {
+        parts.push("role".to_string());
+    }
+    if path_penalty < 1.0 {
+        parts.push("path-penalty".to_string());
+    }
+    if row.noise {
+        parts.push("noise".to_string());
+    }
+    parts.join("+")
+}
+
+fn why_append(why: &mut String, part: &str) {
+    if !why.is_empty() {
+        why.push('+');
+    }
+    why.push_str(part);
 }
 
 fn chunk_search_schema() -> &'static str {
@@ -18862,6 +19433,9 @@ fn ranked_chunk_result_json(item: &RankedChunkResult) -> Value {
         "verify": item.verify,
         "noise": item.noise,
         "raw_similarity": item.raw_similarity,
+        "date_basis": freshness::date_basis(item.date_source),
+        "superseded_by": item.superseded_by,
+        "why": item.why,
     })
 }
 
@@ -18880,11 +19454,16 @@ fn evidence_hit_json(ev: &EvidenceHit) -> Value {
         "excerpt": ev.excerpt,
         "content_date": ev.content_date,
         "date_source": ev.date_source,
+        "date_basis": freshness::date_basis(ev.date_source),
         "age_days": ev.age_days,
         "freshness_tier": ev.freshness_tier,
         "is_record": ev.is_record,
         "role": ev.role,
+        "verify": ev.verify,
+        "noise": ev.noise,
         "raw_similarity": ev.raw_similarity,
+        "superseded_by": Value::Null,
+        "why": ev.why,
     })
 }
 
@@ -18915,6 +19494,8 @@ fn ranked_file_result_json(item: &RankedFileResult) -> Value {
         "noise": item.noise,
         "raw_similarity": item.raw_similarity,
         "superseded_by": item.superseded_by,
+        "date_basis": freshness::date_basis(item.date_source),
+        "why": item.why,
         "evidence": evidence,
     })
 }
@@ -18971,6 +19552,19 @@ fn related_chunk_result_json(item: &RelatedChunkResult) -> Value {
         "lexical": item.lexical,
         "quality": item.quality,
         "excerpt": item.excerpt,
+        "doc_mtime": item.doc_mtime,
+        "content_date": item.content_date,
+        "date_source": item.date_source,
+        "date_basis": freshness::date_basis(item.date_source),
+        "age_days": item.age_days,
+        "freshness_tier": item.freshness_tier,
+        "is_record": item.is_record,
+        "role": item.role,
+        "verify": item.verify,
+        "noise": item.noise,
+        "raw_similarity": item.raw_similarity,
+        "superseded_by": item.superseded_by,
+        "why": item.why,
     })
 }
 
@@ -19272,7 +19866,7 @@ fn print_project_results(results: &[RankedResult]) {
 fn print_file_results(results: &[RankedFileResult]) {
     for (idx, item) in results.iter().enumerate() {
         println!(
-            "{:>2}. {}\n    project={}\n    chunk_id={} chunk_index={}\n    score={:.3} cos={} semantic={:.3} lexical={:.3} graph={:.3} relation={} quality={:.2} role={} date={} age={}d tier={} src={}{}\n    {}",
+            "{:>2}. {}\n    project={}\n    chunk_id={} chunk_index={}\n    score={:.3} cos={} semantic={:.3} lexical={:.3} graph={:.3} relation={} quality={:.2} role={} date={} age={}d tier={} basis={}{}{}\n    why={}\n    {}",
             idx + 1,
             item.path,
             item.project_path,
@@ -19291,11 +19885,13 @@ fn print_file_results(results: &[RankedFileResult]) {
             freshness::format_ymd(item.content_date),
             item.age_days.round() as i64,
             item.freshness_tier,
-            item.date_source,
+            freshness::date_basis(item.date_source),
+            if item.verify { " verify" } else { "" },
             item.superseded_by
                 .as_deref()
                 .map(|s| format!(" superseded_by={}", s))
                 .unwrap_or_default(),
+            item.why,
             item.excerpt
         );
         for ev in item.evidence.iter().take(4) {
@@ -19376,6 +19972,18 @@ fn bedrock_embedding_space_key(model: &str) -> String {
     format!("bedrock:{}", normalized)
 }
 
+/// Key of the query-embedding cache, in memory and on disk: SHA-256 over the model key and
+/// the normalised (trimmed, ASCII-lowercased) query, as hex. The cache never holds the query
+/// text itself; two queries that differ only in case or surrounding whitespace share a key.
+fn query_cache_key(model_key: &str, normalized_query: &str) -> String {
+    use sha2::Digest as _;
+    let mut h = sha2::Sha256::new();
+    h.update(model_key.as_bytes());
+    h.update([0u8]);
+    h.update(normalized_query.as_bytes());
+    h.finalize().iter().map(|b| format!("{:02x}", b)).collect()
+}
+
 fn embed_query_cached(cfg: &ConfigValues, query: &str) -> Result<(String, Vec<f32>), String> {
     let q = query.trim();
     if q.is_empty() {
@@ -19383,7 +19991,7 @@ fn embed_query_cached(cfg: &ConfigValues, query: &str) -> Result<(String, Vec<f3
     }
     let model_key_guess = model_key_for_cfg(cfg);
     let normalized_query = q.to_ascii_lowercase();
-    let cache_key_guess = format!("{}::{}", model_key_guess, normalized_query);
+    let cache_key_guess = query_cache_key(&model_key_guess, &normalized_query);
     let ttl = query_embed_cache_ttl();
     {
         let mut cache = query_embed_cache()
@@ -19404,7 +20012,7 @@ fn embed_query_cached(cfg: &ConfigValues, query: &str) -> Result<(String, Vec<f3
     if let Ok(conn) = open_db_read_only(&db_p) {
         if let Ok(cached_vec) = disk_cache_lookup(&conn, &normalized_query, &model_key_guess) {
             // Found in disk cache — populate in-memory cache and return
-            let cache_key = format!("{}::{}", model_key_guess, normalized_query);
+            let cache_key = cache_key_guess.clone();
             let mut cache = query_embed_cache()
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -19425,7 +20033,7 @@ fn embed_query_cached(cfg: &ConfigValues, query: &str) -> Result<(String, Vec<f3
     let embedder = build_embedder(cfg)?;
     let model_key = embedder.model_key();
     let vector = embedder.embed_query(q)?;
-    let cache_key = format!("{}::{}", model_key, normalized_query);
+    let cache_key = query_cache_key(&model_key, &normalized_query);
     {
         let mut cache = query_embed_cache()
             .lock()
@@ -19442,10 +20050,11 @@ fn embed_query_cached(cfg: &ConfigValues, query: &str) -> Result<(String, Vec<f3
         );
     }
 
-    // Best-effort write to the disk cache on a non-migrating connection: an absent store or
-    // an old table shape is skipped silently, never repaired from here.
+    // Best-effort write to the disk cache on a non-migrating connection with a short busy
+    // timeout: an absent store, an old table shape or a watcher holding the write lock is
+    // skipped silently (a search or the recall hook never waits on the cache write).
     if db_p.is_file() {
-        if let Ok(conn) = open_db_rw(&db_p) {
+        if let Ok(conn) = open_db_side_writer(&db_p) {
             let _ = disk_cache_store(&conn, &normalized_query, &model_key, &vector);
         }
     }
@@ -19453,16 +20062,19 @@ fn embed_query_cached(cfg: &ConfigValues, query: &str) -> Result<(String, Vec<f3
     Ok((model_key, vector))
 }
 
-/// Lookup a query embedding from the persistent SQLite cache.
+/// Lookup a query embedding from the persistent SQLite cache. The row is found by the hash
+/// of (model key, normalised query); a store whose table still has the pre-0.2.1 shape
+/// (`query_normalized` text column) has no such column and simply misses.
 fn disk_cache_lookup(
     conn: &Connection,
     query_normalized: &str,
     model_key: &str,
 ) -> Result<Vec<f32>, String> {
+    let key = query_cache_key(model_key, query_normalized);
     let (blob, cached_at): (Vec<u8>, f64) = conn
         .query_row(
-            "SELECT vector, cached_at FROM query_embed_cache WHERE query_normalized = ?1 AND model_key = ?2",
-            params![query_normalized, model_key],
+            "SELECT vector, cached_at FROM query_embed_cache WHERE query_hash = ?1 AND model_key = ?2",
+            params![key, model_key],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .map_err(|e| format!("disk cache miss: {}", e))?;
@@ -19474,7 +20086,9 @@ fn disk_cache_lookup(
     Ok(blob_to_f32_vec(&blob))
 }
 
-/// Store a query embedding in the persistent SQLite cache.
+/// Store a query embedding in the persistent SQLite cache: the hash key, the model key, the
+/// vector and the time; never the query text. Fails (and is ignored by the caller) on a store
+/// whose table has the old shape; the next writer run recreates the table.
 fn disk_cache_store(
     conn: &Connection,
     query_normalized: &str,
@@ -19482,15 +20096,17 @@ fn disk_cache_store(
     vector: &[f32],
 ) -> Result<(), String> {
     let blob = f32_blob(vector);
+    let key = query_cache_key(model_key, query_normalized);
     conn.execute(
         r#"
-INSERT INTO query_embed_cache(query_normalized, model_key, vector, cached_at)
+INSERT INTO query_embed_cache(query_hash, model_key, vector, cached_at)
 VALUES (?1, ?2, ?3, ?4)
-ON CONFLICT(query_normalized, model_key) DO UPDATE SET
+ON CONFLICT(query_hash) DO UPDATE SET
+    model_key = excluded.model_key,
     vector = excluded.vector,
     cached_at = excluded.cached_at
 "#,
-        params![query_normalized, model_key, blob, now_ts()],
+        params![key, model_key, blob, now_ts()],
     )
     .map_err(|e| format!("failed writing disk cache: {}", e))?;
     Ok(())
@@ -19751,6 +20367,7 @@ pub(crate) fn rank_files_native_with(
     let frecency = frecency_scores(conn)?;
     let project_paths = list_project_paths(conn)?;
     let project_path_keywords = path_keyword_scores(&project_paths, q);
+    let mut summary_judge = SummaryPageJudge::new(conn, &project_paths);
     let role_hint = roles::role_hint(q);
     let show_superseded = opts.include_superseded || roles::history_query(q);
     // The absolute floor is on the raw cosine (an honest number), never on the min-max
@@ -19811,7 +20428,8 @@ pub(crate) fn rank_files_native_with(
         {
             score *= 0.40;
         }
-        score *= path_noise_penalty(&row.doc_rel_path);
+        let path_penalty = path_noise_penalty(&row.doc_rel_path);
+        score *= path_penalty;
         // Freshness (spec §4): blend once per candidate; the file keeps its best chunk.
         let fresh = fx.info_for(row);
         if !fx.within_since(fresh.content_date, opts.since_days) {
@@ -19819,8 +20437,15 @@ pub(crate) fn rank_files_native_with(
         }
         // Role nudge: a prompt about a call or transcript lifts records a little; one about
         // current status lifts state. Small on purpose; relevance still decides.
-        if role_hint == Some(fresh.role) {
+        let role_boost = role_hint == Some(fresh.role);
+        if role_boost {
             score *= ROLE_HINT_BOOST;
+        }
+        let mut why = why_string(row, kw, role_boost, &fresh, path_penalty);
+        if summary_judge.is_summary_page(conn, &row.doc_path, &row.doc_rel_path, &row.project_path)
+        {
+            score *= summary_page_factor();
+            why_append(&mut why, "summary-page");
         }
         let base_score = score;
         score = fx.blend(score, &fresh);
@@ -19850,6 +20475,7 @@ pub(crate) fn rank_files_native_with(
             noise: row.noise,
             raw_similarity: row.raw_similarity,
             superseded_by: None,
+            why,
         };
         // The file keeps its best chunk; an exact tie goes to the earlier chunk so the
         // representative (and its cosine) does not depend on hash-map order.
@@ -20048,6 +20674,7 @@ fn mark_superseded(by_file: &mut HashMap<String, RankedFileResult>, full_strengt
             }
             if let Some(item) = by_file.get_mut(&m) {
                 item.superseded_by = Some(newest.clone());
+                why_append(&mut item.why, "superseded");
                 if !full_strength {
                     item.score *= SUPERSEDED_FACTOR;
                     item.base_score *= SUPERSEDED_FACTOR;
@@ -20189,23 +20816,38 @@ fn rerank_with_ollama(
     results.into_inner().unwrap_or_default()
 }
 
-fn rank_chunks_native(
-    conn: &Connection,
-    cfg: &ConfigValues,
-    query: &str,
-    limit: usize,
-) -> Result<Vec<RankedChunkResult>, String> {
-    rank_chunks_native_with(conn, cfg, query, limit, None)
-}
-
 /// Chunk ranking with an optional `since_days` hard filter on content date. The recency blend
-/// (spec §4) is applied exactly once, after the cross-encoder reranker blend.
+/// (spec §4) is applied exactly once, after the cross-encoder reranker blend. HyDE and the
+/// reranker run as configured.
 fn rank_chunks_native_with(
     conn: &Connection,
     cfg: &ConfigValues,
     query: &str,
     limit: usize,
     since_days: Option<f64>,
+) -> Result<Vec<RankedChunkResult>, String> {
+    rank_chunks_native_opts(
+        conn,
+        cfg,
+        query,
+        limit,
+        since_days,
+        cfg.hyde_enabled,
+        cfg.reranker_enabled,
+    )
+}
+
+/// [`rank_chunks_native_with`] with HyDE and the reranker switchable per call: the related
+/// pass of `get_related_chunks` runs with both off (its query is a chunk's own text, and it
+/// must stay cheap), the query pass keeps the configured behaviour.
+fn rank_chunks_native_opts(
+    conn: &Connection,
+    cfg: &ConfigValues,
+    query: &str,
+    limit: usize,
+    since_days: Option<f64>,
+    use_hyde: bool,
+    use_reranker: bool,
 ) -> Result<Vec<RankedChunkResult>, String> {
     ensure_reembed_ready(conn, cfg, "search")?;
     let q = query.trim();
@@ -20283,7 +20925,7 @@ fn rank_chunks_native_with(
 
     // HyDE: for natural language queries, generate a hypothetical code snippet,
     // embed it, run a second vector search, and merge new results into fused.
-    if cfg.hyde_enabled && query_type == QueryType::NaturalLanguage {
+    if use_hyde && query_type == QueryType::NaturalLanguage {
         if let Some(hyde_text) = generate_hyde_snippet(cfg, q) {
             if let Ok((_hyde_model, hyde_vector)) = embed_query_cached(cfg, &hyde_text) {
                 // Run vector-only search with the hypothetical embedding
@@ -20336,6 +20978,7 @@ fn rank_chunks_native_with(
 
     let frecency = frecency_scores(conn)?;
     let fx = FreshnessCtx::new(cfg);
+    let mut summary_judge = SummaryPageJudge::new(conn, &list_project_paths(conn)?);
     // The same raw-cosine floor as the files view (`search_min_abs_score`, 0 = off), failing
     // closed on a missing or NaN cosine.
     let raw_floor = cfg.search_min_abs_score;
@@ -20385,7 +21028,14 @@ fn rank_chunks_native_with(
             }
         };
         // Same path hygiene as file ranking (scratch, state and copy directories).
-        score *= path_noise_penalty(&row.doc_rel_path);
+        let path_penalty = path_noise_penalty(&row.doc_rel_path);
+        score *= path_penalty;
+        let mut why = why_string(row, kw, false, &fresh, path_penalty);
+        if summary_judge.is_summary_page(conn, &row.doc_path, &row.doc_rel_path, &row.project_path)
+        {
+            score *= summary_page_factor();
+            why_append(&mut why, "summary-page");
+        }
         out.push(RankedChunkResult {
             chunk_id: row.chunk_id,
             chunk_index: row.chunk_index,
@@ -20409,6 +21059,8 @@ fn rank_chunks_native_with(
             verify: fresh.verify,
             noise: row.noise,
             raw_similarity: row.raw_similarity,
+            superseded_by: None,
+            why,
         });
     }
     out.sort_by(|a, b| {
@@ -20419,7 +21071,7 @@ fn rank_chunks_native_with(
 
     // Cross-encoder re-ranking: take top pool_size candidates, score with LLM,
     // blend re-rank score with original score, then re-sort.
-    if cfg.reranker_enabled && !out.is_empty() {
+    if use_reranker && !out.is_empty() {
         let pool = out.len().min(cfg.reranker_pool_size);
         let candidates: Vec<(i64, String)> = out[..pool]
             .iter()
@@ -20453,7 +21105,65 @@ fn rank_chunks_native_with(
     });
 
     out.truncate(limit.max(1));
+    mark_superseded_chunks(&mut out, fx.now);
     Ok(out)
+}
+
+/// Supersession as a label on chunk results (slice 4): among the distinct `state` files of
+/// one series (project, parent directory, normalised stem) present in the result set, the
+/// newest by revision date (the date in the relative path, else the last edit: the same rule
+/// as [`mark_superseded`]) is the head; chunks of the other files carry `superseded_by = head`.
+/// Chunk search never downranks or collapses on it (an older handoff's paragraph may be the
+/// exact answer); the label lets the agent prefer the head.
+fn mark_superseded_chunks(out: &mut [RankedChunkResult], now: f64) {
+    // Per `state` file in the result set: series key, revision date, best chunk score.
+    let mut files: HashMap<String, (String, f64, f64)> = HashMap::new();
+    for item in out.iter() {
+        if item.role != Role::State.as_str() {
+            continue;
+        }
+        let e = files.entry(item.path.clone()).or_insert_with(|| {
+            (
+                roles::series_key(&item.project_path, &item.doc_rel_path),
+                freshness::revision_date(&item.doc_rel_path, item.doc_mtime, now),
+                f64::NEG_INFINITY,
+            )
+        });
+        if item.score > e.2 {
+            e.2 = item.score;
+        }
+    }
+    // Head per series: the newest revision, then the higher score, then the lexicographically
+    // later path, the same order as `mark_superseded`.
+    let mut heads: HashMap<String, (String, f64, f64)> = HashMap::new();
+    for (path, (key, revision, score)) in files.iter() {
+        let e = heads
+            .entry(key.clone())
+            .or_insert_with(|| (path.clone(), *revision, *score));
+        let better = revision
+            .total_cmp(&e.1)
+            .then_with(|| score.total_cmp(&e.2))
+            .then_with(|| path.cmp(&e.0))
+            == std::cmp::Ordering::Greater;
+        if better {
+            *e = (path.clone(), *revision, *score);
+        }
+    }
+    if heads.is_empty() {
+        return;
+    }
+    for item in out.iter_mut() {
+        if item.role != Role::State.as_str() {
+            continue;
+        }
+        let key = roles::series_key(&item.project_path, &item.doc_rel_path);
+        if let Some((head, _, _)) = heads.get(&key) {
+            if *head != item.path {
+                item.superseded_by = Some(head.clone());
+                why_append(&mut item.why, "superseded");
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -20802,6 +21512,7 @@ mod chunk_contract_tests {
         assert!(cfg.recall_excerpts);
         assert!(!cfg.recall_system_message);
         assert_eq!(cfg.recall_semantic, "auto");
+        assert_eq!(cfg.recall_dossier, "shadow");
         assert_eq!(cfg.recall_session_ttl_days, 3.0);
     }
 
@@ -20991,6 +21702,7 @@ mod chunk_contract_tests {
             "recall_excerpts",
             "recall_system_message",
             "recall_semantic",
+            "recall_dossier",
             "recall_session_ttl_days",
             "hyde_enabled",
             "reranker_enabled",
@@ -21019,6 +21731,9 @@ mod chunk_contract_tests {
         config_set_value(&mut cfg, "recall_semantic", "OFF").unwrap();
         assert_eq!(cfg.recall_semantic, "off");
         assert!(config_set_value(&mut cfg, "recall_semantic", "maybe").is_err());
+        config_set_value(&mut cfg, "recall_dossier", "AUTO").unwrap();
+        assert_eq!(cfg.recall_dossier, "auto");
+        assert!(config_set_value(&mut cfg, "recall_dossier", "sometimes").is_err());
         config_set_value(&mut cfg, "recall_excerpts", "false").unwrap();
         assert!(!cfg.recall_excerpts);
         assert!(config_set_value(&mut cfg, "recall_excerpts", "maybe").is_err());
@@ -21039,6 +21754,7 @@ mod chunk_contract_tests {
         let back = ConfigValues::from_map(load_config_values(&path));
         assert_eq!(back.skip_dir_names, "demo-data,tmp,marketplaces");
         assert_eq!(back.recall_semantic, "off");
+        assert_eq!(back.recall_dossier, "auto");
         assert!(!back.recall_excerpts);
         assert_eq!(back.rank_recency_weight, 0.5);
         assert!(!back.reranker_enabled);
@@ -21156,6 +21872,109 @@ mod chunk_contract_tests {
         assert_eq!(context_pack_schema(), "context-pack-v1");
     }
 
+    fn state_chunk(path: &str, rel: &str, mtime: f64, score: f64) -> RankedChunkResult {
+        RankedChunkResult {
+            chunk_id: 1,
+            chunk_index: 0,
+            path: path.to_string(),
+            project_path: "/r/p".to_string(),
+            doc_rel_path: rel.to_string(),
+            score,
+            semantic: score,
+            lexical: 0.0,
+            graph: 0.0,
+            relation: "direct".to_string(),
+            quality: 1.0,
+            excerpt: String::new(),
+            doc_mtime: mtime,
+            content_date: mtime,
+            date_source: "mtime",
+            age_days: 1.0,
+            freshness_tier: "fresh".to_string(),
+            is_record: false,
+            role: "state",
+            verify: false,
+            noise: false,
+            raw_similarity: Some(score),
+            superseded_by: None,
+            why: String::new(),
+        }
+    }
+
+    /// Chunk results label the series head by the same rule as file search
+    /// (`mark_superseded`): the newest revision date (a date in the path beats a fresh mtime),
+    /// then the higher score of the file's best chunk, then the lexicographically later path.
+    #[test]
+    fn chunk_supersession_head_follows_the_file_rule() {
+        let now = 1_800_000_000.0;
+        let day = 86_400.0;
+        // A June handoff edited today (newer mtime) stays behind September's (path date).
+        let mut out = vec![
+            state_chunk(
+                "/r/p/docs/sessions/HANDOFF-2026-06-10.md",
+                "docs/sessions/HANDOFF-2026-06-10.md",
+                now,
+                0.9,
+            ),
+            state_chunk(
+                "/r/p/docs/sessions/HANDOFF-2026-09-01.md",
+                "docs/sessions/HANDOFF-2026-09-01.md",
+                now - 20.0 * day,
+                0.5,
+            ),
+        ];
+        mark_superseded_chunks(&mut out, now);
+        assert_eq!(
+            out[0].superseded_by.as_deref(),
+            Some("/r/p/docs/sessions/HANDOFF-2026-09-01.md")
+        );
+        assert!(out[0].why.contains("superseded"));
+        assert!(out[1].superseded_by.is_none());
+        // Undated names with one mtime: the file whose best chunk scores higher is the head,
+        // whatever the chunk order.
+        let mut out = vec![
+            state_chunk(
+                "/r/p/notes/HANDOFF-final.md",
+                "notes/HANDOFF-final.md",
+                now,
+                0.4,
+            ),
+            state_chunk(
+                "/r/p/notes/HANDOFF-draft.md",
+                "notes/HANDOFF-draft.md",
+                now,
+                0.7,
+            ),
+            state_chunk(
+                "/r/p/notes/HANDOFF-final.md",
+                "notes/HANDOFF-final.md",
+                now,
+                0.6,
+            ),
+        ];
+        mark_superseded_chunks(&mut out, now);
+        assert!(out[1].superseded_by.is_none());
+        assert_eq!(
+            out[0].superseded_by.as_deref(),
+            Some("/r/p/notes/HANDOFF-draft.md")
+        );
+        assert_eq!(
+            out[2].superseded_by.as_deref(),
+            Some("/r/p/notes/HANDOFF-draft.md")
+        );
+        // Same revision date and score: the lexicographically later path is the head.
+        let mut out = vec![
+            state_chunk("/r/p/notes/HANDOFF-v2.md", "notes/HANDOFF-v2.md", now, 0.5),
+            state_chunk("/r/p/notes/HANDOFF-v3.md", "notes/HANDOFF-v3.md", now, 0.5),
+        ];
+        mark_superseded_chunks(&mut out, now);
+        assert_eq!(
+            out[0].superseded_by.as_deref(),
+            Some("/r/p/notes/HANDOFF-v3.md")
+        );
+        assert!(out[1].superseded_by.is_none());
+    }
+
     #[test]
     fn ranked_chunk_json_contract_fields() {
         let item = RankedChunkResult {
@@ -21181,10 +22000,12 @@ mod chunk_contract_tests {
             verify: false,
             noise: false,
             raw_similarity: Some(0.41),
+            superseded_by: None,
+            why: "semantic:0.41+lexical:0.70".to_string(),
         };
         let json = ranked_chunk_result_json(&item);
         let obj = json.as_object().expect("expected object");
-        assert_eq!(obj.len(), 22);
+        assert_eq!(obj.len(), 25);
         for key in [
             "chunk_id",
             "chunk_index",
@@ -21208,11 +22029,17 @@ mod chunk_contract_tests {
             "verify",
             "noise",
             "raw_similarity",
+            "date_basis",
+            "superseded_by",
+            "why",
         ] {
             assert!(obj.contains_key(key), "missing key: {}", key);
         }
         assert_eq!(obj["role"], "knowledge");
         assert_eq!(obj["raw_similarity"], 0.41);
+        assert_eq!(obj["date_basis"], "mtime");
+        assert_eq!(obj["why"], "semantic:0.41+lexical:0.70");
+        assert!(obj["superseded_by"].is_null());
     }
 
     #[test]
@@ -21232,10 +22059,39 @@ mod chunk_contract_tests {
             lexical: 0.66,
             quality: 0.95,
             excerpt: "world".to_string(),
+            doc_mtime: 1_700_000_000.0,
+            content_date: 1_700_000_000.0,
+            date_source: "path-date",
+            age_days: 40.0,
+            freshness_tier: "verify".to_string(),
+            is_record: false,
+            role: "state",
+            verify: true,
+            noise: false,
+            raw_similarity: Some(0.52),
+            superseded_by: Some("/tmp/b2.md".to_string()),
+            why: "semantic:0.52+superseded".to_string(),
         };
         let json = related_chunk_result_json(&item);
         let obj = json.as_object().expect("expected object");
-        assert_eq!(obj.len(), 14);
+        assert_eq!(obj.len(), 27);
+        for key in [
+            "content_date",
+            "date_source",
+            "date_basis",
+            "age_days",
+            "freshness_tier",
+            "role",
+            "verify",
+            "noise",
+            "raw_similarity",
+            "superseded_by",
+            "why",
+        ] {
+            assert!(obj.contains_key(key), "missing key: {}", key);
+        }
+        assert_eq!(obj["date_basis"], "path");
+        assert_eq!(obj["superseded_by"], "/tmp/b2.md");
         for key in [
             "chunk_id",
             "chunk_index",
@@ -21374,6 +22230,8 @@ VALUES (1, '/tmp/p/b.md', 'b.md', 0, 1, 10, 'h2', 'beta', 0);
         assert!(names.contains("read_chunk"));
         assert!(names.contains("read_document"));
         assert!(names.contains("pack_context"));
+        assert!(names.contains("topic_dossier"));
+        assert!(!mcp_tool_needs_rw("topic_dossier"), "the dossier is a read");
     }
 
     #[test]
@@ -21761,7 +22619,7 @@ fn truncate_text_chars(text: &str, max_chars: usize) -> (String, bool, usize) {
     (clipped, true, total_chars)
 }
 
-fn project_neighbor_weights(
+pub(crate) fn project_neighbor_weights(
     conn: &Connection,
     path: &str,
     limit: usize,
@@ -21868,26 +22726,75 @@ fn related_chunks_native(
         .ok_or_else(|| format!("chunk {} was not found", chunk_id))?;
     let query_text: String = source.text.chars().take(2400).collect();
     let candidate_limit = std::cmp::max(40, limit.max(1) * 8).min(400);
-    let ranked = rank_chunks_native(conn, cfg, &query_text, candidate_limit)?;
+    // One plain ranker pass over the source text: no HyDE, no reranker (slice 4). The
+    // source text is already the best possible query for "chunks like this one".
+    let ranked =
+        rank_chunks_native_opts(conn, cfg, &query_text, candidate_limit, None, false, false)?;
     let neighbor_weights = project_neighbor_weights(conn, &source.project_path, 120)?;
-    let suppressed = suppressed_relation_set(conn, source.chunk_id)?;
-    let quality_feedback = active_relation_quality_map(conn, source.chunk_id)?;
+    let out = related_from_ranked(
+        conn,
+        cfg,
+        source.chunk_id,
+        &source.doc_path,
+        &source.project_path,
+        &ranked,
+        &neighbor_weights,
+        &HashSet::new(),
+        limit,
+    )?;
+    Ok((source, out))
+}
 
-    let mut out: Vec<RelatedChunkResult> = Vec::new();
-    for row in ranked {
-        if row.chunk_id == source.chunk_id {
-            continue;
-        }
-        let (relation, relation_weight) = if row.path == source.doc_path {
-            ("same_file".to_string(), 1.0)
-        } else if row.project_path == source.project_path {
-            ("same_project".to_string(), 0.82)
-        } else if let Some(weight) = neighbor_weights.get(&row.project_path) {
+/// Relation of a candidate chunk to a source (file, project or project edge) and its weight;
+/// `None` when the two are unrelated.
+fn chunk_relation(
+    source_doc_path: &str,
+    source_project_path: &str,
+    row: &RankedChunkResult,
+    neighbor_weights: &HashMap<String, f64>,
+) -> Option<(String, f64)> {
+    if row.path == source_doc_path {
+        Some(("same_file".to_string(), 1.0))
+    } else if row.project_path == source_project_path {
+        Some(("same_project".to_string(), 0.82))
+    } else {
+        neighbor_weights.get(&row.project_path).map(|weight| {
             (
                 "project_edge".to_string(),
                 (0.55 + (0.45 * *weight)).clamp(0.0, 1.0),
             )
-        } else {
+        })
+    }
+}
+
+/// Related chunks for one source chosen from an already ranked candidate set: the relation
+/// weight blends with the candidate's own score, suppressed relations are dropped, quality
+/// feedback multiplies, `exclude` (chunks already placed elsewhere) are skipped. No retrieval
+/// happens here; the caller decides where the candidates come from.
+fn related_from_ranked(
+    conn: &Connection,
+    cfg: &ConfigValues,
+    source_chunk_id: i64,
+    source_doc_path: &str,
+    source_project_path: &str,
+    ranked: &[RankedChunkResult],
+    neighbor_weights: &HashMap<String, f64>,
+    exclude: &HashSet<i64>,
+    limit: usize,
+) -> Result<Vec<RelatedChunkResult>, String> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let suppressed = suppressed_relation_set(conn, source_chunk_id)?;
+    let quality_feedback = active_relation_quality_map(conn, source_chunk_id)?;
+    let mut out: Vec<RelatedChunkResult> = Vec::new();
+    for row in ranked {
+        if row.chunk_id == source_chunk_id || exclude.contains(&row.chunk_id) {
+            continue;
+        }
+        let Some((relation, relation_weight)) =
+            chunk_relation(source_doc_path, source_project_path, row, neighbor_weights)
+        else {
             continue;
         };
         if suppressed.contains(&(row.chunk_id, relation.clone())) {
@@ -21899,25 +22806,14 @@ fn related_chunks_native(
             .unwrap_or_else(|| "unspecified".to_string());
         let relation_quality_weight = relation_quality_multiplier(cfg, &relation_quality);
         let score = ((0.72 * row.score) + (0.28 * relation_weight)) * relation_quality_weight;
-        out.push(RelatedChunkResult {
-            chunk_id: row.chunk_id,
-            chunk_index: row.chunk_index,
-            path: row.path,
-            project_path: row.project_path,
-            doc_rel_path: row.doc_rel_path,
+        out.push(related_chunk_from_ranked(
+            row,
             relation,
             relation_weight,
             relation_quality,
-            relation_quality_multiplier: relation_quality_weight,
+            relation_quality_weight,
             score,
-            semantic: row.semantic,
-            lexical: row.lexical,
-            quality: row.quality,
-            excerpt: row.excerpt,
-        });
-    }
-    if out.is_empty() {
-        return Ok((source, Vec::new()));
+        ));
     }
     out.sort_by(|a, b| {
         b.score
@@ -21925,7 +22821,7 @@ fn related_chunks_native(
             .then_with(|| a.chunk_id.cmp(&b.chunk_id))
     });
     out.truncate(limit.max(1));
-    Ok((source, out))
+    Ok(out)
 }
 
 fn context_pack_schema() -> &'static str {
@@ -21956,7 +22852,13 @@ fn build_context_pack_native(
     const MAX_CHUNKS_PER_FILE: usize = 3;
     const MAX_CHUNKS_PER_PROJECT: usize = 8;
 
-    let seeds = rank_chunks_native(conn, cfg, q, opts.seed_limit.max(1).min(80))?;
+    // One ranker pass for the whole pack (slice 4): the pool serves both the seeds and the
+    // related chunks of every seed. Before, every seed re-ran the full ranker (an embedding
+    // call for the seed's text, HyDE, the reranker) for its related chunks.
+    let seed_limit = opts.seed_limit.max(1).min(80);
+    let pool_size = (seed_limit * (2 + opts.related_per_seed.max(1))).clamp(24, 160);
+    let pool = rank_chunks_native_with(conn, cfg, q, pool_size, None)?;
+    let seeds = &pool;
     let mut used_chars = 0usize;
     let mut included_chunk_ids: HashSet<i64> = HashSet::new();
     let mut included_token_sets: Vec<HashSet<String>> = Vec::new();
@@ -21972,7 +22874,7 @@ fn build_context_pack_native(
     }
     let mut staged: Vec<StagedChunk> = Vec::new();
 
-    for seed in seeds.iter().take(opts.seed_limit.max(1) * 2) {
+    for seed in seeds.iter().take(seed_limit * 2) {
         if used_chars >= opts.budget_chars {
             break;
         }
@@ -22021,23 +22923,44 @@ fn build_context_pack_native(
         used_chars = used_chars.saturating_add(text_chars);
         docs_for_pack.insert(chunk.doc_path.clone());
 
-        let mut related_rows: Vec<Value> = Vec::new();
-        if opts.related_per_seed > 0 {
-            let (_, related) =
-                related_chunks_native(conn, cfg, chunk.chunk_id, opts.related_per_seed)?;
-            for rel in related.into_iter().take(opts.related_per_seed) {
-                related_rows.push(related_chunk_result_json(&rel));
-            }
-        }
-
         staged.push(StagedChunk {
             seed: seed.clone(),
             chunk,
-            related: related_rows,
+            related: Vec::new(),
         });
 
-        if staged.len() >= opts.seed_limit.max(1) {
+        if staged.len() >= seed_limit {
             break;
+        }
+    }
+
+    // Related chunks per seed, from the same pool: the staged seeds are excluded, a chunk is
+    // related to one seed at most, project-edge weights are looked up once per project.
+    if opts.related_per_seed > 0 {
+        let mut taken: HashSet<i64> = staged.iter().map(|s| s.chunk.chunk_id).collect();
+        let mut neighbor_cache: HashMap<String, HashMap<String, f64>> = HashMap::new();
+        for entry in staged.iter_mut() {
+            let project = entry.chunk.project_path.clone();
+            if !neighbor_cache.contains_key(&project) {
+                let weights = project_neighbor_weights(conn, &project, 120)?;
+                neighbor_cache.insert(project.clone(), weights);
+            }
+            let weights = &neighbor_cache[&project];
+            let related = related_from_ranked(
+                conn,
+                cfg,
+                entry.chunk.chunk_id,
+                &entry.chunk.doc_path,
+                &project,
+                &pool,
+                weights,
+                &taken,
+                opts.related_per_seed,
+            )?;
+            for rel in &related {
+                taken.insert(rel.chunk_id);
+            }
+            entry.related = related.iter().map(related_chunk_result_json).collect();
         }
     }
 
@@ -22085,9 +23008,16 @@ fn build_context_pack_native(
             "doc_mtime": entry.seed.doc_mtime,
             "content_date": entry.seed.content_date,
             "date_source": entry.seed.date_source,
+            "date_basis": freshness::date_basis(entry.seed.date_source),
             "age_days": entry.seed.age_days,
             "freshness_tier": entry.seed.freshness_tier,
             "is_record": entry.seed.is_record,
+            "role": entry.seed.role,
+            "verify": entry.seed.verify,
+            "noise": entry.seed.noise,
+            "raw_similarity": entry.seed.raw_similarity,
+            "superseded_by": entry.seed.superseded_by,
+            "why": entry.seed.why,
             "text_chars": text_chars,
             "returned_chars": returned_chars,
             "truncated": truncated,
@@ -22303,6 +23233,11 @@ pub(crate) fn lexical_file_candidates(
                 noise: row.noise,
                 raw_similarity: None,
                 superseded_by: None,
+                why: format!(
+                    "lexical:{:.2}{}",
+                    row.lexical,
+                    if row.noise { "+noise" } else { "" }
+                ),
             },
         );
     }
@@ -22885,8 +23820,11 @@ fn evidence_hit_from_chunk(row: &ChunkSignal, score: f64, fx: &FreshnessCtx) -> 
         freshness_tier: fresh.tier.to_string(),
         is_record: fresh.is_record,
         role: fresh.role.as_str(),
+        verify: fresh.verify,
+        noise: row.noise,
         raw_similarity: row.raw_similarity,
         recency: fresh.recency,
+        why: why_string(row, 0.0, false, &fresh, 1.0),
     }
 }
 
@@ -24422,6 +25360,10 @@ struct ConfigValues {
     recall_excerpts: bool,
     recall_system_message: bool,
     recall_semantic: String,
+    /// Automatic topic dossier in the hook (slice 4): `shadow` (default; the gate decision is
+    /// logged, leads are shown), `auto` (a compact dossier replaces the leads when the gate
+    /// fires) or `off`.
+    recall_dossier: String,
     recall_session_ttl_days: f64,
 }
 
@@ -24592,7 +25534,7 @@ impl ConfigValues {
         let lance_version_grace_secs = map
             .get("lance_version_grace_secs")
             .and_then(|v| v.parse::<i64>().ok())
-            .unwrap_or(120)
+            .unwrap_or(900)
             .clamp(0, 86_400);
         // Candidate counts are clamped at load so a hand-edited config cannot make one query
         // read an unbounded number of vector blobs (the bounds are documented in the README
@@ -24821,6 +25763,13 @@ impl ConfigValues {
         if !matches!(recall_semantic.as_str(), "auto" | "on" | "off") {
             recall_semantic = "auto".to_string();
         }
+        let mut recall_dossier = map
+            .get("recall_dossier")
+            .map(|v| v.trim().to_lowercase())
+            .unwrap_or_else(|| "shadow".to_string());
+        if !matches!(recall_dossier.as_str(), "shadow" | "auto" | "off") {
+            recall_dossier = "shadow".to_string();
+        }
         let recall_session_ttl_days = map
             .get("recall_session_ttl_days")
             .and_then(|v| v.parse::<f64>().ok())
@@ -24896,6 +25845,7 @@ impl ConfigValues {
             recall_excerpts,
             recall_system_message,
             recall_semantic,
+            recall_dossier,
             recall_session_ttl_days,
         }
     }
@@ -25092,6 +26042,7 @@ fn write_config_file(path: &Path, cfg: &ConfigValues) -> Result<(), String> {
             "recall_semantic = \"{}\"",
             toml_escape(&cfg.recall_semantic)
         ),
+        format!("recall_dossier = \"{}\"", toml_escape(&cfg.recall_dossier)),
         format!(
             "recall_session_ttl_days = {:.6}",
             cfg.recall_session_ttl_days
@@ -25385,41 +26336,67 @@ fn mark_reembed_required_if_model_changed(
     Ok(Some(reason))
 }
 
+/// Why a re-embed is needed before searching, or `None`. Pure over `app_state`: the stored
+/// flag and reason, plus a model key that differs from the one the store was embedded with,
+/// are combined here without writing anything, so read-only connections (search, the MCP
+/// status resource, the dossier, `doctor`) can ask. Writers normalise the stored state with
+/// [`persist_reembed_requirement`].
 fn reembed_requirement_reason(
     conn: &Connection,
     cfg: &ConfigValues,
 ) -> Result<Option<String>, String> {
+    Ok(reembed_requirement(conn, cfg)?.map(|(reason, _)| reason))
+}
+
+/// [`reembed_requirement_reason`] plus whether the stored state differs from the computed one
+/// (a writer should persist it).
+fn reembed_requirement(
+    conn: &Connection,
+    cfg: &ConfigValues,
+) -> Result<Option<(String, bool)>, String> {
     let current_model_key = model_key_for_cfg(cfg);
-    let mut required = app_state_bool(conn, APP_STATE_REEMBED_REQUIRED)?;
+    let stored_required = app_state_bool(conn, APP_STATE_REEMBED_REQUIRED)?;
     let last_model_key = app_state_get(conn, APP_STATE_ACTIVE_MODEL_KEY)?.unwrap_or_default();
-    let mut reason = app_state_get(conn, APP_STATE_REEMBED_REASON)?
+    let last_model_key = last_model_key.trim();
+    let stored_reason = app_state_get(conn, APP_STATE_REEMBED_REASON)?
         .unwrap_or_default()
         .trim()
         .to_string();
-
-    if !required && !last_model_key.trim().is_empty() && last_model_key.trim() != current_model_key
-    {
-        required = true;
-        reason = model_change_reembed_reason(last_model_key.trim(), &current_model_key);
-        app_state_set(conn, APP_STATE_REEMBED_REQUIRED, "1")?;
-        app_state_set(conn, APP_STATE_REEMBED_REASON, &reason)?;
-    }
-    if !required {
+    let model_changed = !last_model_key.is_empty() && last_model_key != current_model_key;
+    if !stored_required && !model_changed {
         return Ok(None);
     }
-    if reason.is_empty() {
-        reason = if !last_model_key.trim().is_empty() && last_model_key.trim() != current_model_key
-        {
-            model_change_reembed_reason(last_model_key.trim(), &current_model_key)
-        } else {
-            format!(
-                "embedding model migration required for '{}'; run `retrivio reembed` before searching.",
-                current_model_key
-            )
-        };
-        app_state_set(conn, APP_STATE_REEMBED_REASON, &reason)?;
+    let reason = if !stored_reason.is_empty() && stored_required {
+        stored_reason.clone()
+    } else if model_changed {
+        model_change_reembed_reason(last_model_key, &current_model_key)
+    } else {
+        format!(
+            "embedding model migration required for '{}'; run `retrivio reembed` before searching.",
+            current_model_key
+        )
+    };
+    let stale = !stored_required || stored_reason != reason;
+    Ok(Some((reason, stale)))
+}
+
+/// Writer-side companion of [`reembed_requirement_reason`]: stores the flag and the reason
+/// when the computed requirement differs from what `app_state` holds (a model change seen for
+/// the first time, or a flag without a reason). Only commands holding the writer lock call it.
+fn persist_reembed_requirement(
+    conn: &Connection,
+    cfg: &ConfigValues,
+) -> Result<Option<String>, String> {
+    match reembed_requirement(conn, cfg)? {
+        Some((reason, stale)) => {
+            if stale {
+                app_state_set(conn, APP_STATE_REEMBED_REQUIRED, "1")?;
+                app_state_set(conn, APP_STATE_REEMBED_REASON, &reason)?;
+            }
+            Ok(Some(reason))
+        }
+        None => Ok(None),
     }
-    Ok(Some(reason))
 }
 
 fn ensure_reembed_ready(
@@ -25487,6 +26464,21 @@ fn open_db_rw(db_path: &Path) -> Result<Connection, String> {
 fn open_db_writer(db_path: &Path, _writer: &WriterLock) -> Result<Connection, String> {
     let conn = open_db_rw_raw(db_path)?;
     init_schema(&conn)?;
+    Ok(conn)
+}
+
+/// Read-write connection for best-effort side writes from read paths (the query-embedding
+/// cache): waits at most 100 ms on a busy database instead of [`DB_BUSY_TIMEOUT`], so a
+/// watcher transaction never stalls `search`, the MCP tools or the recall hook. Never
+/// creates or migrates a store.
+fn open_db_side_writer(db_path: &Path) -> Result<Connection, String> {
+    let conn = Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| format!("failed opening database: {}", e))?;
+    conn.busy_timeout(Duration::from_millis(100))
+        .map_err(|e| format!("failed setting db busy timeout: {}", e))?;
     Ok(conn)
 }
 
@@ -25822,6 +26814,166 @@ VALUES (10, 'bedrock:amazon.titan-embed-text-v2:0', 1, 1.0, x'00000000');
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// The query-embedding cache holds hashes and vectors, never query text; a store with the
+    /// pre-0.2.1 table (text key) misses on read, refuses the side write, and is recreated by
+    /// the next writer.
+    #[test]
+    fn query_cache_keys_on_a_hash_and_the_old_table_shape_is_a_miss_until_a_writer_recreates_it() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tmp")
+            .join(format!("query-cache-{}", process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let db = dir.join("retrivio.db");
+        let rw = open_db_rw(&db).expect("fresh store");
+        assert!(table_has_column(&rw, "query_embed_cache", "query_hash").unwrap());
+        assert!(!table_has_column(&rw, "query_embed_cache", "query_normalized").unwrap());
+
+        // Put the old shape back, with a row holding query text, as a 0.2.0 store would.
+        rw.execute_batch(
+            r#"
+DROP TABLE query_embed_cache;
+CREATE TABLE query_embed_cache (
+    query_normalized TEXT NOT NULL,
+    model_key TEXT NOT NULL,
+    vector BLOB NOT NULL,
+    cached_at REAL NOT NULL,
+    PRIMARY KEY(query_normalized, model_key)
+);
+INSERT INTO query_embed_cache VALUES ('what did acme say', 'm', x'0000803f', 1.0);
+"#,
+        )
+        .unwrap();
+        let ro = open_db_read_only(&db).expect("read-only");
+        // Read paths tolerate the old shape as a miss; the side writer's store fails and is
+        // ignored by its caller.
+        assert!(disk_cache_lookup(&ro, "what did acme say", "m").is_err());
+        let side = open_db_side_writer(&db).expect("side writer");
+        assert!(disk_cache_store(&side, "what did acme say", "m", &[1.0]).is_err());
+        drop(side);
+
+        // A writer recreates the table in the new shape; the old rows (query text) are gone.
+        init_schema(&rw).expect("writer schema pass");
+        assert!(table_has_column(&rw, "query_embed_cache", "query_hash").unwrap());
+        assert!(!table_has_column(&rw, "query_embed_cache", "query_normalized").unwrap());
+        let rows: i64 = rw
+            .query_row("SELECT COUNT(*) FROM query_embed_cache", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0);
+
+        // Store and look up through the hash: case and whitespace are normalised by the
+        // caller, the key is the same for both spellings, and no column carries the text.
+        let side = open_db_side_writer(&db).expect("side writer");
+        disk_cache_store(&side, "what did acme say", "m", &[1.0, 2.0]).unwrap();
+        assert_eq!(
+            disk_cache_lookup(&ro, "what did acme say", "m").unwrap(),
+            vec![1.0, 2.0]
+        );
+        assert!(disk_cache_lookup(&ro, "what did acme say", "other-model").is_err());
+        assert_eq!(
+            query_cache_key("m", "what did acme say"),
+            query_cache_key("m", &"  What did ACME say ".trim().to_ascii_lowercase())
+        );
+        assert_ne!(
+            query_cache_key("m", "what did acme say"),
+            query_cache_key("m2", "what did acme say")
+        );
+        let dump: String = {
+            let mut stmt = rw
+                .prepare("SELECT query_hash, model_key, cached_at FROM query_embed_cache")
+                .unwrap();
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok(format!(
+                        "{} {} {}",
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, f64>(2)?
+                    ))
+                })
+                .unwrap();
+            rows.map(|r| r.unwrap()).collect::<Vec<_>>().join("\n")
+        };
+        assert!(!dump.contains("acme"), "{}", dump);
+        assert!(dump.starts_with(&query_cache_key("m", "what did acme say")));
+        drop(ro);
+        drop(side);
+        drop(rw);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Readers may ask whether a re-embed is due without writing: a model key that differs
+    /// from the stored one is reported on a read-only connection and the state is unchanged;
+    /// a writer normalises the stored flag and reason.
+    #[test]
+    fn reembed_reason_is_computed_read_only_and_persisted_by_writers() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tmp")
+            .join(format!("reembed-ro-{}", process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let db = dir.join("retrivio.db");
+        let rw = open_db_rw(&db).expect("fresh store");
+        app_state_set(&rw, APP_STATE_ACTIVE_MODEL_KEY, "ollama:old-model").unwrap();
+        app_state_set(&rw, APP_STATE_REEMBED_REQUIRED, "0").unwrap();
+        let mut map: HashMap<String, String> = HashMap::new();
+        map.insert("embed_backend".into(), "ollama".into());
+        map.insert("embed_model".into(), "new-model".into());
+        let cfg = ConfigValues::from_map(map);
+
+        let ro = open_db_read_only(&db).expect("read-only");
+        let reason = reembed_requirement_reason(&ro, &cfg)
+            .expect("no write on a read-only connection")
+            .expect("a model change is a reason");
+        assert!(reason.contains("ollama:old-model") && reason.contains("ollama:new-model"));
+        let blocked = ensure_reembed_ready(&ro, &cfg, "search").unwrap_err();
+        assert!(blocked.starts_with("search blocked:"), "{}", blocked);
+        assert!(!blocked.contains("readonly"), "{}", blocked);
+        assert_eq!(
+            app_state_get(&ro, APP_STATE_REEMBED_REQUIRED)
+                .unwrap()
+                .as_deref(),
+            Some("0"),
+            "the reader changed nothing"
+        );
+        assert!(app_state_get(&ro, APP_STATE_REEMBED_REASON)
+            .unwrap()
+            .is_none());
+
+        // A flag without a reason is reported with a generic reason, still without writing.
+        app_state_set(&rw, APP_STATE_ACTIVE_MODEL_KEY, "ollama:new-model").unwrap();
+        app_state_set(&rw, APP_STATE_REEMBED_REQUIRED, "1").unwrap();
+        let generic = reembed_requirement_reason(&ro, &cfg).unwrap().unwrap();
+        assert!(generic.contains("migration required"), "{}", generic);
+        assert!(app_state_get(&ro, APP_STATE_REEMBED_REASON)
+            .unwrap()
+            .is_none());
+
+        // The writer persists the normalised state; a second call finds nothing stale.
+        app_state_set(&rw, APP_STATE_ACTIVE_MODEL_KEY, "ollama:old-model").unwrap();
+        app_state_set(&rw, APP_STATE_REEMBED_REQUIRED, "0").unwrap();
+        let persisted = persist_reembed_requirement(&rw, &cfg).unwrap().unwrap();
+        assert_eq!(persisted, reason);
+        assert_eq!(
+            app_state_get(&rw, APP_STATE_REEMBED_REQUIRED)
+                .unwrap()
+                .as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            app_state_get(&rw, APP_STATE_REEMBED_REASON)
+                .unwrap()
+                .as_deref(),
+            Some(reason.as_str())
+        );
+        assert!(!reembed_requirement(&rw, &cfg).unwrap().unwrap().1);
+        // No requirement at all: same key, flag clear.
+        app_state_set(&rw, APP_STATE_ACTIVE_MODEL_KEY, "ollama:new-model").unwrap();
+        app_state_set(&rw, APP_STATE_REEMBED_REQUIRED, "0").unwrap();
+        assert!(reembed_requirement_reason(&ro, &cfg).unwrap().is_none());
+        drop(ro);
+        drop(rw);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_brand_new_store_is_created_by_whoever_opens_it_first() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -26066,15 +27218,22 @@ END;
             e
         )
     })?;
-    // Persistent query embedding cache (survives process restarts)
+    // Persistent query embedding cache (survives process restarts). Keyed by the hash of
+    // (model key, normalised query) since 0.2.1; the earlier shape stored the query text
+    // itself. It is a cache: an old table is dropped and recreated rather than migrated.
+    if db_has_table(conn, "query_embed_cache")?
+        && table_has_column(conn, "query_embed_cache", "query_normalized")?
+    {
+        conn.execute_batch("DROP TABLE query_embed_cache;")
+            .map_err(|e| format!("failed dropping the old query_embed_cache table: {}", e))?;
+    }
     conn.execute_batch(
         r#"
 CREATE TABLE IF NOT EXISTS query_embed_cache (
-    query_normalized TEXT NOT NULL,
+    query_hash TEXT NOT NULL PRIMARY KEY,
     model_key TEXT NOT NULL,
     vector BLOB NOT NULL,
-    cached_at REAL NOT NULL,
-    PRIMARY KEY(query_normalized, model_key)
+    cached_at REAL NOT NULL
 );
 "#,
     )
@@ -26948,9 +28107,8 @@ mod scoped_refresh_tests {
         pending.insert(a.join("reports").join("readme.md"));
         pending.insert(a.join("notes").join("readme.md"));
 
-        let (scope, force) = derive_watch_targets(&pending, &tracked);
+        let scope = derive_watch_targets(&pending, &tracked);
         assert_eq!(scope, IndexScope::projects(vec![a.clone()]));
-        assert_eq!(force, HashSet::from([a.clone()]));
         let IndexTargets { projects, .. } =
             resolve_index_targets(&conn, &cfg(), &scope).expect("resolve");
         assert_eq!(projects, vec![a]);
@@ -26960,16 +28118,14 @@ mod scoped_refresh_tests {
         fs::create_dir_all(&fresh).expect("create proj-c");
         let mut pending: HashSet<PathBuf> = HashSet::new();
         pending.insert(fresh.join("readme.md"));
-        let (scope, force) = derive_watch_targets(&pending, &tracked);
+        let scope = derive_watch_targets(&pending, &tracked);
         assert_eq!(scope, IndexScope::projects(vec![fresh.clone()]));
-        assert_eq!(force, HashSet::from([fresh]));
 
         // A file under the root but inside no project falls back to discovery on the root.
         let mut pending: HashSet<PathBuf> = HashSet::new();
         pending.insert(root.join("notes.md"));
-        let (scope, force) = derive_watch_targets(&pending, &tracked);
+        let scope = derive_watch_targets(&pending, &tracked);
         assert_eq!(scope, IndexScope::roots(vec![root.clone()]));
-        assert!(force.is_empty());
         let _ = fs::remove_dir_all(&root);
     }
 }
@@ -27873,6 +29029,48 @@ fn collect_project_corpus(
     manifest: &FileManifest,
     rechunk_all: bool,
 ) -> ProjectCorpus {
+    collect_project_corpus_verifying(
+        project_dir,
+        scan,
+        caps,
+        max_chars,
+        manifest,
+        rechunk_all,
+        &HashSet::new(),
+    )
+}
+
+/// The relative paths of `verify_paths` (absolute, normalised) that lie inside `project`.
+fn verify_rel_paths(project: &Path, verify_paths: &[PathBuf]) -> HashSet<String> {
+    verify_paths
+        .iter()
+        .filter_map(|p| p.strip_prefix(project).ok())
+        .filter(|rel| !rel.as_os_str().is_empty())
+        .map(|rel| rel.to_string_lossy().to_string())
+        .collect()
+}
+
+/// A verified file: its content hash against the manifest whatever its stat says.
+/// Returns (changed, content_hash).
+fn file_content_changed(manifest: &FileManifest, rel_path: &str, content: &[u8]) -> (bool, String) {
+    let hash = content_hash_xxh64(content);
+    match manifest.get(rel_path) {
+        Some(entry) if entry.content_hash == hash => (false, hash),
+        _ => (true, hash),
+    }
+}
+
+/// [`collect_project_corpus`] with `verify`: relative paths that skip the size+mtime fast path
+/// and are read and hashed regardless (see [`run_native_index_verifying`]).
+fn collect_project_corpus_verifying(
+    project_dir: &Path,
+    scan: &ProjectScan,
+    caps: &ScanCaps,
+    max_chars: usize,
+    manifest: &FileManifest,
+    rechunk_all: bool,
+    verify: &HashSet<String>,
+) -> ProjectCorpus {
     const CHUNK_SIZE_CHARS: usize = 1000;
     const CHUNK_OVERLAP_CHARS: usize = 180;
     const SUMMARY_SNIPPET_CHARS: usize = 900;
@@ -27972,8 +29170,10 @@ fn collect_project_corpus(
         let doc_mtime = cand.mtime;
 
         // Fast path: manifest says size and mtime are what they were. No read, no chunking;
-        // the first few files are still read for the project summary snippet.
-        if !rechunk_all {
+        // the first few files are still read for the project summary snippet. A file named
+        // for verification never takes it.
+        let verify_this = verify.contains(rel.as_str());
+        if !rechunk_all && !verify_this {
             if let Some(entry) = manifest_stat_match(manifest, &rel, size_i64, doc_mtime) {
                 if snippet_files.contains(rel.as_str()) {
                     if let Some((text, _)) = read_for_index(&cand.fs_path, caps.max_file_chars) {
@@ -28021,9 +29221,12 @@ fn collect_project_corpus(
             }
         };
 
-        // Stat differed (or the file is new): the content hash decides.
+        // Stat differed (or the file is new, or it is up for verification): the content hash
+        // decides.
         let (changed, content_hash) = if rechunk_all {
             (true, content_hash_xxh64(&raw))
+        } else if verify_this {
+            file_content_changed(manifest, &rel, &raw)
         } else {
             file_has_changed(manifest, &rel, size_i64, doc_mtime, &raw)
         };
@@ -28032,14 +29235,15 @@ fn collect_project_corpus(
             let chunk_count = entry.map(|e| e.chunk_count).unwrap_or(0);
             carried_chunks += chunk_count.max(0) as usize;
             files.push(ScannedFile {
-                rel_path: rel,
+                rel_path: rel.clone(),
                 doc_path,
                 size: size_i64,
                 mtime: doc_mtime,
                 content_hash,
                 chunk_count,
                 rechunked: false,
-                stat_changed: true,
+                // A verified file whose stat did not move needs no manifest refresh.
+                stat_changed: manifest_stat_match(manifest, &rel, size_i64, doc_mtime).is_none(),
             });
             continue;
         }
@@ -33771,7 +34975,10 @@ impl BedrockEmbedder {
                 let request_id = resp.header("x-amzn-RequestId").unwrap_or("").to_string();
                 let error_type = resp.header("x-amzn-ErrorType").unwrap_or("").to_string();
                 let body_text = resp.into_string().unwrap_or_default();
+                // Never in hook mode: the body can echo the request (the derived query) and
+                // the hook's stderr is the CLI's hook log.
                 if code >= 500
+                    && !hook_mode_active()
                     && !BEDROCK_5XX_DIAG_LOGGED.swap(true, Ordering::Relaxed)
                 {
                     progress_clear_line();
@@ -34468,32 +35675,172 @@ mod watcher_and_compaction_tests {
         let mut pending: HashSet<PathBuf> = HashSet::new();
         pending.insert(root_b.join("other").join("notes.md"));
 
+        let targets = |scope: &IndexScope| -> Vec<PathBuf> { scope.target_paths() };
         // Both roots tracked: the event maps to root-b's project.
-        let (scope, force) = derive_watch_targets(&pending, &tracked(&[&root_a, &root_b]));
+        let scope = derive_watch_targets(&pending, &tracked(&[&root_a, &root_b]));
         assert!(!scope.is_empty());
-        assert!(force.iter().any(|p| p.ends_with("other")), "{:?}", force);
+        assert!(
+            targets(&scope).iter().any(|p| p.ends_with("other")),
+            "{:?}",
+            scope
+        );
 
         // root-b removed since: the same event maps to nothing, so nothing is re-indexed.
-        let (scope, force) = derive_watch_targets(&pending, &tracked(&[&root_a]));
+        let scope = derive_watch_targets(&pending, &tracked(&[&root_a]));
         assert!(scope.is_empty(), "{:?}", scope);
-        assert!(force.is_empty());
 
         // An event under the remaining root still scans its project.
         pending.insert(root_a.join("proj").join("notes.md"));
-        let (scope, force) = derive_watch_targets(&pending, &tracked(&[&root_a]));
+        let scope = derive_watch_targets(&pending, &tracked(&[&root_a]));
         assert!(!scope.is_empty());
-        assert_eq!(force.len(), 1);
-        assert!(force.iter().any(|p| p.ends_with("proj")), "{:?}", force);
+        assert_eq!(targets(&scope).len(), 1);
+        assert!(
+            targets(&scope).iter().any(|p| p.ends_with("proj")),
+            "{:?}",
+            scope
+        );
         let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
+    fn summary_pages_are_files_named_after_another_project() {
+        let stems: HashSet<String> = [
+            "202608-acme-rollout",
+            "widget-service",
+            "ai-activity-widget-service",
+            "globex",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        // The stem half: named after another indexed project, not after its own.
+        assert_eq!(
+            summary_page_stem(
+                "projects/202608-Acme-Rollout.md",
+                "/r/202609-handoff",
+                &stems
+            ),
+            Some("202608-acme-rollout".to_string())
+        );
+        assert_eq!(
+            summary_page_stem("AI-Activity-widget-service.md", "/r/202609-handoff", &stems),
+            Some("ai-activity-widget-service".to_string())
+        );
+        assert!(
+            summary_page_stem("202608-acme-rollout.md", "/r/202608-acme-rollout", &stems).is_none()
+        );
+        assert!(summary_page_stem("projects/notes.md", "/r/202609-handoff", &stems).is_none());
+        assert!(summary_page_stem("README.md", "/r/202609-handoff", &stems).is_none());
+        assert!(summary_page_stem("", "/r/x", &stems).is_none());
+        // Directory evidence: projects/, summaries/, handoff*/ at any depth; nothing else.
+        assert!(summary_dir_evidence("projects/202608-acme-rollout.md"));
+        assert!(summary_dir_evidence("notes/Summaries/globex.md"));
+        assert!(summary_dir_evidence("handoffs/2026-09/globex.md"));
+        assert!(summary_dir_evidence("Handoff-notes/globex.md"));
+        assert!(!summary_dir_evidence("docs/Globex.md"));
+        assert!(!summary_dir_evidence("integrations/Acme.md"));
+        assert!(!summary_dir_evidence("Globex.md"));
+        // Text evidence: three distinct paths of the named project.
+        let digest = "Summary of globex: see globex/docs/design.md, globex/src/main.rs and globex/README.md for details; also /Users/me/globex/notes.txt";
+        assert!(text_references_project(digest, "globex"));
+        assert!(!text_references_project(
+            "Globex versus Initech: throughput modes, globex/ pricing, and one link globex/docs/design.md",
+            "globex"
+        ));
+        assert!(
+            !text_references_project("globex/a.md globex/a.md globex/a.md", "globex"),
+            "distinct paths"
+        );
+        assert!(
+            !text_references_project("myglobex/a.md myglobex/b.md myglobex/c.md", "globex"),
+            "word boundary"
+        );
+        assert!(!text_references_project("", "globex"));
+
+        // End to end against a store: the same stem, three verdicts.
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        conn.execute_batch(
+            r#"
+INSERT INTO projects(id, path, title, summary, project_mtime, last_indexed)
+VALUES (1, '/r/vendor-compare', 'sc', 's', 0, 0), (2, '/r/202609-handoff', 'h', 'h', 0, 0);
+INSERT INTO project_chunks(id, project_id, doc_path, doc_rel_path, doc_mtime, chunk_index, token_count, text_hash, text, updated_at)
+VALUES (10, 1, '/r/vendor-compare/docs/Globex.md', 'docs/Globex.md', 0, 0, 5, 'h10', 'Globex throughput modes compared with Initech for the vendor workshop', 0),
+       (11, 2, '/r/202609-handoff/projects/globex.md', 'projects/globex.md', 0, 0, 5, 'h11', 'Digest of the Globex work', 0),
+       (12, 2, '/r/202609-handoff/globex.md', 'globex.md', 0, 0, 5, 'h12', 'Digest: globex/docs/design.md, globex/src/lib.rs, globex/README.md', 0),
+       (13, 2, '/r/202609-handoff/globex-notes/globex.md', 'globex-notes/globex.md', 0, 0, 5, 'h13', 'Just a note that mentions globex once', 0),
+       (14, 2, '/r/202609-handoff/notes/globex.md', 'notes/globex.md', 0, 0, 5, 'h14', 'Digest part one, see globex/docs/design.md', 0),
+       (15, 2, '/r/202609-handoff/notes/globex.md', 'notes/globex.md', 0, 1, 5, 'h15', 'part two: globex/src/lib.rs', 0),
+       (16, 2, '/r/202609-handoff/notes/globex.md', 'notes/globex.md', 0, 2, 5, 'h16', 'part three: globex/README.md and a closing remark', 0);
+"#,
+        )
+        .unwrap();
+        let mut judge = SummaryPageJudge {
+            stems: stems.clone(),
+            verdicts: HashMap::new(),
+        };
+        // A document that shares the name, in an ordinary directory, no path references.
+        assert!(!judge.is_summary_page(
+            &conn,
+            "/r/vendor-compare/docs/Globex.md",
+            "docs/Globex.md",
+            "/r/vendor-compare"
+        ));
+        // The digest by directory.
+        assert!(judge.is_summary_page(
+            &conn,
+            "/r/202609-handoff/projects/globex.md",
+            "projects/globex.md",
+            "/r/202609-handoff"
+        ));
+        // The digest by text, in one chunk.
+        assert!(judge.is_summary_page(
+            &conn,
+            "/r/202609-handoff/globex.md",
+            "globex.md",
+            "/r/202609-handoff"
+        ));
+        // Name only: neither directory nor text evidence.
+        assert!(!judge.is_summary_page(
+            &conn,
+            "/r/202609-handoff/globex-notes/globex.md",
+            "globex-notes/globex.md",
+            "/r/202609-handoff"
+        ));
+        // Paths spread over three chunks: the document is judged whole, every chunk of it
+        // gets the same verdict, and the text is read once (one cached verdict per document).
+        for _ in 0..3 {
+            assert!(judge.is_summary_page(
+                &conn,
+                "/r/202609-handoff/notes/globex.md",
+                "notes/globex.md",
+                "/r/202609-handoff"
+            ));
+        }
+        // Five documents judged (the name-only vendor file included), each once.
+        assert_eq!(judge.verdicts.len(), 5);
+        assert_eq!(
+            document_text(&conn, "/r/202609-handoff/notes/globex.md")
+                .matches("globex/")
+                .count(),
+            3
+        );
+        // The factor: the constant unless the sweep override is set (read once per process).
+        assert!((SUMMARY_PAGE_FACTOR - 0.85).abs() < 1e-12);
+        let f = summary_page_factor();
+        assert!((0.5..=1.0).contains(&f));
+    }
+
+    #[test]
     fn compaction_is_due_only_above_the_threshold() {
-        assert!(!lance_compaction_due(0, 200));
-        assert!(!lance_compaction_due(200, 200));
-        assert!(lance_compaction_due(201, 200));
-        assert!(lance_compaction_due(5_000, 200));
-        assert!(!lance_compaction_due(5_000, 0), "0 disables");
+        assert!(!lance_compaction_due(0, 0, 200));
+        assert!(!lance_compaction_due(200, 0, 200));
+        assert!(lance_compaction_due(201, 0, 200));
+        // Fragments count too: many small writes with the versions pruned between sweeps.
+        assert!(!lance_compaction_due(3, 200, 200));
+        assert!(lance_compaction_due(3, 201, 200));
+        assert!(!lance_compaction_due(10_000, 10_000, 0), "0 disables");
+        assert!(!lance_compaction_due(10_000, 10_000, -1));
         let mut cfg = ConfigValues::from_map(HashMap::new());
         assert_eq!(cfg.lance_compact_versions, 200);
         config_set_value(&mut cfg, "lance_compact_versions", "50").unwrap();
@@ -34737,15 +36084,30 @@ mod test_support {
     thread_local! {
         static DATA_DIR: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
     }
+    /// Process-wide data dir for a test binary that re-runs itself as a child command (the
+    /// recall end-to-end tests): the command spawns worker threads, which do not inherit the
+    /// thread-local above.
+    static PROCESS_DATA_DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
     /// The LanceDB handle is process-global, so tests that run the indexer take turns.
     static STORE_LOCK: Mutex<()> = Mutex::new(());
 
     pub(super) fn data_dir_for_test() -> PathBuf {
-        DATA_DIR.with(|d| d.borrow().clone()).unwrap_or_else(|| {
-            panic!(
-                "data_dir() used in a test without a TestStore; tests must never touch ~/.retrivio"
-            )
-        })
+        if let Some(d) = DATA_DIR.with(|d| d.borrow().clone()) {
+            return d;
+        }
+        if let Some(d) = PROCESS_DATA_DIR
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+        {
+            return d;
+        }
+        panic!("data_dir() used in a test without a TestStore; tests must never touch ~/.retrivio")
+    }
+
+    /// Install `dir` as this process's data dir for every thread (child-process helpers only).
+    pub(super) fn install_process_data_dir(dir: &Path) {
+        *PROCESS_DATA_DIR.lock().unwrap_or_else(|p| p.into_inner()) = Some(dir.to_path_buf());
     }
 
     fn reset_lance_store() {
@@ -34821,6 +36183,7 @@ mod test_support {
                 embedder,
                 IndexScope::AllRoots,
                 force_all,
+                HashSet::new(),
                 HashSet::new(),
                 true,
                 false,
@@ -34994,6 +36357,224 @@ mod index_run_tests {
             ),
         );
         (chunks, vectors)
+    }
+
+    /// The watcher's event scan (slice 4): an edited file is the only one read and embedded;
+    /// a touch without an edit embeds nothing; a deleted file loses exactly its rows. Before
+    /// this, event scans forced a full re-chunk of the touched project (`files=81/0/81`).
+    #[test]
+    fn watch_event_scans_take_the_manifest_fast_path_and_keep_deletions() {
+        let store = TestStore::new("watch-fast-path");
+        let root = two_project_root(&store, "root");
+        store.track(&root);
+        let cfg = store.cfg(&root, &[]);
+        let embedder = TestEmbedder::new(&cfg, false);
+        let first = store.index(&cfg, &embedder, false).expect("first run");
+        assert_eq!(first.chunks_embedded, 3);
+        let conn = store.conn();
+
+        let root_norm = normalize_path(&root.to_string_lossy());
+        let alpha = root_norm.join("alpha");
+        let tracked = vec![TrackedRoot {
+            path: root_norm.clone(),
+            exclude_patterns: Vec::new(),
+        }];
+        // `verify` is what the event loop passes: the event paths themselves.
+        let event_with = |paths: &[PathBuf], verify: bool| -> IndexStats {
+            let pending: HashSet<PathBuf> = paths.iter().cloned().collect();
+            let scope = derive_watch_targets(&pending, &tracked);
+            assert_eq!(scope, IndexScope::projects(vec![alpha.clone()]));
+            let writer = WriterLock::try_acquire(&store.dir).expect("writer lock");
+            run_native_index_with_embedder(
+                &store.dir,
+                &cfg,
+                &writer,
+                &embedder,
+                scope,
+                false,
+                HashSet::new(),
+                if verify { pending } else { HashSet::new() },
+                false,
+                false,
+                "watch events",
+            )
+            .expect("event scan")
+        };
+        let event = |paths: &[PathBuf]| -> IndexStats { event_with(paths, true) };
+
+        // One edited file: read, chunked and embedded alone; the other file is carried.
+        write(
+            &alpha.join("b.md"),
+            "alpha two rewritten about ui and frontend widgets",
+        );
+        let edited = event(&[alpha.join("b.md")]);
+        assert_eq!(edited.updated_projects, 1);
+        assert_eq!(edited.skipped_projects, 0, "beta is outside the scope");
+        assert_eq!(
+            (
+                edited.files_selected,
+                edited.files_unchanged,
+                edited.files_rechunked
+            ),
+            (2, 1, 1)
+        );
+        assert_eq!(edited.chunks_embedded, 1);
+        assert_eq!(edited.chunks_deleted, 0);
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM project_chunks WHERE doc_rel_path = 'b.md' AND text LIKE '%frontend widgets%'"
+            ),
+            1
+        );
+
+        // A touch without an edit: the stat differs, the content hash says unchanged, nothing
+        // is chunked or embedded.
+        let touched = fs::OpenOptions::new()
+            .write(true)
+            .open(alpha.join("a.md"))
+            .expect("open a.md");
+        touched
+            .set_modified(SystemTime::now() + Duration::from_secs(7))
+            .expect("touch a.md");
+        drop(touched);
+        let touched = event(&[alpha.join("a.md")]);
+        assert_eq!(touched.updated_projects, 1);
+        assert_eq!(
+            (
+                touched.files_selected,
+                touched.files_unchanged,
+                touched.files_rechunked
+            ),
+            (2, 2, 0)
+        );
+        assert_eq!(touched.chunks_embedded, 0);
+        assert_eq!(touched.chunks_deleted, 0);
+
+        // A deleted file: the event scan removes exactly its rows and reads nothing else.
+        fs::remove_file(alpha.join("a.md")).expect("rm a.md");
+        let deleted = event(&[alpha.join("a.md")]);
+        assert_eq!(deleted.updated_projects, 1);
+        assert_eq!(
+            (
+                deleted.files_selected,
+                deleted.files_unchanged,
+                deleted.files_rechunked
+            ),
+            (1, 1, 0)
+        );
+        assert_eq!(deleted.chunks_embedded, 0);
+        assert_eq!(deleted.chunks_deleted, 1);
+        assert_eq!(chunk_rows_for(&conn, "a.md"), (0, 0));
+        assert_eq!(chunk_rows_for(&conn, "b.md"), (1, 1));
+        assert_eq!(chunk_rows_for(&conn, "notes.md"), (1, 1));
+
+        // Steady state afterwards: a scope without a file to verify (a directory event) is
+        // skipped by the gate; an event naming an unchanged file verifies it (read, hashed)
+        // and embeds nothing.
+        let steady = event_with(&[alpha.join("b.md")], false);
+        assert_eq!(steady.skipped_projects, 1);
+        assert_eq!(steady.chunks_embedded, 0);
+        let steady = event(&[alpha.join("b.md")]);
+        assert_eq!(steady.skipped_projects, 0);
+        assert_eq!(
+            (
+                steady.files_selected,
+                steady.files_unchanged,
+                steady.files_rechunked
+            ),
+            (1, 1, 0),
+            "alpha holds b.md alone since the deletion"
+        );
+        assert_eq!(steady.chunks_embedded, 0);
+
+        // The edit the stat gate cannot see: same byte length, timestamp restored exactly.
+        // Without the event path as a verify target the project is skipped and the index
+        // keeps the old text; with it, the file is read, hashed, re-chunked and re-embedded.
+        let before = fs::read_to_string(alpha.join("b.md")).unwrap();
+        let after = "alpha two rewritten about ux and frontend gadgets";
+        assert_eq!(
+            before.len(),
+            after.len(),
+            "the replacement keeps the byte length"
+        );
+        let mtime = fs::metadata(alpha.join("b.md"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        write(&alpha.join("b.md"), after);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(alpha.join("b.md"))
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        assert_eq!(
+            fs::metadata(alpha.join("b.md"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            mtime
+        );
+        let missed = event_with(&[alpha.join("b.md")], false);
+        assert_eq!(
+            missed.skipped_projects, 1,
+            "the stat gate alone misses the edit"
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM project_chunks WHERE doc_rel_path = 'b.md' AND text LIKE '%frontend gadgets%'"
+            ),
+            0
+        );
+        let verified = event(&[alpha.join("b.md")]);
+        assert_eq!(verified.skipped_projects, 0);
+        assert_eq!(verified.updated_projects, 1);
+        assert_eq!(
+            (
+                verified.files_selected,
+                verified.files_unchanged,
+                verified.files_rechunked
+            ),
+            (1, 0, 1)
+        );
+        assert_eq!(verified.chunks_embedded, 1);
+        assert_eq!(verified.chunks_deleted, 0);
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM project_chunks WHERE doc_rel_path = 'b.md' AND text LIKE '%frontend gadgets%'"
+            ),
+            1
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM project_chunks WHERE doc_rel_path = 'b.md' AND text LIKE '%frontend widgets%'"
+            ),
+            0
+        );
+        // An event for an unchanged file: verified (read and hashed), nothing re-chunked,
+        // nothing embedded; beta, outside the scope, is not touched at all.
+        let same = event(&[alpha.join("b.md")]);
+        assert_eq!(
+            same.skipped_projects, 0,
+            "the named file is verified, not skipped"
+        );
+        assert_eq!(
+            (
+                same.files_selected,
+                same.files_unchanged,
+                same.files_rechunked
+            ),
+            (1, 1, 0)
+        );
+        assert_eq!(same.chunks_embedded, 0);
+        // An event path outside the project's files (a deleted or foreign path) verifies
+        // nothing and the gate skips as before.
+        let foreign = event_with(&[alpha.join("zzz.md")], true);
+        assert_eq!(foreign.skipped_projects, 1);
     }
 
     #[test]
@@ -35255,17 +36836,16 @@ mod index_run_tests {
             exclude_patterns: Vec::new(),
         }];
         let pending: HashSet<PathBuf> = [root_norm.join("loose-notes.md")].into_iter().collect();
-        let (scope, force) = derive_watch_targets(&pending, &tracked);
+        let scope = derive_watch_targets(&pending, &tracked);
         assert_eq!(scope, IndexScope::projects(vec![root_norm.clone()]));
-        assert!(force.contains(&root_norm));
         let pending: HashSet<PathBuf> = [root_norm.join("gamma").join("new.md")]
             .into_iter()
             .collect();
-        let (scope, _) = derive_watch_targets(&pending, &tracked);
+        let scope = derive_watch_targets(&pending, &tracked);
         assert_eq!(scope, IndexScope::roots(vec![root_norm.clone()]));
         let pending: HashSet<PathBuf> =
             [root_norm.join("alpha").join("a.md")].into_iter().collect();
-        let (scope, _) = derive_watch_targets(&pending, &tracked);
+        let scope = derive_watch_targets(&pending, &tracked);
         assert_eq!(scope, IndexScope::projects(vec![root_norm.join("alpha")]));
         // A scoped run naming the root-files project scans it shallow.
         let targets =

@@ -187,6 +187,10 @@ local_embed_dim = 128
 retrieval_backend = "lancedb"
 reranker_enabled = false
 hyde_enabled = false
+# The recall floor is a raw cosine calibrated for Titan v2 (default 0.40). Feature-hashing
+# vectors are not semantic: the related note measures about 0.29 here and the next file 0.20,
+# so 0.25 keeps exactly the expected lead.
+recall_min_abs_score = 0.25
 EOF
 
 # ---------------------------------------------------------------- steps
