@@ -25980,12 +25980,25 @@ mod project_discovery_tests {
         let set = cfg.skip_dir_name_set();
         assert_eq!(set.len(), 2);
         assert!(set.contains("zz-skip-me") && set.contains("zz-tmp"));
+        // The predicate itself, independent of the process-global set.
+        assert!(is_skip_dir_with("zz-skip-me", Some(&set)));
+        assert!(is_skip_dir_with("zz-tmp", Some(&set)));
+        assert!(
+            is_skip_dir_with("node_modules", Some(&set)),
+            "built-ins still apply"
+        );
+        assert!(!is_skip_dir_with("src", Some(&set)));
+        assert!(!is_skip_dir_with("zz-skip-me", None));
+        // The process-global set is first-call-wins. Tests run in parallel in one process, so
+        // another test may have installed its own set already; the global assertions and the
+        // discovery walk below only hold when this test's set is the one installed.
         set_extra_skip_dirs(&cfg);
+        if EXTRA_SKIP_DIRS.get() != Some(&set) {
+            eprintln!("extra_skip_dirs_from_config_are_honoured: another test installed the process-global skip set first; predicate assertions done, global part skipped");
+            return;
+        }
         assert!(is_skip_dir("zz-skip-me"));
         assert!(is_skip_dir("zz-tmp"));
-        assert!(is_skip_dir("node_modules"), "built-ins still apply");
-        assert!(!is_skip_dir("src"));
-        // The set is process-global and first-call-wins.
         set_extra_skip_dirs(&ConfigValues::from_map(std::collections::HashMap::new()));
         assert!(is_skip_dir("zz-skip-me"));
 
@@ -30989,7 +31002,12 @@ fn is_extra_skip_dir(name: &str) -> bool {
 }
 
 fn is_skip_dir(name: &str) -> bool {
-    is_builtin_skip_dir(name) || is_extra_skip_dir(name)
+    is_skip_dir_with(name, EXTRA_SKIP_DIRS.get())
+}
+
+/// [`is_skip_dir`] against an explicit extra set (the process-global one when `None`).
+fn is_skip_dir_with(name: &str, extra: Option<&HashSet<String>>) -> bool {
+    is_builtin_skip_dir(name) || extra.map(|set| set.contains(name)).unwrap_or(false)
 }
 
 fn is_builtin_skip_dir(name: &str) -> bool {
