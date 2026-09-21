@@ -330,10 +330,8 @@ fn yaml_block_date(body: &[&str]) -> Option<f64> {
                     updated = parse_date_value(value);
                 }
             }
-            "date" => {
-                if date.is_none() {
-                    date = parse_date_value(value);
-                }
+            "date" if date.is_none() => {
+                date = parse_date_value(value);
             }
             _ => {}
         }
@@ -484,10 +482,9 @@ fn parse_english_date(value: &str) -> Option<f64> {
     }
     let (m, d) = if let Some(m) = month_number(words[0]) {
         (m, english_day(words[1])?)
-    } else if let Some(m) = month_number(words[1]) {
-        (m, english_day(words[0])?)
     } else {
-        return None;
+        let m = month_number(words[1])?;
+        (m, english_day(words[0])?)
     };
     civil_ts(english_year(words[2])?, m, d)
 }
@@ -544,6 +541,7 @@ pub fn blend(score: f64, recency: f64, weight: f64) -> f64 {
 }
 
 /// Display tier: `fresh` (< 14 d), `aging` (14..=35 d), `stale` (> 35 d); records are `record`.
+#[cfg(test)]
 pub fn tier(age_days: f64, is_record: bool) -> &'static str {
     tier_for_role(
         age_days,

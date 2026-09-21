@@ -45,6 +45,28 @@ Notes:
 - `retrivio watch` uses `fswatch` when present, otherwise polling fallback
 - if your configured embedding backend is Ollama, initial indexing requires a running Ollama daemon and the configured embedding model to be available locally
 
+## Code signing on macOS (local builds)
+
+macOS keys a folder-access grant (the "retrivio would like to access your Documents folder" prompt; TCC service `kTCCServiceSystemPolicyDocumentsFolder`) to the requesting program's code signature. An unsigned binary has a different code hash after every build, so each rebuild is a new program: the launchd watcher is prompted again and, having no window to answer in, stays blocked until the prompt is clicked. Signing local builds with a stable identity keeps the identity across rebuilds; a self-signed certificate is enough because the grant needs a stable identity, not one Apple trusts.
+
+Create the certificate once (Keychain Access):
+
+1. Keychain Access > Keychain Access menu > Certificate Assistant > Create a Certificate…
+2. Name `Retrivio Dev` (any name; it becomes the identity), Identity Type `Self Signed Root`, Certificate Type `Code Signing`. Create.
+3. `security find-identity -v -p codesigning` lists it.
+
+Then, after every build:
+
+```bash
+export RETRIVIO_CODESIGN_IDENTITY="Retrivio Dev"   # put it in your shell rc
+cargo build --release -p retrivio
+scripts/sign-macos.sh                              # default target: target/release/retrivio
+```
+
+The script runs `codesign --force --sign "$RETRIVIO_CODESIGN_IDENTITY" --identifier com.stouffer-labs.retrivio --timestamp=none <binary>` and verifies the result (`codesign --verify --strict`, then `codesign -dv`). The first run of a newly signed binary prompts once; after that, rebuilds signed with the same certificate and identifier keep the grant. Sign the binary the launchd plist names (`retrivio service status` prints the plist path) and reinstall the agent (`retrivio service uninstall && retrivio service install`) so launchd runs the signed build rather than the process it started before.
+
+Without `RETRIVIO_CODESIGN_IDENTITY` the script signs ad hoc (`--sign -`): the binary carries a signature but no stable identity, so macOS still asks again after every rebuild. The release workflow does not sign the published binaries; a downloaded release only changes when you upgrade, so it prompts once per upgrade.
+
 ## Maintainer Release Flow
 
 The repository is a normal git repository. Work happens on a branch, lands on `main` through a pull request, and a version tag triggers the release build.

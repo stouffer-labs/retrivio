@@ -269,7 +269,6 @@ fn the_installed_entry_path_finishes_hostile_hook_input_under_the_deadline() {
     assert!(dry.stdout.contains("<retrivio_leads>"), "{}", dry.stdout);
     assert!(dry.stdout.contains("storage.md"), "{}", dry.stdout);
 
-    drop(check);
     timings.push(("closed-stdout".to_string(), closed_ms));
     println!("recall binary e2e timings (ms): {:?}", timings);
     let _ = fs::remove_dir_all(&dir);

@@ -113,8 +113,8 @@ pub fn import_node_types(lang: LanguageId) -> &'static [&'static str] {
     }
 }
 
-/// Thread-local parser pool. tree_sitter::Parser is not Send, so each thread
-/// gets its own instance. We cache it to avoid re-allocation on every file.
+// Thread-local parser pool. tree_sitter::Parser is not Send, so each thread
+// gets its own instance. We cache it to avoid re-allocation on every file.
 thread_local! {
     static PARSER: RefCell<tree_sitter::Parser> = RefCell::new(tree_sitter::Parser::new());
 }

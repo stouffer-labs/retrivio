@@ -545,7 +545,7 @@ fn make_fixed_list_array(flat_values: &[f32], dim: usize) -> Result<FixedSizeLis
     if dim == 0 {
         return Err("invalid LanceDB vector dim: 0".to_string());
     }
-    if flat_values.len() % dim != 0 {
+    if !flat_values.len().is_multiple_of(dim) {
         return Err(format!(
             "invalid vector buffer length for dim {}: {}",
             dim,
@@ -570,7 +570,7 @@ fn empty_batch(schema: &SchemaRef, dim: usize) -> Result<RecordBatch, String> {
 
 fn blob_to_f32_vec(blob: &[u8]) -> Vec<f32> {
     let mut out = Vec::with_capacity(blob.len() / 4);
-    for chunk in blob.chunks_exact(4) {
+    for chunk in blob.as_chunks::<4>().0 {
         out.push(f32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
     }
     out

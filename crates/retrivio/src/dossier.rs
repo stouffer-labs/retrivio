@@ -20,7 +20,10 @@ use std::time::Instant;
 use rusqlite::Connection;
 use serde_json::{json, Value};
 
-use super::{freshness, recall, ConfigValues, RankOptions, RankedFileResult};
+use super::{freshness, recall};
+use crate::config::ConfigValues;
+use crate::rank::RankOptions;
+use crate::rank::RankedFileResult;
 
 /// Files a dossier is built from, after the per-project cap.
 pub const CANDIDATES: usize = 60;
@@ -390,7 +393,7 @@ pub fn related_projects(
         return Ok(Vec::new());
     }
     let listed: HashSet<&str> = projects.iter().map(|p| p.project_path.as_str()).collect();
-    let roots: HashSet<String> = super::list_tracked_roots_conn(conn)
+    let roots: HashSet<String> = crate::db::list_tracked_roots_conn(conn)
         .unwrap_or_default()
         .into_iter()
         .map(|p| p.to_string_lossy().to_string())
@@ -444,7 +447,7 @@ pub fn build(
         return Err("topic must be non-empty".to_string());
     }
     let floor = floor_for(cfg);
-    let ranked = super::rank_files_native_with(
+    let ranked = crate::rank::rank_files_native_with(
         conn,
         cfg,
         topic,
