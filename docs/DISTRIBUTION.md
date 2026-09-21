@@ -47,33 +47,40 @@ Notes:
 
 ## Maintainer Release Flow
 
-This project does not use a local `.git` repository. Source is published via GitHub Contents API.
+The repository is a normal git repository. Work happens on a branch, lands on `main` through a pull request, and a version tag triggers the release build.
 
-### 1. Bump version
+### 1. Branch and pull request
 
-Edit `crates/retrivio/Cargo.toml` and update the `version` field. Also update version examples in `scripts/install.sh`.
+```bash
+git checkout -b <topic>
+# ... commit ...
+scripts/check-public-tree.sh     # fails if any tracked file is outside the public set
+git push -u origin <topic>
+gh pr create --fill
+```
 
-### 2. Build locally
+CI (`.github/workflows/ci-rust.yml`) runs the public-tree check, `cargo check`, `cargo test`, `cargo clippy` and `cargo fmt --check` on every pull request and on every push to `main`. Merge with a squash so `main` carries one commit per change.
+
+### 2. Bump version
+
+Edit `crates/retrivio/Cargo.toml` and update the `version` field. Also update the version examples in `scripts/install.sh`. `cargo build` refreshes `Cargo.lock`.
+
+### 3. Build and test locally
 
 ```bash
 cargo build --release -p retrivio
+cargo test -p retrivio
 ./target/release/retrivio --version
 ```
 
-### 3. Publish source to GitHub
+### 4. Tag the release
+
+After the version bump has merged to `main`:
 
 ```bash
-scripts/publish-gh-api.sh
-```
-
-This syncs the allowlisted files to `stouffer-labs/Retrivio` on GitHub. Each file is a separate commit. The `[skip ci]` marker is appended by default to avoid triggering CI on every commit. **Do not use `--no-skip-ci`** — it causes 50+ CI runs.
-
-### 4. Create a release tag
-
-```bash
-SHA=$(gh api repos/stouffer-labs/Retrivio/git/ref/heads/main --jq '.object.sha')
-gh api repos/stouffer-labs/Retrivio/git/refs \
-  --method POST -f ref="refs/tags/v0.1.5" -f sha="$SHA"
+git checkout main && git pull
+git tag v0.2.0
+git push origin v0.2.0
 ```
 
 ### 5. Release builds automatically
@@ -83,6 +90,8 @@ GitHub Actions workflow `.github/workflows/release.yml` triggers on `v*` tags an
 - `retrivio-<version>-darwin-x86_64.tar.gz`
 - `retrivio-<version>-linux-x86_64.tar.gz`
 - `SHA256SUMS.txt`
+
+If the tag push did not start the workflow, dispatch it by hand: `gh workflow run release.yml -f tag=v0.2.0`.
 
 ### 6. End users install with
 

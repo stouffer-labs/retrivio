@@ -63,7 +63,11 @@ fn service_path_env_from(current_path: &str) -> String {
 /// `.bin` directory (per-project tool shims), and nothing writable by group or others (a bare
 /// helper name such as `isengardcli` could be hijacked there).
 fn service_path_dir_ok(seg: &str) -> bool {
-    let trimmed = if seg.len() > 1 { seg.trim_end_matches('/') } else { seg };
+    let trimmed = if seg.len() > 1 {
+        seg.trim_end_matches('/')
+    } else {
+        seg
+    };
     if !trimmed.starts_with('/')
         || trimmed.starts_with("/tmp")
         || trimmed.starts_with("/private/tmp")
@@ -813,7 +817,10 @@ fn read_json_file(path: &Path) -> Result<Option<Value>, String> {
 }
 
 fn backup_path(path: &Path) -> PathBuf {
-    let mut name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    let mut name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
     name.push(BACKUP_SUFFIX);
     path.with_file_name(name)
 }
@@ -852,9 +859,8 @@ fn random_suffix() -> String {
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let mut z = nanos
-        ^ (process::id() as u64).rotate_left(32)
-        ^ n.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let mut z =
+        nanos ^ (process::id() as u64).rotate_left(32) ^ n.wrapping_mul(0x9E37_79B9_7F4A_7C15);
     z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
@@ -882,7 +888,11 @@ fn create_new_with_mode(path: &Path, mode: u32) -> std::io::Result<fs::File> {
 
 /// Create a fresh temp file next to `target` (`create_new`, random suffix, final permission
 /// bits from the start; retried on a clash).
-fn create_temp_next_to(target: &Path, parent: &Path, mode: u32) -> std::io::Result<(fs::File, PathBuf)> {
+fn create_temp_next_to(
+    target: &Path,
+    parent: &Path,
+    mode: u32,
+) -> std::io::Result<(fs::File, PathBuf)> {
     let file_name = target
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -1004,7 +1014,12 @@ fn print_log_tail(label: &str, path: &Path) {
     match tail_lines(path, TAIL_LINES) {
         Ok(lines) if lines.is_empty() => println!("{} ({}): empty", label, path.display()),
         Ok(lines) => {
-            println!("{} ({}), last {} lines:", label, path.display(), lines.len());
+            println!(
+                "{} ({}), last {} lines:",
+                label,
+                path.display(),
+                lines.len()
+            );
             for l in lines {
                 println!("  {}", l);
             }
@@ -1107,7 +1122,12 @@ fn selected_clis(opts: &HookOpts) -> Vec<Cli> {
 }
 
 pub fn run_hook_cmd(args: &[OsString]) {
-    let opts = match parse_common(args, &["install", "uninstall", "status", "trust"], "status", true) {
+    let opts = match parse_common(
+        args,
+        &["install", "uninstall", "status", "trust"],
+        "status",
+        true,
+    ) {
         Ok(o) => o,
         Err(e) => {
             eprintln!("error: {}", e);
@@ -1172,7 +1192,11 @@ fn hook_install(opts: &HookOpts) -> Result<(), String> {
             let mut doc = read_json_file(&file)?.unwrap_or(Value::Null);
             let change = cli.merge(&mut doc, &bin_str)?;
             if change == ChangeKind::Unchanged {
-                println!("  {}: already installed ({})", cli.display(), file.display());
+                println!(
+                    "  {}: already installed ({})",
+                    cli.display(),
+                    file.display()
+                );
                 return Ok(true);
             }
             let question = match change {
@@ -1326,8 +1350,16 @@ fn hook_status(opts: &HookOpts) -> Result<(), String> {
                 } else if status.partial() {
                     format!(
                         "partial ({} present, {} missing)",
-                        if status.prompt_command.is_some() { "UserPromptSubmit" } else { "SessionStart" },
-                        if status.prompt_command.is_some() { "SessionStart" } else { "UserPromptSubmit" },
+                        if status.prompt_command.is_some() {
+                            "UserPromptSubmit"
+                        } else {
+                            "SessionStart"
+                        },
+                        if status.prompt_command.is_some() {
+                            "SessionStart"
+                        } else {
+                            "UserPromptSubmit"
+                        },
                     )
                 } else {
                     "no".to_string()
@@ -1346,7 +1378,11 @@ fn hook_status(opts: &HookOpts) -> Result<(), String> {
                         "  bin: {} ({}, {}, {})",
                         bin,
                         if exists { "exists" } else { "MISSING" },
-                        if executable { "executable" } else { "not executable" },
+                        if executable {
+                            "executable"
+                        } else {
+                            "not executable"
+                        },
                         if matches {
                             "matches current binary"
                         } else {
@@ -1378,16 +1414,25 @@ fn hook_status(opts: &HookOpts) -> Result<(), String> {
                                     );
                                     continue;
                                 }
-                                let which = if report.len() > 1 { format!(" ({})", bin) } else { String::new() };
+                                let which = if report.len() > 1 {
+                                    format!(" ({})", bin)
+                                } else {
+                                    String::new()
+                                };
                                 for h in hooks {
                                     any = true;
                                     all_trusted &= h.trust_status == "trusted";
-                                    println!("  trust: {} {}{}", h.event_name, h.trust_status, which);
+                                    println!(
+                                        "  trust: {} {}{}",
+                                        h.event_name, h.trust_status, which
+                                    );
                                 }
                             }
                             need_note = !any || !all_trusted;
                         }
-                        Err(e) => println!("  trust: unknown (codex app-server unavailable: {})", e),
+                        Err(e) => {
+                            println!("  trust: unknown (codex app-server unavailable: {})", e)
+                        }
                     }
                 }
             }
@@ -1456,7 +1501,9 @@ const CODEX_APP_SERVER_TIMEOUT_SECS: u64 = 30;
 /// Characters that chain, redirect, substitute or escape in `sh`. We never write one into a
 /// hook command (an unusual binary path is single-quoted by [`shell_quote`], and even then such a
 /// path is not auto-trusted), so a command containing any of them is never ours.
-const SHELL_METACHARACTERS: &[char] = &[';', '&', '|', '<', '>', '$', '`', '(', ')', '\\', '\n', '\r'];
+const SHELL_METACHARACTERS: &[char] = &[
+    ';', '&', '|', '<', '>', '$', '`', '(', ')', '\\', '\n', '\r',
+];
 const CODEX_APP_SERVER_STDERR_CAP: usize = 4096;
 
 pub fn build_initialize_request(id: u64) -> Value {
@@ -1528,7 +1575,11 @@ fn is_exact_retrivio_codex_hook(hook: &Value, hooks_json_path: &Path, bin: &str)
     else {
         return false;
     };
-    let Some(kind) = HookKind::ALL.iter().copied().find(|k| k.codex_event() == event) else {
+    let Some(kind) = HookKind::ALL
+        .iter()
+        .copied()
+        .find(|k| k.codex_event() == event)
+    else {
         return false;
     };
     if Path::new(source_path) != hooks_json_path {
@@ -1555,13 +1606,20 @@ fn is_exact_retrivio_codex_hook(hook: &Value, hooks_json_path: &Path, bin: &str)
     if hook.get("timeoutSec").and_then(Value::as_f64) != Some(HOOK_TIMEOUT_SECS as f64) {
         return false;
     }
-    matches!(hook.get("async"), None | Some(Value::Null) | Some(Value::Bool(false)))
+    matches!(
+        hook.get("async"),
+        None | Some(Value::Null) | Some(Value::Bool(false))
+    )
 }
 
 /// Our hooks in a `hooks/list` result: every entry that passes
 /// [`is_exact_retrivio_codex_hook`] for `bin`, deduplicated by key (one hook is listed once per
 /// cwd). A user's own hook in the same file, or ours pointing at another binary, is not included.
-pub fn retrivio_codex_hooks(list_result: &Value, hooks_json_path: &Path, bin: &str) -> Vec<CodexHookTrust> {
+pub fn retrivio_codex_hooks(
+    list_result: &Value,
+    hooks_json_path: &Path,
+    bin: &str,
+) -> Vec<CodexHookTrust> {
     let mut out: Vec<CodexHookTrust> = Vec::new();
     for hook in hooks_in_list_result(list_result) {
         if !is_exact_retrivio_codex_hook(hook, hooks_json_path, bin) {
@@ -1640,7 +1698,10 @@ pub fn select_untrusted_retrivio_hooks(
 pub fn build_trust_write_request(id: u64, hooks: &[CodexHookTrust]) -> Value {
     let mut state = Map::new();
     for hook in hooks {
-        state.insert(hook.key.clone(), json!({ "trusted_hash": hook.current_hash }));
+        state.insert(
+            hook.key.clone(),
+            json!({ "trusted_hash": hook.current_hash }),
+        );
     }
     json!({
         "jsonrpc": "2.0",
@@ -1759,7 +1820,8 @@ struct AppServer {
 impl AppServer {
     fn spawn(codex_home: Option<&Path>) -> Result<AppServer, String> {
         let path_env = env::var("PATH").unwrap_or_default();
-        let codex = find_on_path("codex", &path_env).ok_or_else(|| "codex not found on PATH".to_string())?;
+        let codex = find_on_path("codex", &path_env)
+            .ok_or_else(|| "codex not found on PATH".to_string())?;
         let mut cmd = Command::new(&codex);
         cmd.arg("app-server")
             .stdin(Stdio::piped())
@@ -1769,10 +1831,10 @@ impl AppServer {
             cmd.env("CODEX_HOME", dir);
         }
         // Until the AppServer owns it, the guard kills and reaps the child on every early return.
-        let mut guard = ChildGuard(Some(
-            cmd.spawn()
-                .map_err(|e| format!("cannot start `{} app-server`: {}", codex.display(), e))?,
-        ));
+        let mut guard =
+            ChildGuard(Some(cmd.spawn().map_err(|e| {
+                format!("cannot start `{} app-server`: {}", codex.display(), e)
+            })?));
         let child = guard.0.as_mut().expect("child just spawned");
         let stdin = child.stdin.take().ok_or("codex app-server: no stdin")?;
         let stdout = child.stdout.take().ok_or("codex app-server: no stdout")?;
@@ -1836,7 +1898,11 @@ impl AppServer {
     }
 
     fn stderr_tail(&self) -> String {
-        let text = self.stderr.lock().map(|b| b.trim().to_string()).unwrap_or_default();
+        let text = self
+            .stderr
+            .lock()
+            .map(|b| b.trim().to_string())
+            .unwrap_or_default();
         if text.is_empty() {
             String::new()
         } else {
@@ -1850,7 +1916,13 @@ impl AppServer {
         self.stdin
             .write_all(text.as_bytes())
             .and_then(|_| self.stdin.flush())
-            .map_err(|e| format!("codex app-server: write failed: {}{}", e, self.stderr_tail()))
+            .map_err(|e| {
+                format!(
+                    "codex app-server: write failed: {}{}",
+                    e,
+                    self.stderr_tail()
+                )
+            })
     }
 
     /// Send `request` (which must carry an `id`) and wait up to
@@ -1882,7 +1954,11 @@ impl AppServer {
             let line = match self.lines.recv_timeout(remaining) {
                 Ok(Ok(line)) => line,
                 Ok(Err(e)) => {
-                    return Err(format!("codex app-server: read failed: {}{}", e, self.stderr_tail()))
+                    return Err(format!(
+                        "codex app-server: read failed: {}{}",
+                        e,
+                        self.stderr_tail()
+                    ))
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => return Err(timed_out()),
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -1970,7 +2046,9 @@ fn codex_hook_trust_report(
 
 enum TrustOutcome {
     /// Codex lists none of our hooks for this binary from the file we manage.
-    NotFound { codex_home: Option<String> },
+    NotFound {
+        codex_home: Option<String>,
+    },
     AlreadyTrusted(usize),
     Declined,
     Trusted(usize),
@@ -1990,7 +2068,8 @@ fn codex_trust_hooks(home: &Path, bin: &str, auto_yes: bool) -> Result<TrustOutc
     if ours.is_empty() {
         return Ok(TrustOutcome::NotFound { codex_home });
     }
-    let TrustSelection { pending, warnings } = select_untrusted_retrivio_hooks(&listed, &hooks_json, bin);
+    let TrustSelection { pending, warnings } =
+        select_untrusted_retrivio_hooks(&listed, &hooks_json, bin);
     for warning in &warnings {
         println!("  Codex trust: warning: {}", warning);
     }
@@ -2057,7 +2136,12 @@ fn codex_trust_hooks(home: &Path, bin: &str, auto_yes: bool) -> Result<TrustOutc
 // ---------------------------------------------------------------------------
 
 pub fn run_service_cmd(args: &[OsString]) {
-    let opts = match parse_common(args, &["install", "uninstall", "status", "run"], "status", false) {
+    let opts = match parse_common(
+        args,
+        &["install", "uninstall", "status", "run"],
+        "status",
+        false,
+    ) {
         Ok(o) => o,
         Err(e) => {
             eprintln!("error: {}", e);
@@ -2102,11 +2186,19 @@ fn launchctl(args: &[&str]) -> Result<String, String> {
     if output.status.success() {
         Ok(stdout)
     } else {
-        let detail = if stderr.trim().is_empty() { stdout } else { stderr };
+        let detail = if stderr.trim().is_empty() {
+            stdout
+        } else {
+            stderr
+        };
         Err(format!(
             "launchctl {} failed ({}): {}",
             args.join(" "),
-            output.status.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".to_string()),
+            output
+                .status
+                .code()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "signal".to_string()),
             detail.trim()
         ))
     }
@@ -2141,7 +2233,12 @@ fn service_run() -> Result<(), String> {
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("[{}] retrivio service: failed to start watch: {}; retry in {}s", unix_now(), e, backoff);
+                eprintln!(
+                    "[{}] retrivio service: failed to start watch: {}; retry in {}s",
+                    unix_now(),
+                    e,
+                    backoff
+                );
                 service_sleep(backoff);
                 backoff = (backoff * 2).min(900);
                 continue;
@@ -2167,8 +2264,18 @@ fn service_run() -> Result<(), String> {
             }
         };
         match outcome {
-            Ok(status) => eprintln!("[{}] retrivio service: watch exited ({}); retry in {}s", unix_now(), status, backoff),
-            Err(e) => eprintln!("[{}] retrivio service: {}; retry in {}s", unix_now(), e, backoff),
+            Ok(status) => eprintln!(
+                "[{}] retrivio service: watch exited ({}); retry in {}s",
+                unix_now(),
+                status,
+                backoff
+            ),
+            Err(e) => eprintln!(
+                "[{}] retrivio service: {}; retry in {}s",
+                unix_now(),
+                e,
+                backoff
+            ),
         }
         if started.elapsed() > Duration::from_secs(600) {
             backoff = 60;
@@ -2232,7 +2339,11 @@ fn service_install(opts: &HookOpts) -> Result<(), String> {
     let rendered = render_launchd_plist(&bin.to_string_lossy(), &home);
     fs::write(&plist, rendered).map_err(|e| format!("write {}: {}", plist.display(), e))?;
     println!("  wrote {}", plist.display());
-    println!("  program: {} service run  (supervises `watch --quiet --interval {}` with backoff)", bin.display(), WATCH_INTERVAL_SECS);
+    println!(
+        "  program: {} service run  (supervises `watch --quiet --interval {}` with backoff)",
+        bin.display(),
+        WATCH_INTERVAL_SECS
+    );
     println!("  log: {}", watch_log_path(&home).display());
 
     let domain = format!("gui/{}", current_uid());
@@ -2299,7 +2410,10 @@ fn service_status(_opts: &HookOpts) -> Result<(), String> {
             println!("  loaded: yes ({})", target);
             println!("  state: {}", s.state.as_deref().unwrap_or("unknown"));
             println!("  pid: {}", s.pid.as_deref().unwrap_or("-"));
-            println!("  last exit status: {}", s.last_exit.as_deref().unwrap_or("-"));
+            println!(
+                "  last exit status: {}",
+                s.last_exit.as_deref().unwrap_or("-")
+            );
         }
         Err(_) => println!("  loaded: no ({})", target),
     }
@@ -2307,11 +2421,18 @@ fn service_status(_opts: &HookOpts) -> Result<(), String> {
     println!(
         "  plist: {} ({})",
         plist.display(),
-        if plist.is_file() { "present" } else { "missing" }
+        if plist.is_file() {
+            "present"
+        } else {
+            "missing"
+        }
     );
     // Resolve fswatch against the PATH the agent really gets: the one in the installed plist,
     // or, without a plist, the one `service install` would write now.
-    let (agent_path, path_source) = match fs::read_to_string(&plist).ok().and_then(|t| plist_path_env(&t)) {
+    let (agent_path, path_source) = match fs::read_to_string(&plist)
+        .ok()
+        .and_then(|t| plist_path_env(&t))
+    {
         Some(p) => (p, "the plist's PATH"),
         None => (service_path_env(), "the PATH `service install` would write"),
     };
@@ -2413,7 +2534,10 @@ fn service_non_macos(opts: &HookOpts) -> Result<(), String> {
                 "launchd is macOS-only; save the following as {} then run:",
                 unit_path.display()
             );
-            println!("  systemctl --user daemon-reload && systemctl --user enable --now {}", SYSTEMD_UNIT_NAME);
+            println!(
+                "  systemctl --user daemon-reload && systemctl --user enable --now {}",
+                SYSTEMD_UNIT_NAME
+            );
             println!();
             print!("{}", render_systemd_unit(&bin.to_string_lossy(), &home));
         }
@@ -2428,7 +2552,11 @@ fn service_non_macos(opts: &HookOpts) -> Result<(), String> {
             println!(
                 "  unit file: {} ({})",
                 unit_path.display(),
-                if unit_path.is_file() { "present" } else { "missing" }
+                if unit_path.is_file() {
+                    "present"
+                } else {
+                    "missing"
+                }
             );
             print_log_tail("  watch log", &watch_log_path(&home));
         }
@@ -2539,13 +2667,28 @@ mod tests {
                 ]
             }
         });
-        assert_eq!(merge_claude_hooks(&mut doc, BIN).unwrap(), ChangeKind::Updated);
+        assert_eq!(
+            merge_claude_hooks(&mut doc, BIN).unwrap(),
+            ChangeKind::Updated
+        );
         assert_eq!(groups(&doc, "UserPromptSubmit").len(), 1);
         assert_eq!(groups(&doc, "SessionStart").len(), 1);
-        assert_eq!(doc["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"], json!(BIN));
-        assert_eq!(doc["hooks"]["UserPromptSubmit"][0]["hooks"][0]["args"], json!(["recall"]));
-        assert_eq!(doc["hooks"]["SessionStart"][0]["hooks"][0]["args"], json!(["recall", "--reset-session"]));
-        assert_eq!(merge_claude_hooks(&mut doc, BIN).unwrap(), ChangeKind::Unchanged);
+        assert_eq!(
+            doc["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"],
+            json!(BIN)
+        );
+        assert_eq!(
+            doc["hooks"]["UserPromptSubmit"][0]["hooks"][0]["args"],
+            json!(["recall"])
+        );
+        assert_eq!(
+            doc["hooks"]["SessionStart"][0]["hooks"][0]["args"],
+            json!(["recall", "--reset-session"])
+        );
+        assert_eq!(
+            merge_claude_hooks(&mut doc, BIN).unwrap(),
+            ChangeKind::Unchanged
+        );
     }
 
     #[test]
@@ -2568,7 +2711,10 @@ mod tests {
     #[test]
     fn merge_from_null_document_works() {
         let mut doc = Value::Null;
-        assert_eq!(merge_claude_hooks(&mut doc, BIN).unwrap(), ChangeKind::Installed);
+        assert_eq!(
+            merge_claude_hooks(&mut doc, BIN).unwrap(),
+            ChangeKind::Installed
+        );
         assert!(doc.is_object());
         assert!(retrivio_hook_status(&doc).installed());
     }
@@ -2577,7 +2723,10 @@ mod tests {
     fn merge_preserves_unrelated_hooks_and_keys() {
         let original = fixture_settings();
         let mut doc = original.clone();
-        assert_eq!(merge_claude_hooks(&mut doc, BIN).unwrap(), ChangeKind::Installed);
+        assert_eq!(
+            merge_claude_hooks(&mut doc, BIN).unwrap(),
+            ChangeKind::Installed
+        );
 
         // Every non-hook key is untouched.
         for (k, v) in original.as_object().unwrap() {
@@ -2607,7 +2756,10 @@ mod tests {
         let mut doc = fixture_settings();
         merge_claude_hooks(&mut doc, BIN).unwrap();
         let snapshot = doc.clone();
-        assert_eq!(merge_claude_hooks(&mut doc, BIN).unwrap(), ChangeKind::Unchanged);
+        assert_eq!(
+            merge_claude_hooks(&mut doc, BIN).unwrap(),
+            ChangeKind::Unchanged
+        );
         assert_eq!(doc, snapshot);
     }
 
@@ -2616,7 +2768,10 @@ mod tests {
         let mut doc = fixture_settings();
         merge_claude_hooks(&mut doc, BIN).unwrap();
         let ss_before = groups(&doc, "SessionStart").len();
-        assert_eq!(merge_claude_hooks(&mut doc, BIN2).unwrap(), ChangeKind::Updated);
+        assert_eq!(
+            merge_claude_hooks(&mut doc, BIN2).unwrap(),
+            ChangeKind::Updated
+        );
         assert_eq!(groups(&doc, "SessionStart").len(), ss_before);
         assert_eq!(groups(&doc, "UserPromptSubmit").len(), 1);
         let all: Vec<String> = commands(&doc, "UserPromptSubmit")
@@ -2624,7 +2779,11 @@ mod tests {
             .chain(commands(&doc, "SessionStart"))
             .collect();
         assert_eq!(all.iter().filter(|c| c.as_str() == BIN2).count(), 2);
-        assert!(!all.iter().any(|c| c.contains(BIN)), "old bin still referenced: {:?}", all);
+        assert!(
+            !all.iter().any(|c| c.contains(BIN)),
+            "old bin still referenced: {:?}",
+            all
+        );
         assert_eq!(retrivio_hook_status(&doc).bins(), vec![BIN2.to_string()]);
     }
 
@@ -2633,7 +2792,10 @@ mod tests {
         let mut doc = json!({});
         merge_claude_hooks(&mut doc, BIN).unwrap();
         doc["hooks"].as_object_mut().unwrap().remove("SessionStart");
-        assert_eq!(merge_claude_hooks(&mut doc, BIN).unwrap(), ChangeKind::Updated);
+        assert_eq!(
+            merge_claude_hooks(&mut doc, BIN).unwrap(),
+            ChangeKind::Updated
+        );
         assert!(retrivio_hook_status(&doc).installed());
     }
 
@@ -2649,7 +2811,10 @@ mod tests {
                 ]
             }
         });
-        assert_eq!(merge_claude_hooks(&mut doc, BIN).unwrap(), ChangeKind::Updated);
+        assert_eq!(
+            merge_claude_hooks(&mut doc, BIN).unwrap(),
+            ChangeKind::Updated
+        );
         let ss = groups(&doc, "SessionStart");
         assert_eq!(ss.len(), 2);
         assert_eq!(ss[0]["matcher"], json!("compact"));
@@ -2657,7 +2822,10 @@ mod tests {
         assert_eq!(ss[0]["hooks"][0]["command"], json!("/x/foreign.sh"));
         assert_eq!(ss[1]["matcher"], json!("compact|clear"));
         assert_eq!(ss[1]["hooks"][0]["command"], json!(BIN));
-        assert_eq!(ss[1]["hooks"][0]["args"], json!(["recall", "--reset-session"]));
+        assert_eq!(
+            ss[1]["hooks"][0]["args"],
+            json!(["recall", "--reset-session"])
+        );
     }
 
     #[test]
@@ -2669,7 +2837,10 @@ mod tests {
             .as_array_mut()
             .unwrap()
             .push(new_group(None, dup));
-        assert_eq!(merge_claude_hooks(&mut doc, BIN).unwrap(), ChangeKind::Updated);
+        assert_eq!(
+            merge_claude_hooks(&mut doc, BIN).unwrap(),
+            ChangeKind::Updated
+        );
         assert_eq!(commands(&doc, "UserPromptSubmit"), vec![BIN.to_string()]);
     }
 
@@ -2709,7 +2880,10 @@ mod tests {
     #[test]
     fn codex_file_creation_shape() {
         let mut doc = Value::Null;
-        assert_eq!(merge_codex_hooks(&mut doc, BIN).unwrap(), ChangeKind::Installed);
+        assert_eq!(
+            merge_codex_hooks(&mut doc, BIN).unwrap(),
+            ChangeKind::Installed
+        );
         let expected = json!({
             "description": "Retrivio proactive recall hooks",
             "hooks": {
@@ -2728,10 +2902,19 @@ mod tests {
         assert_eq!(doc, expected);
         // Merging into an existing Codex file keeps its description and is idempotent.
         let mut existing = json!({ "description": "mine", "hooks": { "Stop": [ { "hooks": [ { "type": "command", "command": "say hi" } ] } ] } });
-        assert_eq!(merge_codex_hooks(&mut existing, BIN).unwrap(), ChangeKind::Installed);
+        assert_eq!(
+            merge_codex_hooks(&mut existing, BIN).unwrap(),
+            ChangeKind::Installed
+        );
         assert_eq!(existing["description"], json!("mine"));
-        assert_eq!(existing["hooks"]["Stop"][0]["hooks"][0]["command"], json!("say hi"));
-        assert_eq!(merge_codex_hooks(&mut existing, BIN).unwrap(), ChangeKind::Unchanged);
+        assert_eq!(
+            existing["hooks"]["Stop"][0]["hooks"][0]["command"],
+            json!("say hi")
+        );
+        assert_eq!(
+            merge_codex_hooks(&mut existing, BIN).unwrap(),
+            ChangeKind::Unchanged
+        );
     }
 
     #[test]
@@ -2739,7 +2922,10 @@ mod tests {
         let mut doc = Value::Null;
         merge_codex_hooks(&mut doc, BIN).unwrap();
         assert!(remove_retrivio_hooks(&mut doc));
-        assert_eq!(doc, json!({ "description": "Retrivio proactive recall hooks", "hooks": {} }));
+        assert_eq!(
+            doc,
+            json!({ "description": "Retrivio proactive recall hooks", "hooks": {} })
+        );
     }
 
     #[test]
@@ -2750,7 +2936,10 @@ mod tests {
         assert!(st.bins().is_empty());
         let mut doc = json!({});
         merge_claude_hooks(&mut doc, BIN).unwrap();
-        doc["hooks"].as_object_mut().unwrap().remove("UserPromptSubmit");
+        doc["hooks"]
+            .as_object_mut()
+            .unwrap()
+            .remove("UserPromptSubmit");
         let st = retrivio_hook_status(&doc);
         assert!(st.partial());
         assert_eq!(st.bins(), vec![BIN.to_string()]);
@@ -2766,9 +2955,14 @@ mod tests {
         let reset = HookKind::Reset.shell_command(BIN);
         assert_eq!(reset, format!("{} recall --reset-session", BIN));
         assert_eq!(bin_from_command(&reset).as_deref(), Some(BIN));
-        assert_eq!(bin_from_command("\"/a b/retrivio\" recall").as_deref(), Some("/a b/retrivio"));
+        assert_eq!(
+            bin_from_command("\"/a b/retrivio\" recall").as_deref(),
+            Some("/a b/retrivio")
+        );
         assert_eq!(bin_from_command("something else"), None);
-        assert!(!is_retrivio_recall_command("/Users/me/.claude/hooks/context-budget.sh"));
+        assert!(!is_retrivio_recall_command(
+            "/Users/me/.claude/hooks/context-budget.sh"
+        ));
     }
 
     #[test]
@@ -2778,14 +2972,23 @@ mod tests {
         assert!(plist.contains("<string>com.stouffer-labs.retrivio.watch</string>"));
         assert!(plist.contains("<string>/Users/me/bin/retrivio</string>"));
         for arg in ["service", "run"] {
-            assert!(plist.contains(&format!("<string>{}</string>", arg)), "missing {}", arg);
+            assert!(
+                plist.contains(&format!("<string>{}</string>", arg)),
+                "missing {}",
+                arg
+            );
         }
         assert!(!plist.contains("<string>60</string>"));
         assert!(plist.contains("<key>RunAtLoad</key>\n    <true/>"));
         assert!(plist.contains("<key>KeepAlive</key>\n    <true/>"));
         assert!(plist.contains("<key>ThrottleInterval</key>\n    <integer>60</integer>"));
         assert!(plist.contains("<key>ProcessType</key>\n    <string>Background</string>"));
-        assert_eq!(plist.matches("<string>/Users/me/.retrivio/watch.log</string>").count(), 2);
+        assert_eq!(
+            plist
+                .matches("<string>/Users/me/.retrivio/watch.log</string>")
+                .count(),
+            2
+        );
         assert!(plist.contains("<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"));
         assert!(plist.contains("<key>HOME</key>\n        <string>/Users/me</string>"));
         // Special characters are escaped.
@@ -2818,10 +3021,18 @@ mod tests {
         let proxy_shell = json!({ "type": "command", "command": "/x/bin/retrivio-recall-proxy recall", "timeout": 5 });
         let proxy_exec = json!({ "type": "command", "command": "/x/bin/retrivio-recall-proxy", "args": ["recall"] });
         let wrapper = json!({ "type": "command", "command": "/x/hooks/recall.sh retrivio recall" });
-        let extra_args = json!({ "type": "command", "command": BIN, "args": ["recall", "--verbose"] });
+        let extra_args =
+            json!({ "type": "command", "command": BIN, "args": ["recall", "--verbose"] });
         let extra_shell = json!({ "type": "command", "command": format!("{} recall --reset-session --now", BIN) });
         let piped = json!({ "type": "command", "command": format!("{} recall | tee log", BIN) });
-        let foreign: Vec<Value> = vec![proxy_shell, proxy_exec, wrapper, extra_args, extra_shell, piped];
+        let foreign: Vec<Value> = vec![
+            proxy_shell,
+            proxy_exec,
+            wrapper,
+            extra_args,
+            extra_shell,
+            piped,
+        ];
         for e in &foreign {
             assert!(!is_retrivio_entry(e), "{}", e);
             assert!(bin_from_entry(e).is_none(), "{}", e);
@@ -2833,10 +3044,19 @@ mod tests {
             }
         });
         let before = doc.clone();
-        assert_eq!(merge_claude_hooks(&mut doc, BIN).unwrap(), ChangeKind::Installed);
+        assert_eq!(
+            merge_claude_hooks(&mut doc, BIN).unwrap(),
+            ChangeKind::Installed
+        );
         // The foreign groups are untouched; ours were appended as new groups.
-        assert_eq!(doc["hooks"]["UserPromptSubmit"][0], before["hooks"]["UserPromptSubmit"][0]);
-        assert_eq!(doc["hooks"]["SessionStart"][0], before["hooks"]["SessionStart"][0]);
+        assert_eq!(
+            doc["hooks"]["UserPromptSubmit"][0],
+            before["hooks"]["UserPromptSubmit"][0]
+        );
+        assert_eq!(
+            doc["hooks"]["SessionStart"][0],
+            before["hooks"]["SessionStart"][0]
+        );
         assert_eq!(groups(&doc, "UserPromptSubmit").len(), 2);
         assert_eq!(groups(&doc, "SessionStart").len(), 2);
         assert_eq!(retrivio_hook_status(&doc).bins(), vec![BIN.to_string()]);
@@ -2848,25 +3068,60 @@ mod tests {
 
     #[test]
     fn ownership_matches_exact_generated_forms_only() {
-        assert!(is_retrivio_entry(&json!({ "type": "command", "command": "retrivio", "args": ["recall"] })));
-        assert!(is_retrivio_entry(&json!({ "type": "command", "command": BIN, "args": ["recall", "--reset-session"] })));
-        assert!(is_retrivio_entry(&json!({ "type": "command", "command": "retrivio recall" })));
-        assert!(is_retrivio_entry(&json!({ "type": "command", "command": format!("  {}   recall   --reset-session  ", BIN) })));
-        assert!(is_retrivio_entry(&json!({ "type": "command", "command": "'/Users/me/My Apps/retrivio' recall" })));
-        assert!(is_retrivio_entry(&json!({ "type": "command", "command": "\"/a b/retrivio\" recall" })));
-        assert!(!is_retrivio_entry(&json!({ "type": "command", "command": BIN, "args": ["recall", 1] })));
-        assert!(!is_retrivio_entry(&json!({ "type": "command", "command": BIN, "args": "recall" })));
-        assert!(!is_retrivio_entry(&json!({ "type": "command", "command": BIN, "args": [] })));
-        assert!(!is_retrivio_entry(&json!({ "type": "command", "command": BIN })));
-        assert!(!is_retrivio_entry(&json!({ "type": "command", "command": "/x/Retrivio recall" })));
-        assert!(!is_retrivio_entry(&json!({ "type": "command", "command": "/x/retrivio.sh recall" })));
-        assert!(!is_retrivio_entry(&json!({ "type": "command", "command": "'/x/retrivio'recall" })));
+        assert!(is_retrivio_entry(
+            &json!({ "type": "command", "command": "retrivio", "args": ["recall"] })
+        ));
+        assert!(is_retrivio_entry(
+            &json!({ "type": "command", "command": BIN, "args": ["recall", "--reset-session"] })
+        ));
+        assert!(is_retrivio_entry(
+            &json!({ "type": "command", "command": "retrivio recall" })
+        ));
+        assert!(is_retrivio_entry(
+            &json!({ "type": "command", "command": format!("  {}   recall   --reset-session  ", BIN) })
+        ));
+        assert!(is_retrivio_entry(
+            &json!({ "type": "command", "command": "'/Users/me/My Apps/retrivio' recall" })
+        ));
+        assert!(is_retrivio_entry(
+            &json!({ "type": "command", "command": "\"/a b/retrivio\" recall" })
+        ));
+        assert!(!is_retrivio_entry(
+            &json!({ "type": "command", "command": BIN, "args": ["recall", 1] })
+        ));
+        assert!(!is_retrivio_entry(
+            &json!({ "type": "command", "command": BIN, "args": "recall" })
+        ));
+        assert!(!is_retrivio_entry(
+            &json!({ "type": "command", "command": BIN, "args": [] })
+        ));
+        assert!(!is_retrivio_entry(
+            &json!({ "type": "command", "command": BIN })
+        ));
+        assert!(!is_retrivio_entry(
+            &json!({ "type": "command", "command": "/x/Retrivio recall" })
+        ));
+        assert!(!is_retrivio_entry(
+            &json!({ "type": "command", "command": "/x/retrivio.sh recall" })
+        ));
+        assert!(!is_retrivio_entry(
+            &json!({ "type": "command", "command": "'/x/retrivio'recall" })
+        ));
         assert!(!is_retrivio_entry(&json!({ "type": "command" })));
-        assert_eq!(bin_from_command("'/a'\\''b/retrivio' recall").as_deref(), Some("/a'b/retrivio"));
+        assert_eq!(
+            bin_from_command("'/a'\\''b/retrivio' recall").as_deref(),
+            Some("/a'b/retrivio")
+        );
         assert_eq!(bin_from_command("'/unterminated/retrivio recall"), None);
-        assert_eq!(bin_from_command("retrivio recall"), Some("retrivio".to_string()));
+        assert_eq!(
+            bin_from_command("retrivio recall"),
+            Some("retrivio".to_string())
+        );
         assert_eq!(bin_from_command("retrivio recall now"), None);
-        assert_eq!(split_first_token("  a b").map(|(t, r)| (t, r.to_string())), Some(("a".to_string(), " b".to_string())));
+        assert_eq!(
+            split_first_token("  a b").map(|(t, r)| (t, r.to_string())),
+            Some(("a".to_string(), " b".to_string()))
+        );
         assert_eq!(split_first_token(""), None);
     }
 
@@ -2887,31 +3142,54 @@ mod tests {
         let dir = scratch("atomic");
         let file = dir.join("settings.json");
         let mut backed_up = false;
-        assert_eq!(write_json_atomic(&file, &json!({ "a": 1 }), &mut backed_up).unwrap(), None);
+        assert_eq!(
+            write_json_atomic(&file, &json!({ "a": 1 }), &mut backed_up).unwrap(),
+            None
+        );
         assert!(!backed_up);
         assert_eq!(fs::read_to_string(&file).unwrap(), "{\n  \"a\": 1\n}\n");
         #[cfg(unix)]
-        assert_eq!(fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600, "new files are private");
+        assert_eq!(
+            fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "new files are private"
+        );
         #[cfg(unix)]
         fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
-        let bak = write_json_atomic(&file, &json!({ "a": 2 }), &mut backed_up).unwrap().unwrap();
+        let bak = write_json_atomic(&file, &json!({ "a": 2 }), &mut backed_up)
+            .unwrap()
+            .unwrap();
         assert!(backed_up);
         assert_eq!(bak, backup_path(&file));
         assert_eq!(fs::read_to_string(&bak).unwrap(), "{\n  \"a\": 1\n}\n");
         assert_eq!(fs::read_to_string(&file).unwrap(), "{\n  \"a\": 2\n}\n");
         #[cfg(unix)]
         {
-            assert_eq!(fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o644, "existing mode preserved");
-            assert_eq!(fs::metadata(&bak).unwrap().permissions().mode() & 0o777, 0o644);
+            assert_eq!(
+                fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+                0o644,
+                "existing mode preserved"
+            );
+            assert_eq!(
+                fs::metadata(&bak).unwrap().permissions().mode() & 0o777,
+                0o644
+            );
         }
         // A second write in the same run does not overwrite the backup.
-        assert_eq!(write_json_atomic(&file, &json!({ "a": 3 }), &mut backed_up).unwrap(), None);
+        assert_eq!(
+            write_json_atomic(&file, &json!({ "a": 3 }), &mut backed_up).unwrap(),
+            None
+        );
         assert_eq!(fs::read_to_string(&bak).unwrap(), "{\n  \"a\": 1\n}\n");
         let names: Vec<String> = fs::read_dir(&dir)
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
             .collect();
-        assert!(names.iter().all(|n| !n.contains("tmp-retrivio")), "{:?}", names);
+        assert!(
+            names.iter().all(|n| !n.contains("tmp-retrivio")),
+            "{:?}",
+            names
+        );
         assert_ne!(random_suffix(), random_suffix());
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2926,9 +3204,20 @@ mod tests {
         let link = dir.join("settings.json");
         symlink(&real, &link).unwrap();
         let mut backed_up = false;
-        let bak = write_json_atomic(&link, &json!({ "via": "link" }), &mut backed_up).unwrap().unwrap();
-        assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink(), "link stays a link");
-        assert_eq!(fs::read_to_string(&real).unwrap(), "{\n  \"via\": \"link\"\n}\n");
+        let bak = write_json_atomic(&link, &json!({ "via": "link" }), &mut backed_up)
+            .unwrap()
+            .unwrap();
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "link stays a link"
+        );
+        assert_eq!(
+            fs::read_to_string(&real).unwrap(),
+            "{\n  \"via\": \"link\"\n}\n"
+        );
         assert_eq!(bak, backup_path(&fs::canonicalize(&real).unwrap()));
         assert_eq!(fs::read_to_string(&bak).unwrap(), "{}\n");
         // Symlink to a directory: refused, nothing written.
@@ -2960,7 +3249,9 @@ mod tests {
         // An existing regular backup is replaced.
         fs::remove_file(backup_path(&cfg)).unwrap();
         fs::write(backup_path(&cfg), "old backup\n").unwrap();
-        let bak = write_json_atomic(&cfg, &json!({ "keep": false }), &mut false).unwrap().unwrap();
+        let bak = write_json_atomic(&cfg, &json!({ "keep": false }), &mut false)
+            .unwrap()
+            .unwrap();
         assert_eq!(fs::read_to_string(&bak).unwrap(), "{\"keep\":true}\n");
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2973,7 +3264,14 @@ mod tests {
 
     /// One `hooks/list` entry shaped like the real reply; `matcher` is what we write for the
     /// event, `command` is taken verbatim.
-    fn codex_hook(key: &str, event: &str, command: &str, source_path: &str, status: &str, hash: &str) -> Value {
+    fn codex_hook(
+        key: &str,
+        event: &str,
+        command: &str,
+        source_path: &str,
+        status: &str,
+        hash: &str,
+    ) -> Value {
         json!({
             "key": key,
             "eventName": event,
@@ -3001,11 +3299,25 @@ mod tests {
 
     /// Exactly what `hook install` writes for BIN, as the app-server lists it.
     fn our_prompt(status: &str, hash: &str) -> Value {
-        codex_hook(K_PROMPT, "userPromptSubmit", &format!("{} recall", BIN), CODEX_HOOKS_JSON, status, hash)
+        codex_hook(
+            K_PROMPT,
+            "userPromptSubmit",
+            &format!("{} recall", BIN),
+            CODEX_HOOKS_JSON,
+            status,
+            hash,
+        )
     }
 
     fn our_reset(status: &str, hash: &str) -> Value {
-        codex_hook(K_RESET, "sessionStart", &format!("{} recall --reset-session", BIN), CODEX_HOOKS_JSON, status, hash)
+        codex_hook(
+            K_RESET,
+            "sessionStart",
+            &format!("{} recall --reset-session", BIN),
+            CODEX_HOOKS_JSON,
+            status,
+            hash,
+        )
     }
 
     /// Shaped like a real `hooks/list` result: ours (one untrusted, one modified), a managed
@@ -3015,14 +3327,38 @@ mod tests {
         hooks_list(vec![
             our_prompt("untrusted", "sha256:aaa"),
             our_reset("modified", "sha256:bbb"),
-            codex_hook("/etc/codex/managed_hooks.json:user_prompt_submit:0:0", "userPromptSubmit",
-                "/opt/corp/audit --prompt", "/etc/codex/managed_hooks.json", "managed", "sha256:ccc"),
-            codex_hook("/Users/me/.codex/hooks.json:user_prompt_submit:1:0", "userPromptSubmit",
-                "/Users/me/bin/my-own-hook.sh", CODEX_HOOKS_JSON, "untrusted", "sha256:ddd"),
-            codex_hook("/Users/me/proj/.codex/hooks.json:user_prompt_submit:0:0", "userPromptSubmit",
-                &format!("{} recall", BIN), "/Users/me/proj/.codex/hooks.json", "untrusted", "sha256:eee"),
-            codex_hook("/Users/me/.codex/hooks.json:stop:0:0", "stop",
-                &format!("{} recall", BIN), CODEX_HOOKS_JSON, "untrusted", "sha256:fff"),
+            codex_hook(
+                "/etc/codex/managed_hooks.json:user_prompt_submit:0:0",
+                "userPromptSubmit",
+                "/opt/corp/audit --prompt",
+                "/etc/codex/managed_hooks.json",
+                "managed",
+                "sha256:ccc",
+            ),
+            codex_hook(
+                "/Users/me/.codex/hooks.json:user_prompt_submit:1:0",
+                "userPromptSubmit",
+                "/Users/me/bin/my-own-hook.sh",
+                CODEX_HOOKS_JSON,
+                "untrusted",
+                "sha256:ddd",
+            ),
+            codex_hook(
+                "/Users/me/proj/.codex/hooks.json:user_prompt_submit:0:0",
+                "userPromptSubmit",
+                &format!("{} recall", BIN),
+                "/Users/me/proj/.codex/hooks.json",
+                "untrusted",
+                "sha256:eee",
+            ),
+            codex_hook(
+                "/Users/me/.codex/hooks.json:stop:0:0",
+                "stop",
+                &format!("{} recall", BIN),
+                CODEX_HOOKS_JSON,
+                "untrusted",
+                "sha256:fff",
+            ),
         ])
     }
 
@@ -3041,8 +3377,14 @@ mod tests {
         assert_eq!(req["id"], 1);
         assert_eq!(req["method"], "initialize");
         assert_eq!(req["params"]["clientInfo"]["name"], "retrivio");
-        assert_eq!(req["params"]["clientInfo"]["version"], env!("CARGO_PKG_VERSION"));
-        assert_eq!(req["params"]["clientInfo"]["title"], "retrivio hook install");
+        assert_eq!(
+            req["params"]["clientInfo"]["version"],
+            env!("CARGO_PKG_VERSION")
+        );
+        assert_eq!(
+            req["params"]["clientInfo"]["title"],
+            "retrivio hook install"
+        );
         assert_eq!(req["params"]["capabilities"]["experimentalApi"], true);
         let note = build_initialized_notification();
         assert_eq!(note["method"], "initialized");
@@ -3069,21 +3411,48 @@ mod tests {
         assert_eq!(sel.pending[0].event_name, "userPromptSubmit");
         assert_eq!(sel.pending[1].current_hash, "sha256:bbb");
         // Path comparison is by components, so a trailing slash in the home does not matter.
-        let via_join = PathBuf::from("/Users/me/").join(".codex").join("hooks.json");
-        assert_eq!(select_untrusted_retrivio_hooks(&fixture_hooks_list(), &via_join, BIN).pending.len(), 2);
+        let via_join = PathBuf::from("/Users/me/")
+            .join(".codex")
+            .join("hooks.json");
+        assert_eq!(
+            select_untrusted_retrivio_hooks(&fixture_hooks_list(), &via_join, BIN)
+                .pending
+                .len(),
+            2
+        );
         // Another user's hooks.json, or hooks for a binary other than the one we install: none.
-        assert!(select_untrusted_retrivio_hooks(&fixture_hooks_list(), Path::new("/Users/other/.codex/hooks.json"), BIN).pending.is_empty());
-        assert!(select_untrusted_retrivio_hooks(&fixture_hooks_list(), hooks_json, BIN2).pending.is_empty());
+        assert!(select_untrusted_retrivio_hooks(
+            &fixture_hooks_list(),
+            Path::new("/Users/other/.codex/hooks.json"),
+            BIN
+        )
+        .pending
+        .is_empty());
+        assert!(
+            select_untrusted_retrivio_hooks(&fixture_hooks_list(), hooks_json, BIN2)
+                .pending
+                .is_empty()
+        );
         assert!(retrivio_codex_hooks(&fixture_hooks_list(), hooks_json, BIN2).is_empty());
         // Already trusted: nothing pending and no warning, but still reported as ours.
-        let trusted = hooks_list(vec![our_prompt("trusted", "sha256:aaa"), our_reset("trusted", "sha256:bbb")]);
+        let trusted = hooks_list(vec![
+            our_prompt("trusted", "sha256:aaa"),
+            our_reset("trusted", "sha256:bbb"),
+        ]);
         let sel = select_untrusted_retrivio_hooks(&trusted, hooks_json, BIN);
         assert!(sel.pending.is_empty() && sel.warnings.is_empty());
         assert_eq!(retrivio_codex_hooks(&trusted, hooks_json, BIN).len(), 2);
         // Malformed replies select nothing rather than panicking.
-        assert_eq!(select_untrusted_retrivio_hooks(&json!({}), hooks_json, BIN), TrustSelection::default());
         assert_eq!(
-            select_untrusted_retrivio_hooks(&json!({ "data": [{ "hooks": [{ "key": 1 }] }] }), hooks_json, BIN),
+            select_untrusted_retrivio_hooks(&json!({}), hooks_json, BIN),
+            TrustSelection::default()
+        );
+        assert_eq!(
+            select_untrusted_retrivio_hooks(
+                &json!({ "data": [{ "hooks": [{ "key": 1 }] }] }),
+                hooks_json,
+                BIN
+            ),
             TrustSelection::default()
         );
     }
@@ -3091,32 +3460,89 @@ mod tests {
     /// Every deviation from the exact generated form is somebody else's hook: never trusted.
     #[test]
     fn select_untrusted_rejects_everything_but_the_exact_generated_forms() {
-        let prompt = |command: &str| codex_hook(K_PROMPT, "userPromptSubmit", command, CODEX_HOOKS_JSON, "untrusted", "sha256:aaa");
-        let reset = |command: &str| codex_hook(K_RESET, "sessionStart", command, CODEX_HOOKS_JSON, "untrusted", "sha256:bbb");
+        let prompt = |command: &str| {
+            codex_hook(
+                K_PROMPT,
+                "userPromptSubmit",
+                command,
+                CODEX_HOOKS_JSON,
+                "untrusted",
+                "sha256:aaa",
+            )
+        };
+        let reset = |command: &str| {
+            codex_hook(
+                K_RESET,
+                "sessionStart",
+                command,
+                CODEX_HOOKS_JSON,
+                "untrusted",
+                "sha256:bbb",
+            )
+        };
         let exact_prompt = format!("{} recall", BIN);
         let exact_reset = format!("{} recall --reset-session", BIN);
         // Baseline: the two exact forms are selected.
         assert_eq!(select_one(prompt(&exact_prompt), BIN).pending.len(), 1);
         assert_eq!(select_one(reset(&exact_reset), BIN).pending.len(), 1);
         // Another binary named retrivio.
-        assert!(select_one(prompt("/tmp/retrivio recall"), BIN).pending.is_empty());
-        assert!(select_one(prompt("retrivio recall"), BIN).pending.is_empty());
+        assert!(select_one(prompt("/tmp/retrivio recall"), BIN)
+            .pending
+            .is_empty());
+        assert!(select_one(prompt("retrivio recall"), BIN)
+            .pending
+            .is_empty());
         // A chained command whose first token is our binary, in either position.
-        assert!(select_one(prompt("/known/retrivio;/tmp/retrivio recall"), "/known/retrivio").pending.is_empty());
-        assert!(select_one(prompt("/known/retrivio recall; /tmp/retrivio recall"), "/known/retrivio").pending.is_empty());
-        assert!(select_one(prompt("/known/retrivio recall && rm -rf ~"), "/known/retrivio").pending.is_empty());
-        assert!(select_one(prompt("/known/retrivio recall $(id)"), "/known/retrivio").pending.is_empty());
+        assert!(select_one(
+            prompt("/known/retrivio;/tmp/retrivio recall"),
+            "/known/retrivio"
+        )
+        .pending
+        .is_empty());
+        assert!(select_one(
+            prompt("/known/retrivio recall; /tmp/retrivio recall"),
+            "/known/retrivio"
+        )
+        .pending
+        .is_empty());
+        assert!(select_one(
+            prompt("/known/retrivio recall && rm -rf ~"),
+            "/known/retrivio"
+        )
+        .pending
+        .is_empty());
+        assert!(
+            select_one(prompt("/known/retrivio recall $(id)"), "/known/retrivio")
+                .pending
+                .is_empty()
+        );
         // The reset command on userPromptSubmit, the plain one on sessionStart, extra or
         // repeated arguments, and quoting or spacing we would not write.
         assert!(select_one(prompt(&exact_reset), BIN).pending.is_empty());
         assert!(select_one(reset(&exact_prompt), BIN).pending.is_empty());
-        assert!(select_one(prompt(&format!("{} recall --verbose", BIN)), BIN).pending.is_empty());
-        assert!(select_one(prompt(&format!("{} recall recall", BIN)), BIN).pending.is_empty());
-        assert!(select_one(prompt(&format!("'{}' recall", BIN)), BIN).pending.is_empty());
-        assert!(select_one(prompt(&format!("\"{}\" recall", BIN)), BIN).pending.is_empty());
-        assert!(select_one(prompt(&format!("{}  recall", BIN)), BIN).pending.is_empty());
-        assert!(select_one(prompt(&format!("{} recall ", BIN)), BIN).pending.is_empty());
-        assert!(select_one(prompt(&format!(" {} recall", BIN)), BIN).pending.is_empty());
+        assert!(
+            select_one(prompt(&format!("{} recall --verbose", BIN)), BIN)
+                .pending
+                .is_empty()
+        );
+        assert!(select_one(prompt(&format!("{} recall recall", BIN)), BIN)
+            .pending
+            .is_empty());
+        assert!(select_one(prompt(&format!("'{}' recall", BIN)), BIN)
+            .pending
+            .is_empty());
+        assert!(select_one(prompt(&format!("\"{}\" recall", BIN)), BIN)
+            .pending
+            .is_empty());
+        assert!(select_one(prompt(&format!("{}  recall", BIN)), BIN)
+            .pending
+            .is_empty());
+        assert!(select_one(prompt(&format!("{} recall ", BIN)), BIN)
+            .pending
+            .is_empty());
+        assert!(select_one(prompt(&format!(" {} recall", BIN)), BIN)
+            .pending
+            .is_empty());
         // Matcher mismatch in either direction.
         let mut h = prompt(&exact_prompt);
         h["matcher"] = json!("compact|clear");
@@ -3159,20 +3585,47 @@ mod tests {
         assert!(select_one(h, BIN).pending.is_empty());
         // Fields the app-server may omit are fine when they are absent rather than wrong.
         let mut h = prompt(&exact_prompt);
-        for optional in ["async", "pluginId", "handlerType", "matcher", "statusMessage"] {
+        for optional in [
+            "async",
+            "pluginId",
+            "handlerType",
+            "matcher",
+            "statusMessage",
+        ] {
             h.as_object_mut().unwrap().remove(optional);
         }
         assert_eq!(select_one(h, BIN).pending.len(), 1);
         // Our own quoting of an unusual path is byte-exact and accepted; the unquoted form is not.
         let spaced = "/Users/me/My Tools/retrivio";
-        let quoted = codex_hook(K_PROMPT, "userPromptSubmit", &format!("'{}' recall", spaced), CODEX_HOOKS_JSON, "untrusted", "sha256:aaa");
+        let quoted = codex_hook(
+            K_PROMPT,
+            "userPromptSubmit",
+            &format!("'{}' recall", spaced),
+            CODEX_HOOKS_JSON,
+            "untrusted",
+            "sha256:aaa",
+        );
         assert_eq!(select_one(quoted, spaced).pending.len(), 1);
-        let unquoted = codex_hook(K_PROMPT, "userPromptSubmit", &format!("{} recall", spaced), CODEX_HOOKS_JSON, "untrusted", "sha256:aaa");
+        let unquoted = codex_hook(
+            K_PROMPT,
+            "userPromptSubmit",
+            &format!("{} recall", spaced),
+            CODEX_HOOKS_JSON,
+            "untrusted",
+            "sha256:aaa",
+        );
         assert!(select_one(unquoted, spaced).pending.is_empty());
         // A binary path that itself carries a shell metacharacter is quoted by shell_quote when
         // installed, but never auto-trusted.
         let odd = "/Users/me/a;b/retrivio";
-        let odd_hook = codex_hook(K_PROMPT, "userPromptSubmit", &HookKind::Prompt.shell_command(odd), CODEX_HOOKS_JSON, "untrusted", "sha256:aaa");
+        let odd_hook = codex_hook(
+            K_PROMPT,
+            "userPromptSubmit",
+            &HookKind::Prompt.shell_command(odd),
+            CODEX_HOOKS_JSON,
+            "untrusted",
+            "sha256:aaa",
+        );
         assert!(select_one(odd_hook, odd).pending.is_empty());
     }
 
@@ -3183,10 +3636,21 @@ mod tests {
         let list = hooks_list(vec![
             our_prompt("untrusted", "sha256:aaa"),
             our_reset("modified", "sha256:bbb"),
-            codex_hook(dup_key, "sessionStart", &format!("{} recall --reset-session", BIN), CODEX_HOOKS_JSON, "trusted", "sha256:ggg"),
+            codex_hook(
+                dup_key,
+                "sessionStart",
+                &format!("{} recall --reset-session", BIN),
+                CODEX_HOOKS_JSON,
+                "trusted",
+                "sha256:ggg",
+            ),
         ]);
         let sel = select_untrusted_retrivio_hooks(&list, hooks_json, BIN);
-        assert_eq!(selected_keys(&sel), vec![K_PROMPT], "the unambiguous event is still selected");
+        assert_eq!(
+            selected_keys(&sel),
+            vec![K_PROMPT],
+            "the unambiguous event is still selected"
+        );
         assert_eq!(sel.warnings.len(), 1);
         let w = &sel.warnings[0];
         assert!(w.starts_with("sessionStart:"), "{}", w);
@@ -3194,19 +3658,43 @@ mod tests {
         // Both events duplicated: nothing selected at all, two warnings.
         let list = hooks_list(vec![
             our_prompt("untrusted", "sha256:aaa"),
-            codex_hook("/Users/me/.codex/hooks.json:user_prompt_submit:2:0", "userPromptSubmit",
-                &format!("{} recall", BIN), CODEX_HOOKS_JSON, "untrusted", "sha256:hhh"),
+            codex_hook(
+                "/Users/me/.codex/hooks.json:user_prompt_submit:2:0",
+                "userPromptSubmit",
+                &format!("{} recall", BIN),
+                CODEX_HOOKS_JSON,
+                "untrusted",
+                "sha256:hhh",
+            ),
             our_reset("untrusted", "sha256:bbb"),
-            codex_hook(dup_key, "sessionStart", &format!("{} recall --reset-session", BIN), CODEX_HOOKS_JSON, "untrusted", "sha256:ggg"),
+            codex_hook(
+                dup_key,
+                "sessionStart",
+                &format!("{} recall --reset-session", BIN),
+                CODEX_HOOKS_JSON,
+                "untrusted",
+                "sha256:ggg",
+            ),
         ]);
         let sel = select_untrusted_retrivio_hooks(&list, hooks_json, BIN);
         assert!(sel.pending.is_empty());
         assert_eq!(sel.warnings.len(), 2);
-        assert!(sel.warnings[0].starts_with("userPromptSubmit:"), "{}", sel.warnings[0]);
+        assert!(
+            sel.warnings[0].starts_with("userPromptSubmit:"),
+            "{}",
+            sel.warnings[0]
+        );
         // A second hook for the same event that is NOT ours (other binary) is not a duplicate.
         let list = hooks_list(vec![
             our_reset("untrusted", "sha256:bbb"),
-            codex_hook(dup_key, "sessionStart", &format!("{} recall --reset-session", BIN2), CODEX_HOOKS_JSON, "untrusted", "sha256:ggg"),
+            codex_hook(
+                dup_key,
+                "sessionStart",
+                &format!("{} recall --reset-session", BIN2),
+                CODEX_HOOKS_JSON,
+                "untrusted",
+                "sha256:ggg",
+            ),
         ]);
         let sel = select_untrusted_retrivio_hooks(&list, hooks_json, BIN);
         assert_eq!(selected_keys(&sel), vec![K_RESET]);
@@ -3223,18 +3711,34 @@ mod tests {
     #[test]
     fn retrivio_codex_hooks_reports_status_and_dedupes_across_cwds() {
         let ours = retrivio_codex_hooks(&fixture_hooks_list(), Path::new(CODEX_HOOKS_JSON), BIN);
-        let summary: Vec<(&str, &str)> = ours.iter().map(|h| (h.event_name.as_str(), h.trust_status.as_str())).collect();
-        assert_eq!(summary, vec![("userPromptSubmit", "untrusted"), ("sessionStart", "modified")]);
+        let summary: Vec<(&str, &str)> = ours
+            .iter()
+            .map(|h| (h.event_name.as_str(), h.trust_status.as_str()))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("userPromptSubmit", "untrusted"),
+                ("sessionStart", "modified")
+            ]
+        );
         // The same hook listed under two cwds appears once.
         let mut doubled = fixture_hooks_list();
         let entry = doubled["data"][0].clone();
         doubled["data"].as_array_mut().unwrap().push(entry);
-        assert_eq!(retrivio_codex_hooks(&doubled, Path::new(CODEX_HOOKS_JSON), BIN).len(), 2);
+        assert_eq!(
+            retrivio_codex_hooks(&doubled, Path::new(CODEX_HOOKS_JSON), BIN).len(),
+            2
+        );
     }
 
     #[test]
     fn trust_write_request_upserts_hooks_state() {
-        let sel = select_untrusted_retrivio_hooks(&fixture_hooks_list(), Path::new(CODEX_HOOKS_JSON), BIN);
+        let sel = select_untrusted_retrivio_hooks(
+            &fixture_hooks_list(),
+            Path::new(CODEX_HOOKS_JSON),
+            BIN,
+        );
         let req = build_trust_write_request(3, &sel.pending);
         assert_eq!(req["id"], 3);
         assert_eq!(req["method"], "config/batchWrite");
@@ -3255,52 +3759,105 @@ mod tests {
     #[test]
     fn verify_trusted_hooks_confirms_by_identity_not_by_key() {
         use TrustVerification::*;
-        let pending = select_untrusted_retrivio_hooks(&fixture_hooks_list(), Path::new(CODEX_HOOKS_JSON), BIN).pending;
+        let pending = select_untrusted_retrivio_hooks(
+            &fixture_hooks_list(),
+            Path::new(CODEX_HOOKS_JSON),
+            BIN,
+        )
+        .pending;
         assert_eq!(pending.len(), 2);
         let outcomes = |relisted: &Value| -> Vec<TrustVerification> {
-            verify_trusted_hooks(relisted, &pending).into_iter().map(|(_, o)| o).collect()
+            verify_trusted_hooks(relisted, &pending)
+                .into_iter()
+                .map(|(_, o)| o)
+                .collect()
         };
         // Same key, hash, source path and event, now trusted: confirmed.
-        let relisted = hooks_list(vec![our_prompt("trusted", "sha256:aaa"), our_reset("trusted", "sha256:bbb")]);
+        let relisted = hooks_list(vec![
+            our_prompt("trusted", "sha256:aaa"),
+            our_reset("trusted", "sha256:bbb"),
+        ]);
         assert_eq!(outcomes(&relisted), vec![Confirmed, Confirmed]);
         // Identity intact but Codex still reports another status.
-        let relisted = hooks_list(vec![our_prompt("trusted", "sha256:aaa"), our_reset("modified", "sha256:bbb")]);
-        assert_eq!(outcomes(&relisted), vec![Confirmed, NotTrusted("modified".to_string())]);
+        let relisted = hooks_list(vec![
+            our_prompt("trusted", "sha256:aaa"),
+            our_reset("modified", "sha256:bbb"),
+        ]);
+        assert_eq!(
+            outcomes(&relisted),
+            vec![Confirmed, NotTrusted("modified".to_string())]
+        );
         // The hash changed between list and re-list (hooks.json edited meanwhile): the key alone
         // is not enough, even though Codex now says trusted.
-        let relisted = hooks_list(vec![our_prompt("trusted", "sha256:aaa"), our_reset("trusted", "sha256:zzz")]);
+        let relisted = hooks_list(vec![
+            our_prompt("trusted", "sha256:aaa"),
+            our_reset("trusted", "sha256:zzz"),
+        ]);
         assert_eq!(outcomes(&relisted), vec![Confirmed, DefinitionChanged]);
         // Same key and hash but another source path or event: also a changed definition.
         let mut moved = our_reset("trusted", "sha256:bbb");
         moved["sourcePath"] = json!("/Users/me/proj/.codex/hooks.json");
-        assert_eq!(outcomes(&hooks_list(vec![our_prompt("trusted", "sha256:aaa"), moved])), vec![Confirmed, DefinitionChanged]);
+        assert_eq!(
+            outcomes(&hooks_list(vec![
+                our_prompt("trusted", "sha256:aaa"),
+                moved
+            ])),
+            vec![Confirmed, DefinitionChanged]
+        );
         let mut renamed = our_reset("trusted", "sha256:bbb");
         renamed["eventName"] = json!("stop");
-        assert_eq!(outcomes(&hooks_list(vec![our_prompt("trusted", "sha256:aaa"), renamed])), vec![Confirmed, DefinitionChanged]);
+        assert_eq!(
+            outcomes(&hooks_list(vec![
+                our_prompt("trusted", "sha256:aaa"),
+                renamed
+            ])),
+            vec![Confirmed, DefinitionChanged]
+        );
         // Listed twice (two cwds), one of them identical: confirmed.
-        let relisted = hooks_list(vec![our_prompt("trusted", "sha256:aaa"), our_reset("trusted", "sha256:bbb"), our_reset("trusted", "sha256:bbb")]);
+        let relisted = hooks_list(vec![
+            our_prompt("trusted", "sha256:aaa"),
+            our_reset("trusted", "sha256:bbb"),
+            our_reset("trusted", "sha256:bbb"),
+        ]);
         assert_eq!(outcomes(&relisted), vec![Confirmed, Confirmed]);
         // Gone entirely.
         let relisted = hooks_list(vec![our_prompt("trusted", "sha256:aaa")]);
         assert_eq!(outcomes(&relisted), vec![Confirmed, NotListed]);
         assert_eq!(outcomes(&json!({})), vec![NotListed, NotListed]);
         // The verified hooks are handed back so the caller can name the event.
-        assert_eq!(verify_trusted_hooks(&relisted, &pending)[1].0.event_name, "sessionStart");
+        assert_eq!(
+            verify_trusted_hooks(&relisted, &pending)[1].0.event_name,
+            "sessionStart"
+        );
     }
 
     #[test]
     fn match_response_skips_notifications_other_ids_and_server_requests() {
-        assert!(match_response(&json!({ "method": "remoteControl/status/changed", "params": {} }), 1).is_none());
+        assert!(match_response(
+            &json!({ "method": "remoteControl/status/changed", "params": {} }),
+            1
+        )
+        .is_none());
         assert!(match_response(&json!({ "id": 2, "result": {} }), 1).is_none());
         // A server-to-client request carries both id and method: not our reply even if the id collides.
-        assert!(match_response(&json!({ "id": 1, "method": "item/commandExecution/requestApproval", "params": {} }), 1).is_none());
+        assert!(match_response(
+            &json!({ "id": 1, "method": "item/commandExecution/requestApproval", "params": {} }),
+            1
+        )
+        .is_none());
         assert!(match_response(&json!("not an object"), 1).is_none());
         assert_eq!(
-            match_response(&json!({ "id": 1, "result": { "codexHome": "/Users/me/.codex" } }), 1),
+            match_response(
+                &json!({ "id": 1, "result": { "codexHome": "/Users/me/.codex" } }),
+                1
+            ),
             Some(Ok(json!({ "codexHome": "/Users/me/.codex" })))
         );
         assert_eq!(
-            match_response(&json!({ "id": 1, "error": { "code": -32601, "message": "method not found" } }), 1),
+            match_response(
+                &json!({ "id": 1, "error": { "code": -32601, "message": "method not found" } }),
+                1
+            ),
             Some(Err("method not found (code -32601)".to_string()))
         );
         assert_eq!(
@@ -3312,19 +3869,43 @@ mod tests {
     #[test]
     fn codex_dir_honours_codex_home_unless_retrivio_home_is_set() {
         let home = Path::new("/Users/me");
-        assert_eq!(codex_dir(home, None, None), PathBuf::from("/Users/me/.codex"));
-        assert_eq!(codex_dir(home, Some(""), None), PathBuf::from("/Users/me/.codex"));
-        assert_eq!(codex_dir(home, Some("   "), None), PathBuf::from("/Users/me/.codex"));
-        assert_eq!(codex_dir(home, Some("/Volumes/work/codex-home"), None), PathBuf::from("/Volumes/work/codex-home"));
-        assert_eq!(codex_dir(home, Some(" /Volumes/work/codex-home "), None), PathBuf::from("/Volumes/work/codex-home"));
+        assert_eq!(
+            codex_dir(home, None, None),
+            PathBuf::from("/Users/me/.codex")
+        );
+        assert_eq!(
+            codex_dir(home, Some(""), None),
+            PathBuf::from("/Users/me/.codex")
+        );
+        assert_eq!(
+            codex_dir(home, Some("   "), None),
+            PathBuf::from("/Users/me/.codex")
+        );
+        assert_eq!(
+            codex_dir(home, Some("/Volumes/work/codex-home"), None),
+            PathBuf::from("/Volumes/work/codex-home")
+        );
+        assert_eq!(
+            codex_dir(home, Some(" /Volumes/work/codex-home "), None),
+            PathBuf::from("/Volumes/work/codex-home")
+        );
         // A scratch RETRIVIO_HOME wins (home is already the scratch directory then).
         let scratch = Path::new("/Users/me/proj/tmp/scratch-home2");
         let rh = scratch.to_str();
-        assert_eq!(codex_dir(scratch, Some("/Volumes/work/codex-home"), rh), scratch.join(".codex"));
+        assert_eq!(
+            codex_dir(scratch, Some("/Volumes/work/codex-home"), rh),
+            scratch.join(".codex")
+        );
         assert_eq!(codex_dir(scratch, None, rh), scratch.join(".codex"));
         // An empty RETRIVIO_HOME is the same as unset.
-        assert_eq!(codex_dir(home, Some("/Volumes/work/codex-home"), Some("")), PathBuf::from("/Volumes/work/codex-home"));
-        assert_eq!(codex_dir(home, None, Some(" ")), PathBuf::from("/Users/me/.codex"));
+        assert_eq!(
+            codex_dir(home, Some("/Volumes/work/codex-home"), Some("")),
+            PathBuf::from("/Volumes/work/codex-home")
+        );
+        assert_eq!(
+            codex_dir(home, None, Some(" ")),
+            PathBuf::from("/Users/me/.codex")
+        );
     }
 
     // -- service: PATH policy, plist PATH, process group -----------------------------------
@@ -3351,15 +3932,24 @@ mod tests {
 
         assert!(service_path_dir_ok(&good));
         assert!(service_path_dir_ok(&good2));
-        assert!(service_path_dir_ok(&format!("{}/", good)), "trailing slash is tolerated");
+        assert!(
+            service_path_dir_ok(&format!("{}/", good)),
+            "trailing slash is tolerated"
+        );
         assert!(!service_path_dir_ok(&group_w), "group-writable");
         assert!(!service_path_dir_ok(&world_w), "world-writable");
-        assert!(!service_path_dir_ok(&sticky), "sticky but still world-writable");
+        assert!(
+            !service_path_dir_ok(&sticky),
+            "sticky but still world-writable"
+        );
         assert!(!service_path_dir_ok(&node_bin), "node_modules/.bin");
         assert!(!service_path_dir_ok(&node_dir), "node_modules itself");
         assert!(!service_path_dir_ok(&dot_bin), ".bin");
         assert!(!service_path_dir_ok(&file.to_string_lossy()), "a file");
-        assert!(!service_path_dir_ok(&dir.join("missing").to_string_lossy()), "missing");
+        assert!(
+            !service_path_dir_ok(&dir.join("missing").to_string_lossy()),
+            "missing"
+        );
         assert!(!service_path_dir_ok("relative/bin"));
         assert!(!service_path_dir_ok(""));
         assert!(!service_path_dir_ok("/tmp/x"));
@@ -3371,8 +3961,15 @@ mod tests {
             good, group_w, node_bin, dot_bin, world_w, good, good2
         ));
         let parts: Vec<&str> = rendered.split(':').collect();
-        assert_eq!(&parts[..4], &["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]);
-        assert_eq!(&parts[4..], &[good.as_str(), good2.as_str()], "kept once each, nothing else");
+        assert_eq!(
+            &parts[..4],
+            &["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]
+        );
+        assert_eq!(
+            &parts[4..],
+            &[good.as_str(), good2.as_str()],
+            "kept once each, nothing else"
+        );
         assert_eq!(service_path_env_from(""), LAUNCHD_PATH_ENV);
 
         // Make the scratch tree removable again.
@@ -3385,10 +3982,19 @@ mod tests {
     #[test]
     fn plist_path_env_reads_back_the_rendered_path() {
         let plist = render_launchd_plist("/Users/me/bin/retrivio", Path::new("/Users/me"));
-        assert_eq!(plist_path_env(&plist).as_deref(), Some(service_path_env().as_str()));
+        assert_eq!(
+            plist_path_env(&plist).as_deref(),
+            Some(service_path_env().as_str())
+        );
         let snippet = "<dict><key>HOME</key><string>/Users/me</string>\n<key>PATH</key>\n<string>/a&amp;b/bin:/x&lt;y/bin:/usr/bin</string></dict>";
-        assert_eq!(plist_path_env(snippet).as_deref(), Some("/a&b/bin:/x<y/bin:/usr/bin"));
-        assert_eq!(plist_path_env("<dict><key>HOME</key><string>/x</string></dict>"), None);
+        assert_eq!(
+            plist_path_env(snippet).as_deref(),
+            Some("/a&b/bin:/x<y/bin:/usr/bin")
+        );
+        assert_eq!(
+            plist_path_env("<dict><key>HOME</key><string>/x</string></dict>"),
+            None
+        );
         assert_eq!(plist_path_env("<key>PATH</key><integer>3</integer>"), None);
         assert_eq!(plist_path_env(""), None);
         assert_eq!(xml_unescape("&amp;lt;"), "&lt;");
@@ -3415,12 +4021,18 @@ mod tests {
             .process_group(0);
         let mut child = cmd.spawn().unwrap();
         let mut ready = String::new();
-        BufReader::new(child.stdout.take().unwrap()).read_line(&mut ready).unwrap();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
         assert_eq!(ready.trim(), "ready");
         let t = Instant::now();
         terminate_process_group(&mut child);
         let elapsed = t.elapsed();
-        assert!(elapsed >= Duration::from_secs(3) && elapsed < Duration::from_secs(10), "{:?}", elapsed);
+        assert!(
+            elapsed >= Duration::from_secs(3) && elapsed < Duration::from_secs(10),
+            "{:?}",
+            elapsed
+        );
         let status = child.try_wait().unwrap().expect("reaped");
         assert_eq!(status.signal(), Some(libc::SIGKILL));
     }
@@ -3428,7 +4040,17 @@ mod tests {
     #[test]
     fn hook_usage_and_dispatch_accept_trust() {
         assert!(HOOK_USAGE.contains("trust"));
-        let opts = parse_common(&[OsString::from("trust"), OsString::from("--codex"), OsString::from("--yes")], &["install", "uninstall", "status", "trust"], "status", true).unwrap();
+        let opts = parse_common(
+            &[
+                OsString::from("trust"),
+                OsString::from("--codex"),
+                OsString::from("--yes"),
+            ],
+            &["install", "uninstall", "status", "trust"],
+            "status",
+            true,
+        )
+        .unwrap();
         assert_eq!(opts.sub, "trust");
         assert!(opts.codex && opts.yes && !opts.claude);
     }

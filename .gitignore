@@ -1,22 +1,17 @@
-__pycache__/
-.DS_Store
-*.pyc
-*.pyo
-*.pyd
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.venv/
-venv/
+# build
+target/
+# local scratch and data (never public)
+tmp/
+.tmp/
 .retrivio/
 .retrivio-*/
-dist/
-build/
-*.egg-info/
-target/
-internal/
-.claude/
 .comparo/
-.cypress/
-.retrivio-demo/
-tmp/
+internal/
+docs/sessions/
+docs/superpowers/
+*.db
+*.db-wal
+*.db-shm
+*.jsonl
+# os
+.DS_Store

@@ -218,8 +218,8 @@ Retrieval favours recent work without ever hiding old work. No schema change is 
 **Tiers** (display only): `fresh` < 14 days, `aging` 14–35 days, `stale` > 35 days; records show `record` plus the date instead of `stale`. Freshness is never a filter by itself; `retrivio search --view files --since <days>` (or `since_days` on the API/MCP) is the explicit opt-in hard filter.
 
 ```bash
-retrivio search --view files --limit 5 "intuit context gaps"          # metrics line shows date= age= tier= src=
-retrivio search --view files --since 30 --json "intuit context gaps"  # same payload as GET /search
+retrivio search --view files --limit 5 "lancedb compaction notes"          # metrics line shows date= age= tier= src=
+retrivio search --view files --since 30 --json "lancedb compaction notes"  # same payload as GET /search
 ```
 
 | Config key | Default | Meaning |
