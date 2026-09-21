@@ -498,7 +498,12 @@ mod tests {
         let n = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let p = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tmp")
-            .join(format!("lance-test-{}-{}-{}", prefix, std::process::id(), n));
+            .join(format!(
+                "lance-test-{}-{}-{}",
+                prefix,
+                std::process::id(),
+                n
+            ));
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).expect("create temp lance dir");
         p
@@ -528,9 +533,17 @@ mod tests {
         assert_eq!(count(&reader).unwrap(), 0);
 
         upsert_chunks(&mut writer, &[(1, vec_for(1, dim)), (2, vec_for(2, dim))]).unwrap();
-        assert_eq!(count(&reader).unwrap(), 2, "reader must see the writer's commit");
+        assert_eq!(
+            count(&reader).unwrap(),
+            2,
+            "reader must see the writer's commit"
+        );
         let hits = search_vectors(&reader, &vec_for(2, dim), 1).unwrap();
-        assert!(hits.contains_key(&2), "search on the stale handle: {:?}", hits);
+        assert!(
+            hits.contains_key(&2),
+            "search on the stale handle: {:?}",
+            hits
+        );
 
         delete_chunks(&mut writer, &[1]).unwrap();
         assert_eq!(list_chunk_ids(&reader).unwrap(), vec![2]);

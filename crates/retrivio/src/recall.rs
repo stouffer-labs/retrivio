@@ -97,16 +97,118 @@ const ACKS: &[&str] = &[
 
 /// Small English stopword list for the lexical term extractor.
 const STOPWORDS: &[&str] = &[
-    "the", "and", "for", "are", "but", "not", "you", "all", "any", "can", "had", "her", "was",
-    "one", "our", "out", "has", "his", "how", "its", "let", "may", "she", "too", "use", "who",
-    "why", "with", "from", "into", "onto", "over", "under", "about", "this", "that", "these",
-    "those", "there", "here", "then", "than", "them", "they", "their", "what", "which", "when",
-    "where", "will", "would", "could", "should", "shall", "might", "must", "have", "having",
-    "been", "being", "does", "doing", "did", "just", "like", "also", "very", "some", "each",
-    "more", "most", "other", "such", "only", "own", "same", "please", "lets", "want", "need",
-    "make", "get", "got", "using", "okay", "well", "now", "thing", "things", "something",
-    "really", "dont", "doesnt", "cant", "isnt", "your", "yours", "mine", "ours", "were", "did",
-    "again", "still", "ever", "even", "much", "many", "ill", "ive", "youre", "theyre", "were",
+    "the",
+    "and",
+    "for",
+    "are",
+    "but",
+    "not",
+    "you",
+    "all",
+    "any",
+    "can",
+    "had",
+    "her",
+    "was",
+    "one",
+    "our",
+    "out",
+    "has",
+    "his",
+    "how",
+    "its",
+    "let",
+    "may",
+    "she",
+    "too",
+    "use",
+    "who",
+    "why",
+    "with",
+    "from",
+    "into",
+    "onto",
+    "over",
+    "under",
+    "about",
+    "this",
+    "that",
+    "these",
+    "those",
+    "there",
+    "here",
+    "then",
+    "than",
+    "them",
+    "they",
+    "their",
+    "what",
+    "which",
+    "when",
+    "where",
+    "will",
+    "would",
+    "could",
+    "should",
+    "shall",
+    "might",
+    "must",
+    "have",
+    "having",
+    "been",
+    "being",
+    "does",
+    "doing",
+    "did",
+    "just",
+    "like",
+    "also",
+    "very",
+    "some",
+    "each",
+    "more",
+    "most",
+    "other",
+    "such",
+    "only",
+    "own",
+    "same",
+    "please",
+    "lets",
+    "want",
+    "need",
+    "make",
+    "get",
+    "got",
+    "using",
+    "okay",
+    "well",
+    "now",
+    "thing",
+    "things",
+    "something",
+    "really",
+    "dont",
+    "doesnt",
+    "cant",
+    "isnt",
+    "your",
+    "yours",
+    "mine",
+    "ours",
+    "were",
+    "did",
+    "again",
+    "still",
+    "ever",
+    "even",
+    "much",
+    "many",
+    "ill",
+    "ive",
+    "youre",
+    "theyre",
+    "were",
 ];
 
 /// Filename tokens that mark a revision rather than a distinct document (series collapse).
@@ -251,7 +353,8 @@ fn is_slash_command(prompt: &str) -> bool {
 /// Whole prompt (trimmed, lowercased, trailing punctuation stripped, spaces collapsed) is an ack.
 fn is_ack(prompt: &str) -> bool {
     let lowered = prompt.trim().to_lowercase();
-    let stripped = lowered.trim_end_matches(|c: char| matches!(c, '.' | '!' | '?' | ',' | ';' | ':'));
+    let stripped =
+        lowered.trim_end_matches(|c: char| matches!(c, '.' | '!' | '?' | ',' | ';' | ':'));
     let normalized = stripped.split_whitespace().collect::<Vec<_>>().join(" ");
     ACKS.contains(&normalized.as_str())
 }
@@ -376,7 +479,11 @@ fn extract_terms(text: &str) -> Vec<String> {
         scored.push((is_distinctive_term(token), n, lower));
     }
     scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
-    scored.into_iter().take(MAX_TERMS).map(|(_, _, t)| t).collect()
+    scored
+        .into_iter()
+        .take(MAX_TERMS)
+        .map(|(_, _, t)| t)
+        .collect()
 }
 
 /// Query text and lexical terms; short prompts borrow the session's previous terms. The prompt
@@ -390,7 +497,10 @@ fn build_query(prompt: &str, last_terms: &[String]) -> (String, Vec<String>) {
     let mut terms = extract_terms(&query.replace(REDACTED, " "));
     let short = collapsed.split_whitespace().count() < SHORT_PROMPT_WORDS;
     if short && !last_terms.is_empty() {
-        query = truncate_chars(&format!("{} {}", last_terms.join(" "), query), QUERY_MAX_CHARS);
+        query = truncate_chars(
+            &format!("{} {}", last_terms.join(" "), query),
+            QUERY_MAX_CHARS,
+        );
         for t in last_terms {
             if terms.len() >= MAX_UNION_TERMS {
                 break;
@@ -713,7 +823,10 @@ fn redact_url_userinfo(chars: &[char]) -> Vec<char> {
         if starts_with_at(chars, i, "://") {
             let auth_start = i + 3;
             let mut j = auth_start;
-            while j < chars.len() && !chars[j].is_whitespace() && !matches!(chars[j], '/' | '?' | '#') {
+            while j < chars.len()
+                && !chars[j].is_whitespace()
+                && !matches!(chars[j], '/' | '?' | '#')
+            {
                 j += 1;
             }
             let authority = &chars[auth_start..j];
@@ -734,22 +847,51 @@ fn redact_url_userinfo(chars: &[char]) -> Vec<char> {
 
 /// Keys whose `key = value` / `key: value` / `"key": "value"` assignments are redacted.
 const SECRET_KEYS: &[&str] = &[
-    "authorization", "client_secret", "private_key", "access_key", "secret_key", "password",
-    "passwd", "api_key", "api-key", "apikey", "secret", "token", "pwd",
+    "authorization",
+    "client_secret",
+    "private_key",
+    "access_key",
+    "secret_key",
+    "password",
+    "passwd",
+    "api_key",
+    "api-key",
+    "apikey",
+    "secret",
+    "token",
+    "pwd",
 ];
 
 /// Subset of [`SECRET_KEYS`] that also counts when only whitespace separates key and value
 /// (`password hunter2`); used for prompt text, where a loosely pasted credential is likelier
 /// than prose about "the token budget".
 const BARE_SECRET_KEYS: &[&str] = &[
-    "client_secret", "private_key", "access_key", "secret_key", "password", "passwd", "api_key",
-    "api-key", "apikey", "token", "pwd",
+    "client_secret",
+    "private_key",
+    "access_key",
+    "secret_key",
+    "password",
+    "passwd",
+    "api_key",
+    "api-key",
+    "apikey",
+    "token",
+    "pwd",
 ];
 
 /// HTTP authentication schemes: `Authorization: <scheme> <credential>` consumes both words.
 const AUTH_SCHEMES: &[&str] = &[
-    "basic", "bearer", "digest", "negotiate", "ntlm", "hoba", "mutual", "token", "oauth",
-    "aws4-hmac-sha256", "signature",
+    "basic",
+    "bearer",
+    "digest",
+    "negotiate",
+    "ntlm",
+    "hoba",
+    "mutual",
+    "token",
+    "oauth",
+    "aws4-hmac-sha256",
+    "signature",
 ];
 
 /// A bare value that is just an English function word (`for`, `is`, `of`) is prose.
@@ -759,7 +901,26 @@ fn is_stopword_value(value: &[char]) -> bool {
         .filter(|c| c.is_alphanumeric())
         .map(|c| c.to_ascii_lowercase())
         .collect();
-    word.len() <= 2 || STOPWORDS.contains(&word.as_str()) || matches!(word.as_str(), "is" | "was" | "of" | "for" | "and" | "the" | "reset" | "field" | "prompt" | "manager" | "policy" | "count" | "budget" | "limit" | "usage" | "window")
+    word.len() <= 2
+        || STOPWORDS.contains(&word.as_str())
+        || matches!(
+            word.as_str(),
+            "is" | "was"
+                | "of"
+                | "for"
+                | "and"
+                | "the"
+                | "reset"
+                | "field"
+                | "prompt"
+                | "manager"
+                | "policy"
+                | "count"
+                | "budget"
+                | "limit"
+                | "usage"
+                | "window"
+        )
 }
 
 /// End (exclusive) of a value starting at `j`: a quoted value runs to its closing quote
@@ -834,7 +995,10 @@ fn redact_key_values(chars: &[char], bare_keys: bool) -> Vec<char> {
             }
             if *key == "authorization" && !matches!(chars[k], '"' | '\'') {
                 // `Authorization: Basic dXNlcjpwYXNz`: the credential follows the scheme word.
-                let scheme: String = chars[k..end].iter().map(|c| c.to_ascii_lowercase()).collect();
+                let scheme: String = chars[k..end]
+                    .iter()
+                    .map(|c| c.to_ascii_lowercase())
+                    .collect();
                 if AUTH_SCHEMES.contains(&scheme.as_str()) {
                     let mut m = end;
                     while m < chars.len() && chars[m].is_whitespace() {
@@ -947,7 +1111,19 @@ fn looks_like_markup(s: &str) -> bool {
         total += 1;
         if matches!(
             c,
-            '{' | '}' | '[' | ']' | '<' | '>' | '|' | '"' | '=' | ';' | '\\' | '`' | '\u{2039}' | '\u{203a}'
+            '{' | '}'
+                | '['
+                | ']'
+                | '<'
+                | '>'
+                | '|'
+                | '"'
+                | '='
+                | ';'
+                | '\\'
+                | '`'
+                | '\u{2039}'
+                | '\u{203a}'
         ) {
             punct += 1;
         }
@@ -1087,7 +1263,11 @@ impl RecencyParams {
 /// Blended score for the candidate's class from its base score and an age in days.
 fn reblend(c: &Candidate, age_days: f64, rp: &RecencyParams) -> f64 {
     let (half_life, weight) = rp.for_class(c.is_record);
-    freshness::blend(c.base_score, freshness::recency_score(age_days, half_life), weight)
+    freshness::blend(
+        c.base_score,
+        freshness::recency_score(age_days, half_life),
+        weight,
+    )
 }
 
 /// Re-date a candidate from its front matter and re-blend its score from the base score.
@@ -1126,7 +1306,11 @@ fn tier_rank(tier: &str) -> u8 {
 }
 
 fn sort_by_score(cands: &mut [Candidate]) {
-    cands.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.path.cmp(&b.path)));
+    cands.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then_with(|| a.path.cmp(&b.path))
+    });
 }
 
 fn sort_by_base(cands: &mut [Candidate]) {
@@ -1142,7 +1326,9 @@ fn top_base(cands: &[Candidate]) -> Option<f64> {
     cands
         .iter()
         .map(|c| c.base_score)
-        .fold(None, |acc: Option<f64>, b| Some(acc.map_or(b, |a| a.max(b))))
+        .fold(None, |acc: Option<f64>, b| {
+            Some(acc.map_or(b, |a| a.max(b)))
+        })
 }
 
 fn under_any_root(path: &str, roots: &[PathBuf]) -> bool {
@@ -1178,14 +1364,20 @@ fn blank_dates_and_copy_markers(stem: &str) -> String {
                 continue;
             }
         }
-        if c.is_ascii_digit() && (i == 0 || !chars[i - 1].is_alphanumeric()) && i + 10 <= chars.len() {
+        if c.is_ascii_digit()
+            && (i == 0 || !chars[i - 1].is_alphanumeric())
+            && i + 10 <= chars.len()
+        {
             let d = &chars[i..i + 10];
             let dashed = d[..4].iter().all(|c| c.is_ascii_digit())
                 && matches!(d[4], '-' | '_')
                 && d[5..7].iter().all(|c| c.is_ascii_digit())
                 && matches!(d[7], '-' | '_')
                 && d[8..10].iter().all(|c| c.is_ascii_digit())
-                && chars.get(i + 10).map(|n| !n.is_alphanumeric()).unwrap_or(true);
+                && chars
+                    .get(i + 10)
+                    .map(|n| !n.is_alphanumeric())
+                    .unwrap_or(true);
             if dashed {
                 out.push(' ');
                 i += 10;
@@ -1217,7 +1409,13 @@ fn is_series_token(tok: &str) -> bool {
 fn normalize_stem(file_name: &str) -> String {
     let lower = file_name.to_lowercase();
     let stem = match lower.rsplit_once('.') {
-        Some((s, ext)) if !s.is_empty() && !ext.is_empty() && ext.chars().all(|c| c.is_ascii_alphanumeric()) => s,
+        Some((s, ext))
+            if !s.is_empty()
+                && !ext.is_empty()
+                && ext.chars().all(|c| c.is_ascii_alphanumeric()) =>
+        {
+            s
+        }
         _ => lower.as_str(),
     };
     let blanked = blank_dates_and_copy_markers(stem);
@@ -1319,8 +1517,7 @@ fn apply_lexical_confidence(
 
 /// Newer content date wins; ties go to the higher score.
 fn newer(a: &Candidate, b: &Candidate) -> bool {
-    a.content_date > b.content_date
-        || (a.content_date == b.content_date && a.score > b.score)
+    a.content_date > b.content_date || (a.content_date == b.content_date && a.score > b.score)
 }
 
 /// Same top-chunk `text_hash` means identical content: keep the newest copy.
@@ -1432,7 +1629,11 @@ fn finalize_leads(cands: Vec<Candidate>, p: &SelectParams) -> Vec<Candidate> {
 // ---------------------------------------------------------------------------------------------
 
 fn format_age(age_days: f64) -> String {
-    let d = if age_days.is_finite() { age_days.max(0.0).floor() as i64 } else { 0 };
+    let d = if age_days.is_finite() {
+        age_days.max(0.0).floor() as i64
+    } else {
+        0
+    };
     if d < 60 {
         format!("{}d", d)
     } else {
@@ -1783,7 +1984,14 @@ fn short_error(e: &str) -> String {
         .filter(|c| !c.is_control())
         .take(48)
         .collect();
-    format!("error:{}", if compact.is_empty() { "unknown".to_string() } else { compact })
+    format!(
+        "error:{}",
+        if compact.is_empty() {
+            "unknown".to_string()
+        } else {
+            compact
+        }
+    )
 }
 
 struct Reporter {
@@ -1860,7 +2068,11 @@ fn note_slow_semantic(breaker: &Path) {
     }
     // create_new makes the first strike atomic across concurrent hook invocations: exactly one
     // process creates the marker; any other that finds it decides on its age.
-    match fs::OpenOptions::new().write(true).create_new(true).open(&marker) {
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker)
+    {
         Ok(mut f) => {
             use std::io::Write;
             let _ = writeln!(f, "{} timeout", iso_utc(super::now_ts()));
@@ -1875,7 +2087,11 @@ fn note_slow_semantic(breaker: &Path) {
             let _ = fs::remove_file(&marker);
             if recent {
                 trip_breaker(breaker, "timeout x2");
-            } else if let Ok(mut f) = fs::OpenOptions::new().write(true).create_new(true).open(&marker) {
+            } else if let Ok(mut f) = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&marker)
+            {
                 use std::io::Write;
                 let _ = writeln!(f, "{} timeout", iso_utc(super::now_ts()));
             }
@@ -1887,11 +2103,19 @@ fn trip_breaker(path: &Path, reason: &str) {
     if let Some(parent) = path.parent() {
         let _ = ensure_private_dir(parent);
     }
-    let reason: String = reason.chars().filter(|c| !c.is_control()).take(200).collect();
+    let reason: String = reason
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(200)
+        .collect();
     let _ = fs::write(path, format!("{} {}\n", iso_utc(super::now_ts()), reason));
 }
 
-fn semantic_rows(cfg: &ConfigValues, db_path: &Path, query: &str) -> Result<Vec<RankedFileResult>, String> {
+fn semantic_rows(
+    cfg: &ConfigValues,
+    db_path: &Path,
+    query: &str,
+) -> Result<Vec<RankedFileResult>, String> {
     let conn = super::open_db_read_only(db_path)?;
     super::rank_files_native_with(
         &conn,
@@ -1905,9 +2129,18 @@ fn semantic_rows(cfg: &ConfigValues, db_path: &Path, query: &str) -> Result<Vec<
     )
 }
 
-fn lexical_rows(cfg: &ConfigValues, db_path: &Path, terms: &[String]) -> Result<Vec<RankedFileResult>, String> {
+fn lexical_rows(
+    cfg: &ConfigValues,
+    db_path: &Path,
+    terms: &[String],
+) -> Result<Vec<RankedFileResult>, String> {
     let conn = super::open_db_read_only(db_path)?;
-    Ok(super::lexical_file_candidates(&conn, cfg, terms, RETRIEVAL_LIMIT))
+    Ok(super::lexical_file_candidates(
+        &conn,
+        cfg,
+        terms,
+        RETRIEVAL_LIMIT,
+    ))
 }
 
 /// Candidates plus the mode that produced them (`semantic` or `lexical`), honouring
@@ -2175,7 +2408,12 @@ pub fn run_recall_cmd(args: &[OsString]) {
         });
     if let Err(e) = spawned {
         rep.note(&format!("worker: {}", e));
-        rep.finish(&short_error("worker-spawn"), 0, 0, if dry_run { 1 } else { 0 });
+        rep.finish(
+            &short_error("worker-spawn"),
+            0,
+            0,
+            if dry_run { 1 } else { 0 },
+        );
     }
     let outcome = match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
         Ok(r) => r,
@@ -2200,10 +2438,7 @@ pub fn run_recall_cmd(args: &[OsString]) {
             OutputFormat::Text => println!("{}", block),
             OutputFormat::Json => {
                 let msg = system_message.then(|| system_message_for(&out.leads[..n]));
-                println!(
-                    "{}",
-                    hook_output_json(&block, &event_name, msg.as_deref())
-                );
+                println!("{}", hook_output_json(&block, &event_name, msg.as_deref()));
             }
         }
         let _ = std::io::stdout().flush();
@@ -2212,7 +2447,10 @@ pub fn run_recall_cmd(args: &[OsString]) {
 
     if let Some(h) = &session_hash {
         if should_persist(started.elapsed()) {
-            let shown: Vec<String> = out.leads[..emitted].iter().map(|c| c.path.clone()).collect();
+            let shown: Vec<String> = out.leads[..emitted]
+                .iter()
+                .map(|c| c.path.clone())
+                .collect();
             if let Err(e) = update_session_state(&state_dir, h, &shown, &terms, now) {
                 rep.note(&e);
             }
@@ -2289,24 +2527,54 @@ mod tests {
         assert!(is_slash_command("  /clear"));
         assert!(is_slash_command("/my-cmd_2 args"));
         assert!(!is_slash_command("/Users/x"));
-        assert!(!is_slash_command("/Users/estouff/AI-Activity/Retrivio is the repo"));
+        assert!(!is_slash_command(
+            "/Users/estouff/AI-Activity/Retrivio is the repo"
+        ));
         assert!(!is_slash_command("/"));
         assert!(!is_slash_command("/123"));
         assert!(!is_slash_command("look at /compact"));
-        assert_eq!(skip_reason("/compact", None, Path::new("/nonexistent")), Some("slash-command"));
-        assert_eq!(skip_reason("/Users/x please", None, Path::new("/nonexistent")), None);
-        assert_eq!(skip_reason("   ", None, Path::new("/nonexistent")), Some("empty"));
+        assert_eq!(
+            skip_reason("/compact", None, Path::new("/nonexistent")),
+            Some("slash-command")
+        );
+        assert_eq!(
+            skip_reason("/Users/x please", None, Path::new("/nonexistent")),
+            None
+        );
+        assert_eq!(
+            skip_reason("   ", None, Path::new("/nonexistent")),
+            Some("empty")
+        );
     }
 
     #[test]
     fn ack_list_matches_normalized_prompts() {
-        for p in ["ok", "OK.", "Go ahead!", "  yes  ", "lgtm", "do   it", "Thanks,", "k", "y"] {
+        for p in [
+            "ok",
+            "OK.",
+            "Go ahead!",
+            "  yes  ",
+            "lgtm",
+            "do   it",
+            "Thanks,",
+            "k",
+            "y",
+        ] {
             assert!(is_ack(p), "{:?} should be an ack", p);
         }
-        for p in ["ok lets go", "no way", "thanks, now fix it", "continue with the plan", "yes?!x"] {
+        for p in [
+            "ok lets go",
+            "no way",
+            "thanks, now fix it",
+            "continue with the plan",
+            "yes?!x",
+        ] {
             assert!(!is_ack(p), "{:?} should not be an ack", p);
         }
-        assert_eq!(skip_reason("ok", None, Path::new("/nonexistent")), Some("ack"));
+        assert_eq!(
+            skip_reason("ok", None, Path::new("/nonexistent")),
+            Some("ack")
+        );
     }
 
     #[test]
@@ -2317,14 +2585,27 @@ mod tests {
         assert!(!has_nr_prefix("nrx"));
         assert!(!has_nr_prefix("nr"));
         assert!(!has_nr_prefix("énr:"));
-        assert_eq!(skip_reason("nr: skip me", None, Path::new("/nonexistent")), Some("nr-prefix"));
+        assert_eq!(
+            skip_reason("nr: skip me", None, Path::new("/nonexistent")),
+            Some("nr-prefix")
+        );
     }
 
     #[test]
     fn subagent_prompts_are_skipped_when_agent_id_present() {
         env::remove_var("RETRIVIO_HOOK_SUBAGENTS");
-        assert_eq!(skip_reason("real prompt here", Some("agent-1"), Path::new("/nonexistent")), Some("subagent"));
-        assert_eq!(skip_reason("real prompt here", Some("  "), Path::new("/nonexistent")), None);
+        assert_eq!(
+            skip_reason(
+                "real prompt here",
+                Some("agent-1"),
+                Path::new("/nonexistent")
+            ),
+            Some("subagent")
+        );
+        assert_eq!(
+            skip_reason("real prompt here", Some("  "), Path::new("/nonexistent")),
+            None
+        );
     }
 
     #[test]
@@ -2357,7 +2638,10 @@ mod tests {
         assert_eq!(q2.chars().count(), QUERY_MAX_CHARS);
         assert!(q2.ends_with("a 日"));
         assert_eq!(derive_query("  a   b \t c "), "a b c");
-        assert_eq!(derive_query("```rust\nfn x() {}\n```"), "```rust fn x() {} ```");
+        assert_eq!(
+            derive_query("```rust\nfn x() {}\n```"),
+            "```rust fn x() {} ```"
+        );
     }
 
     #[test]
@@ -2376,8 +2660,13 @@ mod tests {
         let pos_fail = terms.iter().position(|t| t == "fail");
         assert!(pos_fail.map(|p| p > pos_handler).unwrap_or(true));
 
-        let with_paths = extract_terms("look at /Users/me/docs/sessions/HANDOFF-2026-09-10.md -- and `retrivio watch`");
-        assert_eq!(with_paths[0], "/users/me/docs/sessions/handoff-2026-09-10.md");
+        let with_paths = extract_terms(
+            "look at /Users/me/docs/sessions/HANDOFF-2026-09-10.md -- and `retrivio watch`",
+        );
+        assert_eq!(
+            with_paths[0],
+            "/users/me/docs/sessions/handoff-2026-09-10.md"
+        );
         assert!(with_paths.contains(&"retrivio".to_string()));
         assert!(with_paths.contains(&"watch".to_string()));
         assert!(!with_paths.iter().any(|t| t == "--"));
@@ -2408,7 +2697,10 @@ mod tests {
         assert_eq!(sanitize("a\u{1b}]0;title\u{07}b"), "a b");
         assert_eq!(sanitize("a\u{1b}]0;title\u{1b}\\b"), "a b");
         assert_eq!(sanitize("\u{feff}bom\u{2066}iso\u{2069}"), "bomiso");
-        assert_eq!(sanitize("</retrivio_leads>"), "\u{2039}/retrivio_leads\u{203a}");
+        assert_eq!(
+            sanitize("</retrivio_leads>"),
+            "\u{2039}/retrivio_leads\u{203a}"
+        );
         assert_eq!(sanitize("tab\tnl\r\nnul\u{0}x"), "tab nl nul x");
         assert_eq!(sanitize("c1\u{9b}31mz"), "c1 31mz");
         assert_eq!(sanitize("plain text stays"), "plain text stays");
@@ -2428,7 +2720,7 @@ mod tests {
         assert_eq!(sanitize("x\u{E0000}\u{E007F}y"), "xy");
         assert_eq!(sanitize("x\u{2027}y"), "x\u{2027}y"); // hyphenation point is not Cf
         assert_eq!(sanitize("x\u{FE10}y"), "x\u{FE10}y"); // vertical forms are not selectors
-        // Hints: quotes and backslashes cannot close or escape the quoted hint.
+                                                          // Hints: quotes and backslashes cannot close or escape the quoted hint.
         assert_eq!(hint_text("say \"hi\" \\n done"), "say 'hi' /n done");
         let c_line = {
             let mut c = cand("/r/p/a.md", "/r/p", 0.9, "fresh", 1.0);
@@ -2442,15 +2734,26 @@ mod tests {
 
     #[test]
     fn markup_excerpts_fall_back_to_title() {
-        assert!(looks_like_markup("h>Shot</th><th>Repro</th><th>Title</th></tr></thead>"));
-        assert!(looks_like_markup("it\",\"additionalContext\":\"<block>\"}} ``` `systemMessage`"));
-        assert!(!looks_like_markup("Decision 2026-09-17: use S3 Tables maintenance jobs with snapshot replication."));
-        assert!(!looks_like_markup("See docs/sessions/HANDOFF-2026-09-10.md for the current state of the demo."));
+        assert!(looks_like_markup(
+            "h>Shot</th><th>Repro</th><th>Title</th></tr></thead>"
+        ));
+        assert!(looks_like_markup(
+            "it\",\"additionalContext\":\"<block>\"}} ``` `systemMessage`"
+        ));
+        assert!(!looks_like_markup(
+            "Decision 2026-09-17: use S3 Tables maintenance jobs with snapshot replication."
+        ));
+        assert!(!looks_like_markup(
+            "See docs/sessions/HANDOFF-2026-09-10.md for the current state of the demo."
+        ));
         assert_eq!(
             first_heading("---\ntitle: \"Bedrock setup\"\nupdated: 2026-09-15\n---\n\n# Bedrock region setup\ntext"),
             Some("Bedrock region setup".to_string())
         );
-        assert_eq!(first_heading("---\ntitle: Only Title\n---\nno heading here"), Some("Only Title".to_string()));
+        assert_eq!(
+            first_heading("---\ntitle: Only Title\n---\nno heading here"),
+            Some("Only Title".to_string())
+        );
         assert_eq!(first_heading("plain text\nmore"), None);
     }
 
@@ -2465,12 +2768,22 @@ mod tests {
         // A title substituted by the pipeline reads like prose and is shown.
         c.excerpt = "Bedrock region setup".to_string();
         let titled = format_lead_line(1, &c, Some(HINT_MAX_CHARS));
-        assert!(titled.ends_with(" — \"Bedrock region setup\""), "{}", titled);
+        assert!(
+            titled.ends_with(" — \"Bedrock region setup\""),
+            "{}",
+            titled
+        );
         // JSON fragments are suppressed too, and the older-versions note still follows.
-        c.excerpt = "{\"hookSpecificOutput\":{\"hookEventName\":\"x\",\"additionalContext\":\"<block>\"}}".to_string();
+        c.excerpt =
+            "{\"hookSpecificOutput\":{\"hookEventName\":\"x\",\"additionalContext\":\"<block>\"}}"
+                .to_string();
         c.older_versions = 1;
         let json_line = format_lead_line(2, &c, Some(HINT_MAX_CHARS));
-        assert!(json_line.ends_with(" — p (1 older versions)"), "{}", json_line);
+        assert!(
+            json_line.ends_with(" — p (1 older versions)"),
+            "{}",
+            json_line
+        );
     }
 
     #[test]
@@ -2481,29 +2794,53 @@ mod tests {
         assert!(format_lead_line(1, &c, Some(100)).contains("\"retrivio\""));
         assert_eq!(first_heading("#!/bin/bash\necho hi"), None);
         assert_eq!(first_heading("#include <stdio.h>\n"), None);
-        assert_eq!(first_heading("## Two hashes\n"), Some("Two hashes".to_string()));
+        assert_eq!(
+            first_heading("## Two hashes\n"),
+            Some("Two hashes".to_string())
+        );
         assert_eq!(first_heading("####### seven\n"), None);
     }
 
     #[test]
     fn secret_redaction_cases() {
-        assert_eq!(redact_secrets("key AKIAIOSFODNN7EXAMPLE end"), "key <redacted> end");
+        assert_eq!(
+            redact_secrets("key AKIAIOSFODNN7EXAMPLE end"),
+            "key <redacted> end"
+        );
         assert_eq!(redact_secrets("ASIAIOSFODNN7EXAMPLE"), "<redacted>");
-        assert_eq!(redact_secrets("AKIAlowercase12345678"), "AKIAlowercase12345678");
-        assert_eq!(redact_secrets("-----BEGIN PRIVATE KEY----- MIIE"), "<redacted>");
+        assert_eq!(
+            redact_secrets("AKIAlowercase12345678"),
+            "AKIAlowercase12345678"
+        );
+        assert_eq!(
+            redact_secrets("-----BEGIN PRIVATE KEY----- MIIE"),
+            "<redacted>"
+        );
         assert_eq!(redact_secrets("-----BEGIN unterminated"), "<redacted>");
-        assert_eq!(redact_secrets("password=hunter2-super-secret next"), "<redacted> next");
+        assert_eq!(
+            redact_secrets("password=hunter2-super-secret next"),
+            "<redacted> next"
+        );
         assert_eq!(redact_secrets("Token: abc123 tail"), "<redacted> tail");
         assert_eq!(redact_secrets("API_KEY = xyz"), "<redacted>");
         assert_eq!(redact_secrets("Authorization: Bearer eyJ"), "<redacted>");
         assert_eq!(redact_secrets("the secret sauce"), "the secret sauce");
-        assert_eq!(redact_secrets("the token budget is 400 tokens"), "the token budget is 400 tokens");
-        assert_eq!(redact_secrets("secret_key_id=notakey"), "secret_key_id=notakey");
+        assert_eq!(
+            redact_secrets("the token budget is 400 tokens"),
+            "the token budget is 400 tokens"
+        );
+        assert_eq!(
+            redact_secrets("secret_key_id=notakey"),
+            "secret_key_id=notakey"
+        );
         assert_eq!(
             redact_secrets("sha 0123456789abcdef0123456789abcdef done"),
             "sha <redacted> done"
         );
-        assert_eq!(redact_secrets("short 0123abcd0123abcd"), "short 0123abcd0123abcd");
+        assert_eq!(
+            redact_secrets("short 0123abcd0123abcd"),
+            "short 0123abcd0123abcd"
+        );
         assert_eq!(
             redact_secrets("blob QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVowMTIzNDU2Nzg5"),
             "blob <redacted>"
@@ -2529,7 +2866,10 @@ mod tests {
             redact_secrets("curl -H 'Authorization: Bearer abc.def-ghi_jkl' https://x"),
             "curl -H '<redacted> https://x"
         );
-        assert_eq!(redact_secrets("use Bearer tok3n please"), "use <redacted> please");
+        assert_eq!(
+            redact_secrets("use Bearer tok3n please"),
+            "use <redacted> please"
+        );
         assert_eq!(redact_secrets("bearers of bad news"), "bearers of bad news");
         // JWT: eyJ + base64url with two dots; sentence-ending dot is not part of it.
         assert_eq!(
@@ -2543,49 +2883,93 @@ mod tests {
             redact_secrets("gh ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ab end"),
             "gh <redacted> end"
         );
-        assert_eq!(redact_secrets("gho_1234567890ABCDEFGHIJKLMNOP"), "<redacted>");
+        assert_eq!(
+            redact_secrets("gho_1234567890ABCDEFGHIJKLMNOP"),
+            "<redacted>"
+        );
         assert_eq!(
             redact_secrets("github_pat_11AAAAAAA0abcdefghijklmnopqrstuvwxyz"),
             "<redacted>"
         );
         assert_eq!(redact_secrets("ghp_short"), "ghp_short");
-        assert_eq!(redact_secrets("sk-abcdefghijklmnopqrstuvwxyz123456"), "<redacted>");
+        assert_eq!(
+            redact_secrets("sk-abcdefghijklmnopqrstuvwxyz123456"),
+            "<redacted>"
+        );
         assert_eq!(redact_secrets("sk-short"), "sk-short");
-        assert_eq!(redact_secrets("task-list-for-the-sk-team"), "task-list-for-the-sk-team");
+        assert_eq!(
+            redact_secrets("task-list-for-the-sk-team"),
+            "task-list-for-the-sk-team"
+        );
         assert_eq!(
             redact_secrets("slack xoxb-1234567890-abcdefghij-KLMNOP"),
             "slack <redacted>"
         );
-        assert_eq!(redact_secrets("xoxq-1234567890-abcdefghij"), "xoxq-1234567890-abcdefghij");
+        assert_eq!(
+            redact_secrets("xoxq-1234567890-abcdefghij"),
+            "xoxq-1234567890-abcdefghij"
+        );
         assert_eq!(
             redact_secrets("g AIzaSyA1234567890abcdefghijklmnopqrstuvw"),
             "g <redacted>"
         );
         // Quoted JSON / YAML / assignment forms, values with spaces, escaped quotes.
-        assert_eq!(redact_secrets(r#"{"token": "abc def", "x": 1}"#), "{<redacted>, \"x\": 1}");
+        assert_eq!(
+            redact_secrets(r#"{"token": "abc def", "x": 1}"#),
+            "{<redacted>, \"x\": 1}"
+        );
         assert_eq!(redact_secrets("'password': 'p w'"), "<redacted>");
         assert_eq!(redact_secrets(r#"api_key = "my key""#), "<redacted>");
-        assert_eq!(redact_secrets(r#"client_secret: "a\"b" tail"#), "<redacted> tail");
-        assert_eq!(redact_secrets("private_key: \"unterminated quoted value"), "<redacted>");
-        assert_eq!(redact_secrets("private_key: bare \"then quoted"), "<redacted> \"then quoted");
-        assert_eq!(redact_secrets("PWD=x1 access_key: y2 Secret_Key = z3"), "<redacted> <redacted> <redacted>");
-        assert_eq!(redact_secrets("\"authorization\": \"Basic abc\""), "<redacted>");
-        assert_eq!(redact_secrets("Authorization: Basic dXNlcjpwYXNz tail"), "<redacted> tail");
-        assert_eq!(redact_secrets("authorization: Digest username=\"x\", realm=\"y\""), "<redacted> realm=\"y\"");
-        assert_eq!(redact_secrets("Authorization: sometoken next"), "<redacted> next");
+        assert_eq!(
+            redact_secrets(r#"client_secret: "a\"b" tail"#),
+            "<redacted> tail"
+        );
+        assert_eq!(
+            redact_secrets("private_key: \"unterminated quoted value"),
+            "<redacted>"
+        );
+        assert_eq!(
+            redact_secrets("private_key: bare \"then quoted"),
+            "<redacted> \"then quoted"
+        );
+        assert_eq!(
+            redact_secrets("PWD=x1 access_key: y2 Secret_Key = z3"),
+            "<redacted> <redacted> <redacted>"
+        );
+        assert_eq!(
+            redact_secrets("\"authorization\": \"Basic abc\""),
+            "<redacted>"
+        );
+        assert_eq!(
+            redact_secrets("Authorization: Basic dXNlcjpwYXNz tail"),
+            "<redacted> tail"
+        );
+        assert_eq!(
+            redact_secrets("authorization: Digest username=\"x\", realm=\"y\""),
+            "<redacted> realm=\"y\""
+        );
+        assert_eq!(
+            redact_secrets("Authorization: sometoken next"),
+            "<redacted> next"
+        );
         assert_eq!(redact_secrets("Authorization: Basic"), "<redacted>");
         assert_eq!(redact_secrets("the basic idea"), "the basic idea");
         assert_eq!(redact_secrets("cd $PWD && ls"), "cd $PWD && ls");
         // PEM blocks collapse to one marker, terminated or not.
         assert_eq!(
-            redact_secrets("k -----BEGIN RSA PRIVATE KEY----- MIIE abc -----END RSA PRIVATE KEY----- after"),
+            redact_secrets(
+                "k -----BEGIN RSA PRIVATE KEY----- MIIE abc -----END RSA PRIVATE KEY----- after"
+            ),
             "k <redacted> after"
         );
         assert_eq!(
             redact_secrets("-----BEGIN CERTIFICATE-----\nMIIC\n-----END CERTIFICATE-----\n"),
             "<redacted>\n"
         );
-        assert_eq!(redact_secrets("-----BEGIN X----- body -----END X"), "<redacted>");
+        assert_eq!(
+            redact_secrets("-----BEGIN X----- body -----END X"),
+            "<redacted>"
+        );
         // URL userinfo.
         assert_eq!(
             redact_secrets("clone https://eric:s3cret@github.com/x/y.git now"),
@@ -2595,29 +2979,65 @@ mod tests {
             redact_secrets("postgres://user:pw@db:5432/app?sslmode=require"),
             "postgres://<redacted>@db:5432/app?sslmode=require"
         );
-        assert_eq!(redact_secrets("https://git@github.com/x"), "https://git@github.com/x");
-        assert_eq!(redact_secrets("https://host:8443/path"), "https://host:8443/path");
+        assert_eq!(
+            redact_secrets("https://git@github.com/x"),
+            "https://git@github.com/x"
+        );
+        assert_eq!(
+            redact_secrets("https://host:8443/path"),
+            "https://host:8443/path"
+        );
         // Prompt form additionally treats a bare `key value` as a credential.
-        assert_eq!(redact_prompt_secrets("deploy with password=hunter2 and token abc"), "deploy with <redacted> and <redacted>");
-        assert_eq!(redact_prompt_secrets("the secret sauce"), "the secret sauce");
-        assert_eq!(redact_prompt_secrets("tokens are counted"), "tokens are counted");
-        assert_eq!(redact_secrets("deploy with token abc"), "deploy with token abc");
+        assert_eq!(
+            redact_prompt_secrets("deploy with password=hunter2 and token abc"),
+            "deploy with <redacted> and <redacted>"
+        );
+        assert_eq!(
+            redact_prompt_secrets("the secret sauce"),
+            "the secret sauce"
+        );
+        assert_eq!(
+            redact_prompt_secrets("tokens are counted"),
+            "tokens are counted"
+        );
+        assert_eq!(
+            redact_secrets("deploy with token abc"),
+            "deploy with token abc"
+        );
         // Bare form does not fire on prose where the next word is a function word or a common
         // noun that follows the key in ordinary sentences.
-        assert_eq!(redact_prompt_secrets("reset the password for user bob"), "reset the password for user bob");
-        assert_eq!(redact_prompt_secrets("what is the token budget here"), "what is the token budget here");
-        assert_eq!(redact_prompt_secrets("the password is in 1Password"), "the password is in 1Password");
-        assert_eq!(redact_prompt_secrets("password: hunter2 please"), "<redacted> please");
+        assert_eq!(
+            redact_prompt_secrets("reset the password for user bob"),
+            "reset the password for user bob"
+        );
+        assert_eq!(
+            redact_prompt_secrets("what is the token budget here"),
+            "what is the token budget here"
+        );
+        assert_eq!(
+            redact_prompt_secrets("the password is in 1Password"),
+            "the password is in 1Password"
+        );
+        assert_eq!(
+            redact_prompt_secrets("password: hunter2 please"),
+            "<redacted> please"
+        );
         assert_eq!(redact_prompt_secrets("api_key AKIAxyz"), "<redacted>");
     }
 
     #[test]
     fn prompt_secrets_never_reach_terms_or_session_state() {
         let (query, terms) = build_query("deploy with password=hunter2 and token abc", &[]);
-        assert!(!query.contains("hunter2") && !query.contains("abc"), "{}", query);
+        assert!(
+            !query.contains("hunter2") && !query.contains("abc"),
+            "{}",
+            query
+        );
         assert!(terms.contains(&"deploy".to_string()), "{:?}", terms);
         assert!(
-            !terms.iter().any(|t| t.contains("hunter2") || t == "abc" || t.contains("redacted")),
+            !terms
+                .iter()
+                .any(|t| t.contains("hunter2") || t == "abc" || t.contains("redacted")),
             "{:?}",
             terms
         );
@@ -2626,15 +3046,27 @@ mod tests {
             &[],
         );
         assert!(terms2.contains(&"s3tables".to_string()), "{:?}", terms2);
-        assert!(!terms2.iter().any(|t| t.contains("akia") || t.starts_with("eyj")), "{:?}", terms2);
+        assert!(
+            !terms2
+                .iter()
+                .any(|t| t.contains("akia") || t.starts_with("eyj")),
+            "{:?}",
+            terms2
+        );
         // Zero-width characters inside a secret do not split it past the scanners.
         let (q3, terms3) = build_query(
             "deploy AKI\u{200B}AIOSFODNN7EXAMPLE and pass\u{200B}word=hunter2 with Auth\u{FEFF}orization: Basic dXNlcjpwYXNz",
             &[],
         );
-        assert!(!q3.contains("AKIA") && !q3.contains("hunter2") && !q3.contains("dXNl"), "{}", q3);
         assert!(
-            !terms3.iter().any(|t| t.contains("akia") || t.contains("hunter2") || t.contains("dxnl")),
+            !q3.contains("AKIA") && !q3.contains("hunter2") && !q3.contains("dXNl"),
+            "{}",
+            q3
+        );
+        assert!(
+            !terms3
+                .iter()
+                .any(|t| t.contains("akia") || t.contains("hunter2") || t.contains("dxnl")),
             "{:?}",
             terms3
         );
@@ -2646,7 +3078,13 @@ mod tests {
         update_session_state(&state_dir, &hash, &[], &terms, 1_800_000_000.0).unwrap();
         let st = load_state(&session_file(&state_dir, &hash));
         assert!(!st.last_terms.is_empty());
-        assert!(!st.last_terms.iter().any(|t| t.contains("hunter2") || t == "abc"), "{:?}", st.last_terms);
+        assert!(
+            !st.last_terms
+                .iter()
+                .any(|t| t.contains("hunter2") || t == "abc"),
+            "{:?}",
+            st.last_terms
+        );
         let raw = fs::read_to_string(session_file(&state_dir, &hash)).unwrap();
         assert!(!raw.contains("hunter2") && !raw.contains("abc"), "{}", raw);
         let _ = fs::remove_dir_all(&dir);
@@ -2665,7 +3103,10 @@ mod tests {
 
     #[test]
     fn series_stem_normalization() {
-        assert_eq!(normalize_stem("HANDOFF-2026-08-28-orion.md"), "handoff-orion");
+        assert_eq!(
+            normalize_stem("HANDOFF-2026-08-28-orion.md"),
+            "handoff-orion"
+        );
         assert_eq!(
             normalize_stem("HANDOFF-2026-08-28-orion.md"),
             normalize_stem("HANDOFF-2026-09-10-orion.md")
@@ -2677,20 +3118,35 @@ mod tests {
         assert_eq!(normalize_stem("notes copy.md"), "notes");
         assert_eq!(normalize_stem("notes 2.md"), "notes-2"); // a lone short number elsewhere is kept
         assert_eq!(normalize_stem("Brief (draft).md"), "brief");
-        assert_ne!(normalize_stem("runbook.md"), normalize_stem("HANDOFF-2026-09-10-orion.md"));
-        assert_eq!(normalize_stem("20260812-workday-call.txt"), "workday-call");
+        assert_ne!(
+            normalize_stem("runbook.md"),
+            normalize_stem("HANDOFF-2026-09-10-orion.md")
+        );
+        assert_eq!(normalize_stem("20260812-vendor-call.txt"), "vendor-call");
         assert_eq!(normalize_stem("202609_notes.md"), "notes");
         assert_eq!(normalize_stem("2026_09_10_notes.md"), "notes");
-        assert_eq!(normalize_stem("2026-09-19-proactive-recall-design.md"), "proactive-recall-design");
+        assert_eq!(
+            normalize_stem("2026-09-19-proactive-recall-design.md"),
+            "proactive-recall-design"
+        );
         assert_eq!(normalize_stem(".hidden"), "hidden");
         assert_eq!(normalize_stem("README"), "readme");
         // Digits inside words are meaningful: these stay distinct.
-        assert_ne!(normalize_stem("s3-tables.md"), normalize_stem("s4-tables.md"));
+        assert_ne!(
+            normalize_stem("s3-tables.md"),
+            normalize_stem("s4-tables.md")
+        );
         assert_eq!(normalize_stem("s3-tables.md"), "s3-tables");
         assert_eq!(normalize_stem("ec2-core3-access.md"), "ec2-core3-access");
-        assert_ne!(normalize_stem("ec2-notes.md"), normalize_stem("ec3-notes.md"));
+        assert_ne!(
+            normalize_stem("ec2-notes.md"),
+            normalize_stem("ec3-notes.md")
+        );
         // Revision markers collapse.
-        assert_eq!(normalize_stem("deck-v11.html"), normalize_stem("deck-v12.html"));
+        assert_eq!(
+            normalize_stem("deck-v11.html"),
+            normalize_stem("deck-v12.html")
+        );
         assert_eq!(normalize_stem("deck-v11.html"), "deck");
         assert_eq!(normalize_stem("spec-rev3.md"), "spec");
         assert_eq!(normalize_stem("spec_r12.md"), "spec");
@@ -2716,15 +3172,33 @@ mod tests {
 
     #[test]
     fn series_collapse_counts_older_versions() {
-        let h1 = cand("/r/orion/docs/sessions/HANDOFF-2026-08-28-orion.md", "/r/orion", 0.95, "record", 22.0);
-        let h2 = cand("/r/orion/docs/sessions/HANDOFF-2026-09-10-orion.md", "/r/orion", 0.90, "record", 9.0);
+        let h1 = cand(
+            "/r/orion/docs/sessions/HANDOFF-2026-08-28-orion.md",
+            "/r/orion",
+            0.95,
+            "record",
+            22.0,
+        );
+        let h2 = cand(
+            "/r/orion/docs/sessions/HANDOFF-2026-09-10-orion.md",
+            "/r/orion",
+            0.90,
+            "record",
+            9.0,
+        );
         let rb = cand("/r/orion/docs/runbook.md", "/r/orion", 0.92, "stale", 150.0);
         let out = collapse_series(vec![h1, h2.clone(), rb.clone()]);
         assert_eq!(out.len(), 2);
         let kept = out.iter().find(|c| c.path.contains("HANDOFF")).unwrap();
         assert_eq!(kept.path, h2.path);
         assert_eq!(kept.older_versions, 1);
-        assert_eq!(out.iter().find(|c| c.path.contains("runbook")).unwrap().older_versions, 0);
+        assert_eq!(
+            out.iter()
+                .find(|c| c.path.contains("runbook"))
+                .unwrap()
+                .older_versions,
+            0
+        );
     }
 
     #[test]
@@ -2734,11 +3208,23 @@ mod tests {
         let c = cand("/r/c/c.md", "/r/c", 0.93, "aging", 20.0);
         let d = cand("/r/d/d.md", "/r/d", 0.85, "fresh", 1.0); // below the 0.90 band
         let e = cand("/r/e/e.md", "/r/e", 0.97, "record", 40.0);
-        let shortlist = prefilter(vec![a.clone(), b.clone(), c.clone(), d.clone(), e.clone()], &params(5));
+        let shortlist = prefilter(
+            vec![a.clone(), b.clone(), c.clone(), d.clone(), e.clone()],
+            &params(5),
+        );
         assert_eq!(shortlist.len(), 5);
         let leads = finalize_leads(shortlist, &params(5));
         let paths: Vec<&str> = leads.iter().map(|c| c.path.as_str()).collect();
-        assert_eq!(paths, vec!["/r/b/b.md", "/r/c/c.md", "/r/e/e.md", "/r/a/a.md", "/r/d/d.md"]);
+        assert_eq!(
+            paths,
+            vec![
+                "/r/b/b.md",
+                "/r/c/c.md",
+                "/r/e/e.md",
+                "/r/a/a.md",
+                "/r/d/d.md"
+            ]
+        );
         let three = finalize_leads(vec![a, b, c, d, e], &params(3));
         assert_eq!(three.len(), 3);
         assert_eq!(three[0].path, "/r/b/b.md");
@@ -2756,7 +3242,11 @@ mod tests {
         d.base_score = 0.30;
         let shortlist = prefilter(vec![a.clone(), b.clone(), c.clone(), d.clone()], &params(5));
         let paths: Vec<&str> = shortlist.iter().map(|c| c.path.as_str()).collect();
-        assert_eq!(paths, vec!["/r/a/a.md", "/r/b/b.md", "/r/c/c.md"], "sorted by base, d below the ratio floor");
+        assert_eq!(
+            paths,
+            vec!["/r/a/a.md", "/r/b/b.md", "/r/c/c.md"],
+            "sorted by base, d below the ratio floor"
+        );
         let leads = finalize_leads(shortlist, &params(5));
         let paths: Vec<&str> = leads.iter().map(|c| c.path.as_str()).collect();
         // Band (base >= 0.90): b (fresh) before a (stale); c has the second-best blended score
@@ -2778,10 +3268,17 @@ mod tests {
 
     #[test]
     fn lexical_confidence_requires_two_matched_terms() {
-        let terms: Vec<String> = ["s3tables", "replication", "cost", "allocation", "business", "unit"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let terms: Vec<String> = [
+            "s3tables",
+            "replication",
+            "cost",
+            "allocation",
+            "business",
+            "unit",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
         let rp = RecencyParams {
             living_half_life: 21.0,
             record_half_life: 90.0,
@@ -2791,7 +3288,9 @@ mod tests {
         let texts = |id: i64| -> Option<String> {
             match id {
                 1 => Some("Only the unit tests are mentioned here.".to_string()),
-                2 => Some("S3Tables replication: cost allocation per business unit via tags.".to_string()),
+                2 => Some(
+                    "S3Tables replication: cost allocation per business unit via tags.".to_string(),
+                ),
                 3 => Some("Cost and replication notes.".to_string()),
                 _ => None,
             }
@@ -2812,9 +3311,18 @@ mod tests {
         let out = apply_lexical_confidence(vec![lone, full, two, missing], &terms, &rp, &texts);
         let paths: Vec<&str> = out.iter().map(|c| c.path.as_str()).collect();
         assert_eq!(paths, vec!["/r/b/b.md", "/r/c/c.md"]);
-        assert!((out[0].base_score - (0.5 * 0.7 + 0.5)).abs() < 1e-9, "{}", out[0].base_score);
-        assert!((out[1].base_score - (0.5 * 0.9 + 0.5 * (2.0 / 6.0))).abs() < 1e-9, "{}", out[1].base_score);
-        let expected = freshness::blend(out[0].base_score, freshness::recency_score(1.0, 21.0), 0.12);
+        assert!(
+            (out[0].base_score - (0.5 * 0.7 + 0.5)).abs() < 1e-9,
+            "{}",
+            out[0].base_score
+        );
+        assert!(
+            (out[1].base_score - (0.5 * 0.9 + 0.5 * (2.0 / 6.0))).abs() < 1e-9,
+            "{}",
+            out[1].base_score
+        );
+        let expected =
+            freshness::blend(out[0].base_score, freshness::recency_score(1.0, 21.0), 0.12);
         assert!((out[0].score - expected).abs() < 1e-9);
         // Whole-token matching: `unit` inside `community` does not count.
         let community = |id: i64| -> Option<String> {
@@ -2823,9 +3331,14 @@ mod tests {
         let mut sub = cand("/r/s/s.md", "/r/s", 1.0, "fresh", 1.0);
         sub.chunk_id = 7;
         let two_terms: Vec<String> = vec!["unit".to_string(), "cost".to_string()];
-        assert!(apply_lexical_confidence(vec![sub.clone()], &two_terms, &rp, &community).is_empty());
+        assert!(
+            apply_lexical_confidence(vec![sub.clone()], &two_terms, &rp, &community).is_empty()
+        );
         let compound: Vec<String> = vec!["config.toml".to_string(), "cost".to_string()];
-        assert_eq!(apply_lexical_confidence(vec![sub], &compound, &rp, &community).len(), 1);
+        assert_eq!(
+            apply_lexical_confidence(vec![sub], &compound, &rp, &community).len(),
+            1
+        );
         // A one-term query needs only that term.
         let mut single = cand("/r/a/a.md", "/r/a", 1.0, "fresh", 1.0);
         single.chunk_id = 1;
@@ -2840,7 +3353,11 @@ mod tests {
 
     #[test]
     fn thresholds_drop_weak_results() {
-        assert!(prefilter(vec![cand("/r/a/a.md", "/r/a", 0.39, "fresh", 1.0)], &params(3)).is_empty());
+        assert!(prefilter(
+            vec![cand("/r/a/a.md", "/r/a", 0.39, "fresh", 1.0)],
+            &params(3)
+        )
+        .is_empty());
         let out = prefilter(
             vec![
                 cand("/r/a/a.md", "/r/a", 1.00, "fresh", 1.0),
@@ -2882,12 +3399,27 @@ mod tests {
         let paths: Vec<&str> = leads.iter().map(|c| c.path.as_str()).collect();
         assert_eq!(
             paths,
-            vec!["/r/a/other.md", "/r/cwdproj/x.md", "/r/cwdproj2/y.md", "/r/z/z.md", "/r/t1/transcript.txt"]
+            vec![
+                "/r/a/other.md",
+                "/r/cwdproj/x.md",
+                "/r/cwdproj2/y.md",
+                "/r/z/z.md",
+                "/r/t1/transcript.txt"
+            ]
         );
         // cwd inside a project caps that project only; a sibling-named project is unaffected.
-        assert!(project_contains_cwd("/r/cwdproj", Path::new("/r/cwdproj/src")));
-        assert!(!project_contains_cwd("/r/cwdproj", Path::new("/r/cwdproj2/src")));
-        assert!(!project_contains_cwd("/r/cwdproj/sub", Path::new("/r/cwdproj")));
+        assert!(project_contains_cwd(
+            "/r/cwdproj",
+            Path::new("/r/cwdproj/src")
+        ));
+        assert!(!project_contains_cwd(
+            "/r/cwdproj",
+            Path::new("/r/cwdproj2/src")
+        ));
+        assert!(!project_contains_cwd(
+            "/r/cwdproj/sub",
+            Path::new("/r/cwdproj")
+        ));
     }
 
     #[test]
@@ -2902,13 +3434,24 @@ mod tests {
         let base = 0.8;
         let old_age = 140.0;
         let r_old = freshness::recency_score(old_age, 21.0);
-        let mut c = cand("/r/p/README.md", "/r/p", freshness::blend(base, r_old, 0.12), "stale", old_age);
+        let mut c = cand(
+            "/r/p/README.md",
+            "/r/p",
+            freshness::blend(base, r_old, 0.12),
+            "stale",
+            old_age,
+        );
         c.base_score = base;
         c.content_date = now - old_age * freshness::DAY_SECS;
         let fm = now - 4.0 * freshness::DAY_SECS;
         refine_with_frontmatter(&mut c, fm, now, &rp);
         let expected = freshness::blend(base, freshness::recency_score(4.0, 21.0), 0.12);
-        assert!((c.score - expected).abs() < 1e-9, "{} vs {}", c.score, expected);
+        assert!(
+            (c.score - expected).abs() < 1e-9,
+            "{} vs {}",
+            c.score,
+            expected
+        );
         assert!((c.base_score - base).abs() < 1e-12, "base is untouched");
         assert_eq!(c.date_source, "frontmatter");
         assert_eq!(c.tier, "fresh");
@@ -2956,7 +3499,11 @@ mod tests {
             })
             .collect();
         let (block, n) = build_block(&leads, true);
-        assert!(block.chars().count() <= BLOCK_MAX_CHARS, "{}", block.chars().count());
+        assert!(
+            block.chars().count() <= BLOCK_MAX_CHARS,
+            "{}",
+            block.chars().count()
+        );
         assert!(block.starts_with("<retrivio_leads>\n"));
         assert!(block.ends_with("\n</retrivio_leads>"));
         assert!(n >= 1 && n < 5, "kept {}", n);
@@ -2964,7 +3511,10 @@ mod tests {
         assert_eq!(block.matches(&format!("\n{}. ", n)).count(), 1);
         assert_eq!(block.matches(&format!("\n{}. ", n + 1)).count(), 0);
         // Small blocks keep every lead.
-        let small = vec![cand("/r/a/a.md", "/r/a", 0.9, "fresh", 1.0), cand("/r/b/b.md", "/r/b", 0.8, "aging", 20.0)];
+        let small = vec![
+            cand("/r/a/a.md", "/r/a", 0.9, "fresh", 1.0),
+            cand("/r/b/b.md", "/r/b", 0.8, "aging", 20.0),
+        ];
         let (small_block, kept) = build_block(&small, true);
         assert_eq!(kept, 2);
         assert!(small_block.contains("\n2. /r/b/b.md"));
@@ -2989,9 +3539,18 @@ mod tests {
         shrink.excerpt = prose.clone();
         let (block, n) = build_block(std::slice::from_ref(&shrink), true);
         assert_eq!(n, 1);
-        assert!(block.chars().count() <= BLOCK_MAX_CHARS, "{}", block.chars().count());
+        assert!(
+            block.chars().count() <= BLOCK_MAX_CHARS,
+            "{}",
+            block.chars().count()
+        );
         assert!(block.contains(&shrink.path));
-        assert_eq!(block.matches('"').count(), 2, "shrunk hint still quoted: {}", block);
+        assert_eq!(
+            block.matches('"').count(),
+            2,
+            "shrunk hint still quoted: {}",
+            block
+        );
         assert!(block.contains("…\""), "hint was shortened with an ellipsis");
 
         // Room for nothing but the bare line: the hint is dropped, the path kept whole.
@@ -3004,7 +3563,13 @@ mod tests {
         assert!(!block.contains('"'), "{}", block);
 
         // A path longer than the whole budget: the line itself is cut, the block still closes.
-        let mut huge = cand(&format!("/r/p/{}.md", "b".repeat(2000)), "/r/p", 0.9, "fresh", 1.0);
+        let mut huge = cand(
+            &format!("/r/p/{}.md", "b".repeat(2000)),
+            "/r/p",
+            0.9,
+            "fresh",
+            1.0,
+        );
         huge.excerpt = prose;
         let (block, n) = build_block(std::slice::from_ref(&huge), true);
         assert_eq!(n, 1);
@@ -3014,7 +3579,15 @@ mod tests {
 
         // Several huge leads: only the first survives, still capped.
         let many: Vec<Candidate> = (0..3)
-            .map(|i| cand(&format!("/r/p{}/{}.md", i, "c".repeat(1900)), &format!("/r/p{}", i), 0.9, "fresh", 1.0))
+            .map(|i| {
+                cand(
+                    &format!("/r/p{}/{}.md", i, "c".repeat(1900)),
+                    &format!("/r/p{}", i),
+                    0.9,
+                    "fresh",
+                    1.0,
+                )
+            })
             .collect();
         let (block, n) = build_block(&many, true);
         assert_eq!(n, 1);
@@ -3044,14 +3617,30 @@ mod tests {
     #[test]
     fn json_output_shape() {
         let v = hook_output_json("BLOCK", "UserPromptSubmit", None);
-        assert_eq!(v["hookSpecificOutput"]["hookEventName"], json!("UserPromptSubmit"));
+        assert_eq!(
+            v["hookSpecificOutput"]["hookEventName"],
+            json!("UserPromptSubmit")
+        );
         assert_eq!(v["hookSpecificOutput"]["additionalContext"], json!("BLOCK"));
         assert!(v.get("systemMessage").is_none());
         assert_eq!(v.as_object().unwrap().len(), 1);
-        let with = hook_output_json("B", "UserPromptSubmit", Some("retrivio: 2 leads (fresh, record)"));
-        assert_eq!(with["systemMessage"], json!("retrivio: 2 leads (fresh, record)"));
-        let leads = vec![cand("/r/a/a.md", "/r/a", 0.9, "fresh", 1.0), cand("/r/t/t.txt", "/r/t", 0.8, "record", 30.0)];
-        assert_eq!(system_message_for(&leads), "retrivio: 2 leads (fresh, record)");
+        let with = hook_output_json(
+            "B",
+            "UserPromptSubmit",
+            Some("retrivio: 2 leads (fresh, record)"),
+        );
+        assert_eq!(
+            with["systemMessage"],
+            json!("retrivio: 2 leads (fresh, record)")
+        );
+        let leads = vec![
+            cand("/r/a/a.md", "/r/a", 0.9, "fresh", 1.0),
+            cand("/r/t/t.txt", "/r/t", 0.8, "record", 30.0),
+        ];
+        assert_eq!(
+            system_message_for(&leads),
+            "retrivio: 2 leads (fresh, record)"
+        );
         let text = serde_json::to_string(&v).unwrap();
         assert!(text.starts_with("{\"hookSpecificOutput\":{"));
     }
@@ -3082,10 +3671,19 @@ mod tests {
 
     #[test]
     fn args_parse_flags_and_inline_values() {
-        let args: Vec<OsString> = ["--query", "hi there", "--format=text", "--limit", "9", "--session", "abc", "--verbose"]
-            .iter()
-            .map(OsString::from)
-            .collect();
+        let args: Vec<OsString> = [
+            "--query",
+            "hi there",
+            "--format=text",
+            "--limit",
+            "9",
+            "--session",
+            "abc",
+            "--verbose",
+        ]
+        .iter()
+        .map(OsString::from)
+        .collect();
         let a = parse_args(&args).unwrap();
         assert_eq!(a.query.as_deref(), Some("hi there"));
         assert_eq!(a.format, Some(OutputFormat::Text));
@@ -3096,7 +3694,11 @@ mod tests {
         assert!(parse_args(&[OsString::from("--limit"), OsString::from("0")]).is_err());
         assert!(parse_args(&[OsString::from("--bogus")]).is_err());
         assert!(parse_args(&[OsString::from("--query")]).is_err());
-        assert!(parse_args(&[OsString::from("--reset-session")]).unwrap().reset_session);
+        assert!(
+            parse_args(&[OsString::from("--reset-session")])
+                .unwrap()
+                .reset_session
+        );
     }
 
     #[test]
@@ -3106,7 +3708,14 @@ mod tests {
         let hash = sha1_hex("session-1");
         assert_eq!(hash.len(), 40);
         let now = 1_800_000_000.0;
-        update_session_state(&state_dir, &hash, &["/r/a.md".to_string()], &["bedrock".to_string(), "us-west-2".to_string()], now).unwrap();
+        update_session_state(
+            &state_dir,
+            &hash,
+            &["/r/a.md".to_string()],
+            &["bedrock".to_string(), "us-west-2".to_string()],
+            now,
+        )
+        .unwrap();
         update_session_state(
             &state_dir,
             &hash,
@@ -3122,7 +3731,11 @@ mod tests {
         assert!(!state_dir.join(format!("{}.lock", hash)).exists());
         #[cfg(unix)]
         {
-            let fmode = fs::metadata(session_file(&state_dir, &hash)).unwrap().permissions().mode() & 0o777;
+            let fmode = fs::metadata(session_file(&state_dir, &hash))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
             assert_eq!(fmode, 0o600);
             let dmode = fs::metadata(&state_dir).unwrap().permissions().mode() & 0o777;
             assert_eq!(dmode, 0o700);
@@ -3140,14 +3753,30 @@ mod tests {
         let lock = state_dir.join(format!("{}.lock", hash));
         open_private_new(&lock).unwrap();
         let before = fs::read_to_string(session_file(&state_dir, &hash)).unwrap();
-        let real_now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64();
-        assert!(update_session_state(&state_dir, &hash, &["/r/zz.md".to_string()], &[], real_now).is_err());
-        assert_eq!(fs::read_to_string(session_file(&state_dir, &hash)).unwrap(), before);
+        let real_now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        assert!(
+            update_session_state(&state_dir, &hash, &["/r/zz.md".to_string()], &[], real_now)
+                .is_err()
+        );
+        assert_eq!(
+            fs::read_to_string(session_file(&state_dir, &hash)).unwrap(),
+            before
+        );
         fs::remove_file(&lock).unwrap();
         // Missing file loads as default.
-        assert_eq!(load_state(&state_dir.join("nope.json")), SessionState::default());
+        assert_eq!(
+            load_state(&state_dir.join("nope.json")),
+            SessionState::default()
+        );
         // Prune removes files older than the TTL (mtime is now; ttl 0 with a far-future now).
-        maybe_prune_states(&state_dir, 0.0, now + 10.0 * freshness::DAY_SECS + 4_000_000_000.0);
+        maybe_prune_states(
+            &state_dir,
+            0.0,
+            now + 10.0 * freshness::DAY_SECS + 4_000_000_000.0,
+        );
         assert!(!session_file(&state_dir, &hash).exists());
         assert!(state_dir.join(".last-prune").exists());
         let _ = fs::remove_dir_all(&dir);
@@ -3158,7 +3787,10 @@ mod tests {
         assert_eq!(iso_utc(0.0), "1970-01-01T00:00:00Z");
         assert_eq!(iso_utc(1_758_290_400.0), "2025-09-19T14:00:00Z");
         assert_eq!(iso_utc(1_758_292_800.0 + 59.0), "2025-09-19T14:40:59Z");
-        assert_eq!(short_error("failed opening database: no such file"), "error:failed_opening_database:_no_such_file");
+        assert_eq!(
+            short_error("failed opening database: no such file"),
+            "error:failed_opening_database:_no_such_file"
+        );
         assert!(short_error("").starts_with("error:"));
         let dir = scratch("log");
         let log = dir.join("recall.log");

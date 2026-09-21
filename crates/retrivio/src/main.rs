@@ -71,7 +71,11 @@ mod hook_mode_tests {
         assert_eq!(cfg.aws_refresh_cmd, "sleep 30");
         let started = Instant::now();
         let err = refresh_aws_credentials_if_configured(Some(&cfg)).unwrap_err();
-        assert!(started.elapsed() < Duration::from_millis(100), "took {:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "took {:?}",
+            started.elapsed()
+        );
         assert!(err.contains("hook mode"), "{}", err);
         let started = Instant::now();
         assert!(run_refresh_command_once("sleep 30").is_err());
@@ -90,7 +94,11 @@ mod hook_mode_tests {
         let started = Instant::now();
         let err = bounded_command_output(&mut slow, Duration::from_millis(150)).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
-        assert!(started.elapsed() < Duration::from_secs(2), "took {:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "took {:?}",
+            started.elapsed()
+        );
 
         let mut fast = Command::new("sh");
         fast.arg("-c")
@@ -100,7 +108,10 @@ mod hook_mode_tests {
             .stderr(Stdio::piped());
         let out = bounded_command_output(&mut fast, Duration::from_secs(5)).unwrap();
         assert!(out.status.success());
-        assert_eq!(String::from_utf8_lossy(&out.stdout), "{\"AccessKeyId\":\"x\"}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "{\"AccessKeyId\":\"x\"}"
+        );
 
         // A grandchild that inherited the pipe does not stall the read past the budget.
         let mut orphan = Command::new("sh");
@@ -113,7 +124,11 @@ mod hook_mode_tests {
         let started = Instant::now();
         let err = bounded_command_output(&mut orphan, Duration::from_millis(300)).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
-        assert!(started.elapsed() < Duration::from_millis(1500), "took {:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_millis(1500),
+            "took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
@@ -123,7 +138,9 @@ mod hook_mode_tests {
         assert_eq!(maybe_autostart_ollama("http://127.0.0.1:1"), Ok(false));
         assert!(started.elapsed() < Duration::from_millis(100));
         let embedder = BedrockEmbedder::new("amazon.titan-embed-text-v2:0");
-        let err = embedder.invoke_model_cli(&serde_json::json!({ "inputText": "x" })).unwrap_err();
+        let err = embedder
+            .invoke_model_cli(&serde_json::json!({ "inputText": "x" }))
+            .unwrap_err();
         assert!(err.contains("hook mode"), "{}", err);
     }
 }
@@ -2611,15 +2628,30 @@ fn config_rows() -> Vec<(&'static str, &'static str)> {
         ("graph_related_base", "Related-project graph base"),
         ("graph_related_scale", "Related-project graph scale"),
         ("graph_related_cap", "Related-project graph cap"),
-        ("hyde_enabled", "HyDE hypothetical-document query expansion (opt-in)"),
-        ("reranker_enabled", "Ollama cross-encoder re-ranking of chunk results"),
+        (
+            "hyde_enabled",
+            "HyDE hypothetical-document query expansion (opt-in)",
+        ),
+        (
+            "reranker_enabled",
+            "Ollama cross-encoder re-ranking of chunk results",
+        ),
         ("reranker_model", "Ollama model used for re-ranking"),
         ("reranker_pool_size", "Re-ranker candidate pool size"),
         ("reranker_batch_size", "Re-ranker parallel batch size"),
         ("reranker_timeout_ms", "Re-ranker per-request timeout (ms)"),
-        ("rank_recency_weight", "Recency blend weight for living docs"),
-        ("rank_recency_record_weight", "Recency blend weight for records"),
-        ("recency_half_life_days", "Recency half-life for living docs (days)"),
+        (
+            "rank_recency_weight",
+            "Recency blend weight for living docs",
+        ),
+        (
+            "rank_recency_record_weight",
+            "Recency blend weight for records",
+        ),
+        (
+            "recency_half_life_days",
+            "Recency half-life for living docs (days)",
+        ),
         (
             "recency_record_half_life_days",
             "Recency half-life for records (days)",
@@ -2632,15 +2664,33 @@ fn config_rows() -> Vec<(&'static str, &'static str)> {
             "skip_dir_names",
             "Extra directory names skipped at discovery/indexing (comma-separated)",
         ),
-        ("recall_max_leads", "Max leads injected by `retrivio recall`"),
-        ("recall_min_score_ratio", "Recall: min score ratio vs top lead"),
-        ("recall_min_abs_score", "Recall: min absolute score for the top lead"),
-        ("recall_band_ratio", "Recall: score band ratio for grouping leads"),
-        ("recall_roots", "Recall: comma-separated roots (empty = all tracked)"),
+        (
+            "recall_max_leads",
+            "Max leads injected by `retrivio recall`",
+        ),
+        (
+            "recall_min_score_ratio",
+            "Recall: min score ratio vs top lead",
+        ),
+        (
+            "recall_min_abs_score",
+            "Recall: min absolute score for the top lead",
+        ),
+        (
+            "recall_band_ratio",
+            "Recall: score band ratio for grouping leads",
+        ),
+        (
+            "recall_roots",
+            "Recall: comma-separated roots (empty = all tracked)",
+        ),
         ("recall_excerpts", "Recall: include excerpts in leads"),
         ("recall_system_message", "Recall: emit as system message"),
         ("recall_semantic", "Recall: semantic retrieval mode"),
-        ("recall_session_ttl_days", "Recall: session memory TTL (days)"),
+        (
+            "recall_session_ttl_days",
+            "Recall: session memory TTL (days)",
+        ),
     ]
 }
 
@@ -4769,9 +4819,7 @@ fn run_graph_cmd(args: &[OsString]) {
         println!("usage: retrivio graph [doctor|status|start|stop|provision|view|open|neighbors|lineage] [--path <project-or-child-path>] [--limit <n>] [--threshold <0..1>] [--depth <1..3>]");
         println!("quick examples:");
         println!("  retrivio ui");
-        println!(
-            "  retrivio graph neighbors --path ~/projects/sample-project --limit 12"
-        );
+        println!("  retrivio graph neighbors --path ~/projects/sample-project --limit 12");
         println!(
             "  retrivio graph lineage --path ~/projects/sample-project --depth 2 --threshold 0.60"
         );
@@ -5087,7 +5135,11 @@ fn graph_viewer_state(host: &str, port: u16) -> Option<Value> {
 fn graph_view_state_json(conn: &Connection, cwd: &Path) -> Result<Value, String> {
     let mut roots: Vec<String> = list_tracked_roots_conn(conn)?
         .into_iter()
-        .map(|p| normalize_path(&p.to_string_lossy()).to_string_lossy().to_string())
+        .map(|p| {
+            normalize_path(&p.to_string_lossy())
+                .to_string_lossy()
+                .to_string()
+        })
         .collect();
     roots.sort();
     roots.dedup();
@@ -8624,7 +8676,10 @@ fn run_add(args: &[OsString]) {
                         eprintln!("error: {}", e);
                         process::exit(1);
                     }
-                    eprintln!("warning: skipping initial index because Ollama is not ready: {}", e);
+                    eprintln!(
+                        "warning: skipping initial index because Ollama is not ready: {}",
+                        e
+                    );
                     eprintln!(
                         "note: tracked roots were added. run `retrivio setup`, start Ollama, or change embed_backend; then run `retrivio index`."
                     );
@@ -8714,10 +8769,10 @@ fn run_del(args: &[OsString]) {
             true,
             "delete refresh",
         )
-            .unwrap_or_else(|e| {
-                eprintln!("error: {}", e);
-                process::exit(1);
-            });
+        .unwrap_or_else(|e| {
+            eprintln!("error: {}", e);
+            process::exit(1);
+        });
     } else if removed > 0 {
         println!("note: run `retrivio refresh` when convenient.");
     }
@@ -8892,19 +8947,11 @@ fn run_index_cmd(args: &[OsString]) {
     let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let cfg_path = config_path(&cwd);
     let cfg = ConfigValues::from_map(load_config_values(&cfg_path));
-    run_index_with_strategy(
-        &cwd,
-        &cfg,
-        IndexScope::AllRoots,
-        false,
-        None,
-        true,
-        "index",
-    )
-    .unwrap_or_else(|e| {
-        eprintln!("error: {}", e);
-        process::exit(1);
-    });
+    run_index_with_strategy(&cwd, &cfg, IndexScope::AllRoots, false, None, true, "index")
+        .unwrap_or_else(|e| {
+            eprintln!("error: {}", e);
+            process::exit(1);
+        });
 }
 
 fn run_refresh_cmd(args: &[OsString]) {
@@ -8948,19 +8995,11 @@ fn run_refresh_cmd(args: &[OsString]) {
         (scope, false)
     };
 
-    run_index_with_strategy(
-        &cwd,
-        &cfg,
-        scope,
-        true,
-        None,
-        remove_missing,
-        "refresh",
-    )
-    .unwrap_or_else(|e| {
-        eprintln!("error: {}", e);
-        process::exit(1);
-    });
+    run_index_with_strategy(&cwd, &cfg, scope, true, None, remove_missing, "refresh")
+        .unwrap_or_else(|e| {
+            eprintln!("error: {}", e);
+            process::exit(1);
+        });
 }
 
 fn run_reembed_cmd(args: &[OsString]) {
@@ -9044,8 +9083,12 @@ fn run_prune_cmd(args: &[OsString]) {
     if args.iter().any(|a| a == "-h" || a == "--help") {
         println!("usage: retrivio prune [--dry-run] [--no-compact] [path ...]");
         println!("removes index rows for files that are no longer part of a project's corpus:");
-        println!("deleted files, files under excluded or skip_dir_names directories, files past the");
-        println!("per-project caps. Drops their chunks, LanceDB vectors, manifest, symbol and import");
+        println!(
+            "deleted files, files under excluded or skip_dir_names directories, files past the"
+        );
+        println!(
+            "per-project caps. Drops their chunks, LanceDB vectors, manifest, symbol and import"
+        );
         println!("rows; removes projects whose directory is gone or excluded; and deletes LanceDB");
         println!("vectors that have no sqlite chunk. Re-reads and re-chunks files (no embedding).");
         println!("Real runs end by compacting LanceDB (deletes are tombstones until then) and");
@@ -9270,7 +9313,9 @@ fn run_prune(
             .prepare("SELECT id, path FROM projects ORDER BY path")
             .map_err(|e| format!("failed preparing project list query: {}", e))?;
         let rows = stmt
-            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
             .map_err(|e| format!("failed listing projects: {}", e))?;
         let mut out = Vec::new();
         for row in rows {
@@ -9599,7 +9644,10 @@ fn run_search_cmd(args: &[OsString]) {
             process::exit(1);
         });
         if json_output {
-            println!("{}", search_files_response_json(&query, &rows, search_started));
+            println!(
+                "{}",
+                search_files_response_json(&query, &rows, search_started)
+            );
             return;
         }
         if rows.is_empty() {
@@ -9615,7 +9663,10 @@ fn run_search_cmd(args: &[OsString]) {
         process::exit(1);
     });
     if json_output {
-        println!("{}", search_projects_response_json(&query, &rows, search_started));
+        println!(
+            "{}",
+            search_projects_response_json(&query, &rows, search_started)
+        );
         return;
     }
     if rows.is_empty() {
@@ -10179,12 +10230,22 @@ fn run_jump_cmd(args: &[OsString]) {
         }
         let candidates: Vec<PickCandidate> = if view == "files" {
             rank_files_native(&conn, &cfg, &query, limit)
-                .unwrap_or_else(|e| { eprintln!("error: {}", e); process::exit(1); })
-                .iter().map(|r| make_file_pick_candidate(r)).collect()
+                .unwrap_or_else(|e| {
+                    eprintln!("error: {}", e);
+                    process::exit(1);
+                })
+                .iter()
+                .map(|r| make_file_pick_candidate(r))
+                .collect()
         } else {
             rank_projects_native(&conn, &cfg, &query, limit)
-                .unwrap_or_else(|e| { eprintln!("error: {}", e); process::exit(1); })
-                .iter().map(|r| make_project_pick_candidate(r)).collect()
+                .unwrap_or_else(|e| {
+                    eprintln!("error: {}", e);
+                    process::exit(1);
+                })
+                .iter()
+                .map(|r| make_project_pick_candidate(r))
+                .collect()
         };
         if let Some(first) = candidates.first() {
             record_selection_event(&conn, &query, &first.path, now_ts()).ok();
@@ -10208,11 +10269,10 @@ fn run_jump_cmd(args: &[OsString]) {
     let mut active_view = view;
     let mut active_query = query;
     loop {
-        let action =
-            pick_interactive_live(&active_view, &active_query).unwrap_or_else(|e| {
-                eprintln!("error: picker failed: {}", e);
-                process::exit(1);
-            });
+        let action = pick_interactive_live(&active_view, &active_query).unwrap_or_else(|e| {
+            eprintln!("error: picker failed: {}", e);
+            process::exit(1);
+        });
         match action {
             PickAction::Cancel => process::exit(130),
             PickAction::Toggle { view, query } => {
@@ -10427,10 +10487,11 @@ fn run_pick_cmd(args: &[OsString]) {
                 .map(|item| make_file_pick_candidate(&item))
                 .collect::<Vec<_>>()
         } else {
-            let rows = rank_projects_native(&conn, &cfg, &active_query, limit).unwrap_or_else(|e| {
-                eprintln!("error: {}", e);
-                process::exit(1);
-            });
+            let rows =
+                rank_projects_native(&conn, &cfg, &active_query, limit).unwrap_or_else(|e| {
+                    eprintln!("error: {}", e);
+                    process::exit(1);
+                });
             if rows.is_empty() {
                 eprintln!("error: no indexed projects found. run `retrivio index` first.");
                 process::exit(1);
@@ -10440,8 +10501,8 @@ fn run_pick_cmd(args: &[OsString]) {
                 .collect::<Vec<_>>()
         };
 
-        let selected =
-            pick_candidate_path(&candidates, &active_query, &active_view).unwrap_or_else(|e| {
+        let selected = pick_candidate_path(&candidates, &active_query, &active_view)
+            .unwrap_or_else(|e| {
                 eprintln!("error: picker failed: {}", e);
                 process::exit(1);
             });
@@ -10618,10 +10679,7 @@ fn pick_query_changed(original: &str, updated: &str) -> bool {
     normalize_pick_query(original) != normalize_pick_query(updated)
 }
 
-fn pick_interactive_live(
-    view: &str,
-    initial_query: &str,
-) -> Result<PickAction, String> {
+fn pick_interactive_live(view: &str, initial_query: &str) -> Result<PickAction, String> {
     let bin = env::current_exe()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| "retrivio".to_string());
@@ -10710,7 +10768,12 @@ fn pick_interactive_live(
     if selected_line.trim().is_empty() {
         return Ok(PickAction::Cancel);
     }
-    let path = selected_line.split('\t').next().unwrap_or("").trim().to_string();
+    let path = selected_line
+        .split('\t')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string();
     if path.is_empty() {
         return Ok(PickAction::Cancel);
     }
@@ -14001,7 +14064,10 @@ fn handle_api_request(req: ApiRequest) -> (u16, Value) {
                 Ok(v) => v,
                 Err(e) => return (503, serde_json::json!({"error": e})),
             };
-            return (200, search_projects_response_json(&q, &rows, search_started));
+            return (
+                200,
+                search_projects_response_json(&q, &rows, search_started),
+            );
         }
         ("GET", "/chunks/search") => {
             let query = req.query.get("q").cloned().unwrap_or_default();
@@ -16418,9 +16484,7 @@ fn write_mcp_frame<W: Write>(writer: &mut W, value: &Value, ndjson: bool) -> Res
 
 fn serve_mcp_native() -> Result<(), String> {
     if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
-        eprintln!(
-            "retrivio mcp serve: waiting for MCP client messages on stdio (Ctrl+C to exit)"
-        );
+        eprintln!("retrivio mcp serve: waiting for MCP client messages on stdio (Ctrl+C to exit)");
     }
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
@@ -17929,9 +17993,7 @@ fn model_key_for_cfg(cfg: &ConfigValues) -> String {
             };
             format!("ollama:{}", model)
         }
-        "bedrock" => {
-            bedrock_embedding_space_key(&cfg.embed_model)
-        }
+        "bedrock" => bedrock_embedding_space_key(&cfg.embed_model),
         other => {
             let model = if cfg.embed_model.trim().is_empty() {
                 "qwen3-embedding".to_string()
@@ -18206,7 +18268,9 @@ fn project_mtimes(conn: &Connection) -> Result<HashMap<String, f64>, String> {
         .prepare("SELECT path, project_mtime FROM projects")
         .map_err(|e| format!("failed preparing project mtime query: {}", e))?;
     let rows = stmt
-        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?)))
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+        })
         .map_err(|e| format!("failed querying project mtimes: {}", e))?;
     let mut out = HashMap::new();
     for row in rows {
@@ -18249,8 +18313,7 @@ pub(crate) fn rank_files_native_with(
         cfg.lexical_candidates.max(1) as usize,
     );
     let (project_semantic, mut fused) = if opts.lexical_only {
-        let fused =
-            search_lexical_chunks_sqlite(conn, q, std::cmp::max(160, lex_limit * 2))?;
+        let fused = search_lexical_chunks_sqlite(conn, q, std::cmp::max(160, lex_limit * 2))?;
         (HashMap::new(), fused)
     } else {
         let (model_key, query_vector) = embed_query_cached(cfg, q)?;
@@ -18378,7 +18441,11 @@ pub(crate) fn rank_files_native_with(
             if !include {
                 continue;
             }
-            support.push(evidence_hit_from_chunk(row, chunk_base_score(row, cfg), &fx));
+            support.push(evidence_hit_from_chunk(
+                row,
+                chunk_base_score(row, cfg),
+                &fx,
+            ));
         }
         support.sort_by(|a, b| {
             b.score
@@ -19182,11 +19249,11 @@ mod chunk_contract_tests {
         assert!(fx.within_since(now - 800.0 * 86_400.0, None));
         assert_eq!(
             fts_or_query(&[
-                "intuit".to_string(),
+                "alpha".to_string(),
                 "con\"text".to_string(),
                 " ".to_string()
             ]),
-            "\"intuit\" OR \"con\"\"text\""
+            "\"alpha\" OR \"con\"\"text\""
         );
         assert_eq!(parse_since_days(Some(&"30".to_string())), Some(30.0));
         assert_eq!(parse_since_days(Some(&"-1".to_string())), None);
@@ -19202,7 +19269,10 @@ mod chunk_contract_tests {
 
     #[test]
     fn picker_query_change_detection_ignores_case_and_spacing() {
-        assert!(!pick_query_changed("speech to text", "  Speech   To   Text  "));
+        assert!(!pick_query_changed(
+            "speech to text",
+            "  Speech   To   Text  "
+        ));
         assert!(pick_query_changed("call", "speech to text"));
         assert!(pick_query_changed("call", ""));
     }
@@ -19485,7 +19555,8 @@ VALUES (1, '/tmp/p/b.md', 'b.md', 0, 1, 10, 'h2', 'beta', 0);
 
     #[test]
     fn migrate_isengard_add_profile_rewrites_to_credentials() {
-        let legacy = "'isengardcli' add-profile 'wwso-strategics-data-ai-fusion@amazon.com' --role Admin";
+        let legacy =
+            "'isengardcli' add-profile 'wwso-strategics-data-ai-fusion@amazon.com' --role Admin";
         let migrated =
             migrate_isengard_add_profile_to_credential_cmd(legacy).expect("should migrate");
         // shell_split should round-trip the migrated form back to the same tokens.
@@ -19505,7 +19576,8 @@ VALUES (1, '/tmp/p/b.md', 'b.md', 0, 1, 10, 'h2', 'beta', 0);
 
     #[test]
     fn migrate_isengard_add_profile_keeps_absolute_path() {
-        let legacy = "/Users/x/Scripts/isengardcli/isengardcli add-profile foo@bar.com --role ReadOnly";
+        let legacy =
+            "/Users/x/Scripts/isengardcli/isengardcli add-profile foo@bar.com --role ReadOnly";
         let migrated =
             migrate_isengard_add_profile_to_credential_cmd(legacy).expect("should migrate");
         let tokens = shell_split(&migrated).expect("migrated form must be parseable");
@@ -19525,10 +19597,9 @@ VALUES (1, '/tmp/p/b.md', 'b.md', 0, 1, 10, 'h2', 'beta', 0);
     #[test]
     fn migrate_isengard_add_profile_ignores_non_isengard() {
         // aws-sso login command should not be rewritten
-        assert!(migrate_isengard_add_profile_to_credential_cmd(
-            "aws sso login --profile foo"
-        )
-        .is_none());
+        assert!(
+            migrate_isengard_add_profile_to_credential_cmd("aws sso login --profile foo").is_none()
+        );
         // isengardcli credentials (already correct) should not be rewritten
         assert!(migrate_isengard_add_profile_to_credential_cmd(
             "isengardcli credentials --awscli foo --role Admin"
@@ -19547,8 +19618,7 @@ VALUES (1, '/tmp/p/b.md', 'b.md', 0, 1, 10, 'h2', 'beta', 0);
         );
         let cfg = ConfigValues::from_map(map);
         assert_eq!(cfg.aws_refresh_cmd, "");
-        let tokens =
-            shell_split(&cfg.aws_credential_cmd).expect("migrated form must be parseable");
+        let tokens = shell_split(&cfg.aws_credential_cmd).expect("migrated form must be parseable");
         assert_eq!(
             tokens,
             vec![
@@ -19606,10 +19676,7 @@ VALUES (1, '/tmp/p/b.md', 'b.md', 0, 1, 10, 'h2', 'beta', 0);
                 .unwrap_or_default(),
             "hello world"
         );
-        assert_eq!(
-            embedder.model_key(),
-            "bedrock:amazon.titan-embed-text-v2:0"
-        );
+        assert_eq!(embedder.model_key(), "bedrock:amazon.titan-embed-text-v2:0");
     }
 
     #[test]
@@ -20551,7 +20618,9 @@ LIMIT ?2
             .prepare("SELECT id, lower(path) FROM projects")
             .map_err(|e| format!("failed preparing project path list: {}", e))?;
         let rows = stmt
-            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
             .map_err(|e| format!("failed listing project paths: {}", e))?;
         let mut v = Vec::new();
         for row in rows {
@@ -20636,7 +20705,9 @@ LIMIT ?2
                 .query_map(params![project_id, remaining], map_path_chunk_row)
                 .map_err(|e| format!("failed querying keyword project chunks: {}", e))?;
             for row in rows {
-                absorb(row.map_err(|e| format!("failed reading keyword project chunk row: {}", e))?);
+                absorb(
+                    row.map_err(|e| format!("failed reading keyword project chunk row: {}", e))?,
+                );
                 rows_for_token += 1;
             }
         }
@@ -20709,8 +20780,17 @@ WHERE pcv.model = ?1
 
     let mut scored: Vec<(f64, i64, String, String, String, i64, String, f64)> = Vec::new();
     for row in rows {
-        let (chunk_id, project_path, doc_path, doc_rel_path, chunk_index, text, vnorm, blob, doc_mtime) =
-            row.map_err(|e| format!("failed reading semantic chunk row: {}", e))?;
+        let (
+            chunk_id,
+            project_path,
+            doc_path,
+            doc_rel_path,
+            chunk_index,
+            text,
+            vnorm,
+            blob,
+            doc_mtime,
+        ) = row.map_err(|e| format!("failed reading semantic chunk row: {}", e))?;
         if vnorm == 0.0 {
             continue;
         }
@@ -21310,7 +21390,6 @@ struct QueryWeights {
     frecency: f64,
 }
 
-
 /// File extensions that mark a query word as a file name: the indexable suffixes plus
 /// common code/config extensions people type even though those files are not indexed.
 fn known_file_extension(ext: &str) -> bool {
@@ -21424,8 +21503,21 @@ fn path_like_token(token: &str, short_query: bool) -> Option<&str> {
     let mut t = token.trim_matches(|c: char| {
         matches!(
             c,
-            '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | ',' | ';' | ':'
-                | '!' | '?'
+            '"' | '\''
+                | '`'
+                | '('
+                | ')'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | '<'
+                | '>'
+                | ','
+                | ';'
+                | ':'
+                | '!'
+                | '?'
         )
     });
     if t.len() > 1 && t.ends_with('.') {
@@ -21728,10 +21820,7 @@ mod query_type_tests {
             query_path_like_tokens("fix (src/auth/token.rs) now"),
             vec!["src/auth/token.rs".to_string()]
         );
-        assert_eq!(
-            QueryType::classify(r"\\server\share"),
-            QueryType::PathQuery
-        );
+        assert_eq!(QueryType::classify(r"\\server\share"), QueryType::PathQuery);
         assert_eq!(QueryType::classify(r"C:\x\y"), QueryType::PathQuery);
         assert_eq!(QueryType::classify(".gitignore"), QueryType::PathQuery);
         assert_eq!(
@@ -21758,7 +21847,10 @@ mod query_type_tests {
             QueryType::classify("impl Display for Foo"),
             QueryType::CodePattern
         );
-        assert_eq!(QueryType::classify("where is the struct"), QueryType::NaturalLanguage);
+        assert_eq!(
+            QueryType::classify("where is the struct"),
+            QueryType::NaturalLanguage
+        );
         // Keyword prefixes inside ordinary words are not code keywords.
         assert_eq!(
             QueryType::classify("how do users log in"),
@@ -22012,7 +22104,11 @@ struct ConfigValues {
 const DEFAULT_RECENCY_RECORD_PATTERNS: &str =
     "transcript,customer-signals,docs/sessions,HANDOFF,meeting,call-notes,.srt";
 
-fn parse_bool_config(map: &std::collections::HashMap<String, String>, key: &str, default: bool) -> bool {
+fn parse_bool_config(
+    map: &std::collections::HashMap<String, String>,
+    key: &str,
+    default: bool,
+) -> bool {
     map.get(key)
         .map(|v| matches!(v.trim().to_lowercase().as_str(), "true" | "1" | "yes"))
         .unwrap_or(default)
@@ -22403,7 +22499,9 @@ impl ConfigValues {
 
     /// Extra directory names to skip during discovery and corpus walks.
     fn skip_dir_name_set(&self) -> HashSet<String> {
-        split_csv_setting(&self.skip_dir_names).into_iter().collect()
+        split_csv_setting(&self.skip_dir_names)
+            .into_iter()
+            .collect()
     }
 
     /// Absolute roots that `retrivio recall` searches; empty means every tracked root.
@@ -22562,8 +22660,14 @@ fn write_config_file(path: &Path, cfg: &ConfigValues) -> Result<(), String> {
         format!("recall_roots = \"{}\"", toml_escape(&cfg.recall_roots)),
         format!("recall_excerpts = {}", cfg.recall_excerpts),
         format!("recall_system_message = {}", cfg.recall_system_message),
-        format!("recall_semantic = \"{}\"", toml_escape(&cfg.recall_semantic)),
-        format!("recall_session_ttl_days = {:.6}", cfg.recall_session_ttl_days),
+        format!(
+            "recall_semantic = \"{}\"",
+            toml_escape(&cfg.recall_semantic)
+        ),
+        format!(
+            "recall_session_ttl_days = {:.6}",
+            cfg.recall_session_ttl_days
+        ),
         String::new(),
     ];
     fs::write(path, lines.join("\n")).map_err(|e| format!("failed writing config: {}", e))
@@ -23687,7 +23791,10 @@ mod scoped_refresh_tests {
             .join("../../tmp")
             .join(format!("refresh-{}-{}", name, std::process::id()));
         let _ = fs::remove_dir_all(&root);
-        for (project, subs) in [("proj-a", ["notes", "reports"]), ("proj-b", ["src", "plans"])] {
+        for (project, subs) in [
+            ("proj-a", ["notes", "reports"]),
+            ("proj-b", ["src", "plans"]),
+        ] {
             for sub in subs {
                 let dir = root.join(project).join(sub);
                 fs::create_dir_all(&dir).expect("create sub dir");
@@ -23718,7 +23825,11 @@ mod scoped_refresh_tests {
         let scope = plan_scoped_refresh(&conn, &cfg(), &[a.clone()]).expect("plan");
         assert_eq!(scope, IndexScope::projects(vec![a.clone()]));
         let (roots, projects) = resolve_index_targets(&conn, &cfg(), &scope).expect("resolve");
-        assert_eq!(projects, vec![a.clone()], "only the project itself, never its children");
+        assert_eq!(
+            projects,
+            vec![a.clone()],
+            "only the project itself, never its children"
+        );
         assert_eq!(roots.len(), 1);
 
         // prune's stale-row criterion: a row survives when discovery of the tracked roots
@@ -23747,8 +23858,16 @@ mod scoped_refresh_tests {
         let a = root.join("proj-a");
 
         let err = plan_scoped_refresh(&conn, &cfg(), &[a.join("reports")]).unwrap_err();
-        assert!(err.contains("neither a tracked root nor a discovered project"), "{}", err);
-        assert!(err.contains(&format!("retrivio refresh {}", a.display())), "{}", err);
+        assert!(
+            err.contains("neither a tracked root nor a discovered project"),
+            "{}",
+            err
+        );
+        assert!(
+            err.contains(&format!("retrivio refresh {}", a.display())),
+            "{}",
+            err
+        );
 
         let outside = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tmp")
@@ -25454,7 +25573,9 @@ fn remove_projects_not_in(conn: &Connection, keep_paths: &[String]) -> Result<i6
             .prepare("SELECT id, path FROM projects ORDER BY path")
             .map_err(|e| format!("failed preparing project list query: {}", e))?;
         let rows = stmt
-            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
             .map_err(|e| format!("failed listing existing projects: {}", e))?;
         let mut out = Vec::new();
         for row in rows {
@@ -25907,32 +26028,71 @@ VALUES (12, 10, 'related', 'active', 0, 0);
             let mut stmt = conn
                 .prepare("SELECT id FROM project_chunks WHERE project_id = 1 ORDER BY id")
                 .unwrap();
-            stmt.query_map([], |r| r.get(0)).unwrap().map(|r| r.unwrap()).collect()
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
         };
         assert_eq!(survivors, vec![10, 11]);
-        assert_eq!(count(&conn, "SELECT COUNT(*) FROM project_files WHERE project_id = 1"), 1);
         assert_eq!(
-            count(&conn, "SELECT COUNT(*) FROM project_files WHERE rel_path = 'src/keep.rs'"),
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM project_files WHERE project_id = 1"
+            ),
             1
         );
-        assert_eq!(count(&conn, "SELECT COUNT(*) FROM symbols WHERE project_id = 1"), 1);
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM project_files WHERE rel_path = 'src/keep.rs'"
+            ),
+            1
+        );
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM symbols WHERE project_id = 1"),
+            1
+        );
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM file_imports"), 0);
         assert_eq!(
             count(&conn, "SELECT COUNT(*) FROM file_dependency_edges WHERE source_doc_path = '/p/alpha/src/keep.rs'"),
             1
         );
-        assert_eq!(count(&conn, "SELECT COUNT(*) FROM file_dependency_edges"), 1);
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM file_dependency_edges"),
+            1
+        );
         // FK cascade dropped the vector and the feedback row of chunk 12.
-        assert_eq!(count(&conn, "SELECT COUNT(*) FROM project_chunk_vectors WHERE chunk_id = 12"), 0);
-        assert_eq!(count(&conn, "SELECT COUNT(*) FROM project_chunk_vectors"), 3);
-        assert_eq!(count(&conn, "SELECT COUNT(*) FROM chunk_relation_feedback"), 0);
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM project_chunk_vectors WHERE chunk_id = 12"
+            ),
+            0
+        );
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM project_chunk_vectors"),
+            3
+        );
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM chunk_relation_feedback"),
+            0
+        );
         // The FTS shadow table dropped the stale row too.
         assert_eq!(
-            count(&conn, "SELECT COUNT(*) FROM chunk_fts WHERE chunk_fts MATCH 'stale'"),
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM chunk_fts WHERE chunk_fts MATCH 'stale'"
+            ),
             0
         );
         // Other projects are never touched.
-        assert_eq!(count(&conn, "SELECT COUNT(*) FROM project_chunks WHERE project_id = 2"), 1);
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM project_chunks WHERE project_id = 2"
+            ),
+            1
+        );
     }
 
     #[test]
@@ -25948,8 +26108,20 @@ VALUES (12, 10, 'related', 'active', 0, 0);
         // The file is still in the corpus, so its per-file rows stay.
         assert_eq!(out.manifest_rows, 0);
         assert_eq!(out.symbol_rows, 0);
-        assert_eq!(count(&conn, "SELECT COUNT(*) FROM project_chunks WHERE project_id = 1"), 2);
-        assert_eq!(count(&conn, "SELECT COUNT(*) FROM project_files WHERE project_id = 1"), 2);
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM project_chunks WHERE project_id = 1"
+            ),
+            2
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM project_files WHERE project_id = 1"
+            ),
+            2
+        );
     }
 
     #[test]
@@ -25975,9 +26147,27 @@ VALUES (12, 10, 'related', 'active', 0, 0);
         let out =
             prune_stale_project_rows(&conn, 1, &PruneKeepSet::default(), false).expect("prune");
         assert_eq!(out.chunks, 3);
-        assert_eq!(count(&conn, "SELECT COUNT(*) FROM project_chunks WHERE project_id = 1"), 0);
-        assert_eq!(count(&conn, "SELECT COUNT(*) FROM project_files WHERE project_id = 1"), 0);
-        assert_eq!(count(&conn, "SELECT COUNT(*) FROM project_chunks WHERE project_id = 2"), 1);
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM project_chunks WHERE project_id = 1"
+            ),
+            0
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM project_files WHERE project_id = 1"
+            ),
+            0
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM project_chunks WHERE project_id = 2"
+            ),
+            1
+        );
     }
 
     #[test]
@@ -26003,16 +26193,31 @@ VALUES (12, 10, 'related', 'active', 0, 0);
         };
         let id = upsert_project_chunk(&conn, 1, &same, 1.0).expect("upsert same hash");
         assert_eq!(id, 12);
-        assert_eq!(count(&conn, "SELECT COUNT(*) FROM chunk_relation_feedback"), 1);
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM chunk_relation_feedback"),
+            1
+        );
 
         let changed = ProjectChunk {
             text_hash: "h12-changed".to_string(),
             ..chunk(STALE_DOC, "tmp/stale.md", 0)
         };
         let id = upsert_project_chunk(&conn, 1, &changed, 2.0).expect("upsert new hash");
-        assert_eq!(id, 12, "the row keeps its id so its vector is updated in place");
-        assert_eq!(count(&conn, "SELECT COUNT(*) FROM chunk_relation_feedback"), 0);
-        assert_eq!(count(&conn, "SELECT COUNT(*) FROM project_chunk_vectors WHERE chunk_id = 12"), 1);
+        assert_eq!(
+            id, 12,
+            "the row keeps its id so its vector is updated in place"
+        );
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM chunk_relation_feedback"),
+            0
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM project_chunk_vectors WHERE chunk_id = 12"
+            ),
+            1
+        );
     }
 
     #[test]
@@ -26022,8 +26227,20 @@ VALUES (12, 10, 'related', 'active', 0, 0);
             remove_projects_not_in(&conn, &["/p/alpha".to_string()]).expect("remove stale");
         assert_eq!(removed, 1);
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM projects"), 1);
-        assert_eq!(count(&conn, "SELECT COUNT(*) FROM project_chunks WHERE project_id = 2"), 0);
-        assert_eq!(count(&conn, "SELECT COUNT(*) FROM project_chunk_vectors WHERE chunk_id = 20"), 0);
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM project_chunks WHERE project_id = 2"
+            ),
+            0
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM project_chunk_vectors WHERE chunk_id = 20"
+            ),
+            0
+        );
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM project_chunks"), 3);
     }
 }
@@ -27252,9 +27469,8 @@ impl AwsCredentials {
         aws_cli: &str,
         credential_cmd: Option<&str>,
     ) -> Result<Self, String> {
-        let (stdout, source_label) = if let Some(cmd_str) = credential_cmd
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
+        let (stdout, source_label) = if let Some(cmd_str) =
+            credential_cmd.map(|s| s.trim()).filter(|s| !s.is_empty())
         {
             let tokens = shell_split(cmd_str)
                 .ok_or_else(|| format!("aws_credential_cmd has unbalanced quotes: {}", cmd_str))?;

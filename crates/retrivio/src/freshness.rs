@@ -320,13 +320,38 @@ fn parse_date_value(value: &str) -> Option<f64> {
 }
 
 const MONTHS: &[&str] = &[
-    "january", "february", "march", "april", "may", "june", "july", "august", "september",
-    "october", "november", "december",
+    "january",
+    "february",
+    "march",
+    "april",
+    "may",
+    "june",
+    "july",
+    "august",
+    "september",
+    "october",
+    "november",
+    "december",
 ];
 
 const WEEKDAYS: &[&str] = &[
-    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday", "mon", "tue",
-    "tues", "wed", "thu", "thur", "thurs", "fri", "sat", "sun",
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+    "sunday",
+    "mon",
+    "tue",
+    "tues",
+    "wed",
+    "thu",
+    "thur",
+    "thurs",
+    "fri",
+    "sat",
+    "sun",
 ];
 
 /// 1-based month for a full name or an abbreviation of at least three letters (`Sep`, `Sept`).
@@ -350,7 +375,9 @@ fn english_day(word: &str) -> Option<u32> {
 }
 
 fn english_year(word: &str) -> Option<i64> {
-    (word.len() == 4).then(|| digits_value(word.as_bytes())).flatten()
+    (word.len() == 4)
+        .then(|| digits_value(word.as_bytes()))
+        .flatten()
 }
 
 /// `Month D YYYY` or `D Month YYYY`, commas and periods ignored, an optional leading weekday,
@@ -428,7 +455,11 @@ pub fn recency_score(age_days: f64, half_life_days: f64) -> f64 {
     } else {
         1.0
     };
-    let age = if age_days.is_finite() { age_days.max(0.0) } else { 0.0 };
+    let age = if age_days.is_finite() {
+        age_days.max(0.0)
+    } else {
+        0.0
+    };
     0.5f64.powf(age / half_life)
 }
 
@@ -495,7 +526,10 @@ mod tests {
     #[test]
     fn path_date_month_prefix_resolves_to_first_of_month() {
         assert_eq!(path_date("202609-foo/bar.md"), Some(ymd(2026, 9, 1)));
-        assert_eq!(path_date("/Users/x/c-projects/202609-foo/notes/bar.md"), Some(ymd(2026, 9, 1)));
+        assert_eq!(
+            path_date("/Users/x/c-projects/202609-foo/notes/bar.md"),
+            Some(ymd(2026, 9, 1))
+        );
     }
 
     #[test]
@@ -504,16 +538,28 @@ mod tests {
         assert_eq!(path_date("a/20260715_x.md"), Some(ymd(2026, 7, 15)));
         assert_eq!(path_date("a/20260715.md"), Some(ymd(2026, 7, 15)));
         assert_eq!(path_date("a/20260715"), Some(ymd(2026, 7, 15)));
-        assert_eq!(path_date("specs/2026-09-19-proactive-recall-design.md"), Some(ymd(2026, 9, 19)));
+        assert_eq!(
+            path_date("specs/2026-09-19-proactive-recall-design.md"),
+            Some(ymd(2026, 9, 19))
+        );
     }
 
     #[test]
     fn path_date_day_component_beats_month_parent() {
-        assert_eq!(path_date("202609-foo/20260715-x.md"), Some(ymd(2026, 7, 15)));
+        assert_eq!(
+            path_date("202609-foo/20260715-x.md"),
+            Some(ymd(2026, 7, 15))
+        );
         // Precision wins even when the month component is deeper.
-        assert_eq!(path_date("20260715-x/202609-foo/bar.md"), Some(ymd(2026, 7, 15)));
+        assert_eq!(
+            path_date("20260715-x/202609-foo/bar.md"),
+            Some(ymd(2026, 7, 15))
+        );
         // Equal precision: deepest wins.
-        assert_eq!(path_date("20260101-a/20260715-b/c.md"), Some(ymd(2026, 7, 15)));
+        assert_eq!(
+            path_date("20260101-a/20260715-b/c.md"),
+            Some(ymd(2026, 7, 15))
+        );
     }
 
     #[test]
@@ -524,9 +570,17 @@ mod tests {
         assert_eq!(path_date("20260231-foo.md"), None, "Feb 31");
         assert_eq!(path_date("20260700-foo.md"), None, "day 0");
         assert_eq!(path_date("12345678-foo.md"), None, "year out of range");
-        assert_eq!(path_date("202609foo/bar.md"), None, "no delimiter after digits");
+        assert_eq!(
+            path_date("202609foo/bar.md"),
+            None,
+            "no delimiter after digits"
+        );
         assert_eq!(path_date("2026091-foo.md"), None, "seven digits");
-        assert_eq!(path_date("x20260715-foo.md"), None, "not at component start");
+        assert_eq!(
+            path_date("x20260715-foo.md"),
+            None,
+            "not at component start"
+        );
         assert_eq!(path_date("1234567890-id.md"), None, "long serial number");
         assert_eq!(path_date("2026-13-01-foo.md"), None, "dashed month 13");
     }
@@ -578,7 +632,10 @@ mod tests {
             parse_frontmatter_date("Last Updated: 2026-07-05"),
             Some(ymd(2026, 7, 5))
         );
-        assert_eq!(parse_frontmatter_date("---\nmodified: 2026-02-30\n---\n"), None);
+        assert_eq!(
+            parse_frontmatter_date("---\nmodified: 2026-02-30\n---\n"),
+            None
+        );
         assert_eq!(parse_frontmatter_date("date: yesterday"), None);
         assert_eq!(parse_frontmatter_date("no dates here"), None);
         // Beyond the first 2 KB is ignored.
@@ -618,8 +675,15 @@ mod tests {
         // An unclosed block is not front matter: its `date:` is a plain line, `Date:` style
         // keys only. (`date:` lowercase plain line still matches: keys are case-insensitive.)
         let unclosed = format!("---\n{}date: 2026-09-03\n", "line\n".repeat(70));
-        assert_eq!(parse_frontmatter_date(&unclosed), None, "beyond 10 non-empty lines");
-        assert_eq!(parse_frontmatter_date("---\ndate: 2026-09-03\nno close"), Some(ymd(2026, 9, 3)));
+        assert_eq!(
+            parse_frontmatter_date(&unclosed),
+            None,
+            "beyond 10 non-empty lines"
+        );
+        assert_eq!(
+            parse_frontmatter_date("---\ndate: 2026-09-03\nno close"),
+            Some(ymd(2026, 9, 3))
+        );
         // Closing fence must arrive within 60 lines.
         let long_block = format!("---\n{}date: 2026-09-04\n---\n", "k: v\n".repeat(70));
         assert_eq!(parse_frontmatter_date(&long_block), None);
@@ -632,9 +696,18 @@ mod tests {
         // Eric's specs: `Date: 2026-09-19` on line 3.
         let spec = "# Proactive recall design\n\nDate: 2026-09-19\nAuthor: Eric\n\n## 1. Goal\n";
         assert_eq!(parse_frontmatter_date(spec), Some(ymd(2026, 9, 19)));
-        assert_eq!(parse_frontmatter_date("**Updated:** 2026-09-18\n"), Some(ymd(2026, 9, 18)));
-        assert_eq!(parse_frontmatter_date("- Last updated: 2026-09-17"), Some(ymd(2026, 9, 17)));
-        assert_eq!(parse_frontmatter_date("> date: 2026-09-16"), Some(ymd(2026, 9, 16)));
+        assert_eq!(
+            parse_frontmatter_date("**Updated:** 2026-09-18\n"),
+            Some(ymd(2026, 9, 18))
+        );
+        assert_eq!(
+            parse_frontmatter_date("- Last updated: 2026-09-17"),
+            Some(ymd(2026, 9, 17))
+        );
+        assert_eq!(
+            parse_frontmatter_date("> date: 2026-09-16"),
+            Some(ymd(2026, 9, 16))
+        );
         // Only the accepted keys count outside a YAML block.
         assert_eq!(parse_frontmatter_date("modified: 2026-09-15\n"), None);
         assert_eq!(parse_frontmatter_date("last_updated: 2026-09-15\n"), None);
@@ -654,7 +727,10 @@ mod tests {
         let body = "# T\nintro\nmore\nmore\nmore\nmore\nmore\nmore\nmore\nmore\ndate: 2026-09-19\n";
         assert_eq!(parse_frontmatter_date(body), None);
         // Indented lines are never header lines (an unclosed block's nested key, code).
-        assert_eq!(parse_frontmatter_date("---\nmeta:\n  date: 2026-05-01\nno close"), None);
+        assert_eq!(
+            parse_frontmatter_date("---\nmeta:\n  date: 2026-05-01\nno close"),
+            None
+        );
         assert_eq!(parse_frontmatter_date("# T\n    Date: 2026-05-01\n"), None);
         // Fences must be closed by the same marker.
         let mixed = "~~~\n```\nDate: 2026-01-01\n~~~\nDate: 2026-09-19\n";
@@ -664,26 +740,44 @@ mod tests {
     #[test]
     fn english_dates_from_the_corpus() {
         assert_eq!(
-            parse_frontmatter_date("# AWS Context\n\nLast updated: 17 September 2026, GA roadmap draft pass\n"),
+            parse_frontmatter_date(
+                "# AWS Context\n\nLast updated: 17 September 2026, GA roadmap draft pass\n"
+            ),
             Some(ymd(2026, 9, 17))
         );
         assert_eq!(
-            parse_frontmatter_date("---\ntitle: \"Scout\"\nauthor: \"x\"\ndate: \"July 10, 2026\"\n---\n"),
+            parse_frontmatter_date(
+                "---\ntitle: \"Scout\"\nauthor: \"x\"\ndate: \"July 10, 2026\"\n---\n"
+            ),
             Some(ymd(2026, 7, 10))
         );
         assert_eq!(
-            parse_frontmatter_date("# Sophos review\n\nDate: 19 Sep 2026. Firewall `vpn-sophos-xg`\n"),
+            parse_frontmatter_date(
+                "# Firewall review\n\nDate: 19 Sep 2026. Appliance `fw-edge-01`\n"
+            ),
             Some(ymd(2026, 9, 19))
         );
-        assert_eq!(parse_frontmatter_date("**Date:** November 5, 2025\n"), Some(ymd(2025, 11, 5)));
-        assert_eq!(parse_frontmatter_date("**Date**: May 22nd, 2026\n"), Some(ymd(2026, 5, 22)));
+        assert_eq!(
+            parse_frontmatter_date("**Date:** November 5, 2025\n"),
+            Some(ymd(2025, 11, 5))
+        );
+        assert_eq!(
+            parse_frontmatter_date("**Date**: May 22nd, 2026\n"),
+            Some(ymd(2026, 5, 22))
+        );
         assert_eq!(
             parse_frontmatter_date("**Date:** Thursday, March 5, 2026, 9:00 PT\n"),
             Some(ymd(2026, 3, 5))
         );
-        assert_eq!(parse_frontmatter_date("Date: 1 Sept 2026\n"), Some(ymd(2026, 9, 1)));
+        assert_eq!(
+            parse_frontmatter_date("Date: 1 Sept 2026\n"),
+            Some(ymd(2026, 9, 1))
+        );
         // Placeholders and partial dates are rejected.
-        assert_eq!(parse_frontmatter_date("**Date:** Add to the table above.\n"), None);
+        assert_eq!(
+            parse_frontmatter_date("**Date:** Add to the table above.\n"),
+            None
+        );
         assert_eq!(parse_frontmatter_date("**Date**: [Date]\n"), None);
         assert_eq!(parse_frontmatter_date("Date: May 2026\n"), None);
         assert_eq!(parse_frontmatter_date("Date: 5 mayonnaise 2026\n"), None);
@@ -726,9 +820,15 @@ mod tests {
         assert!((recency_score(0.0, 21.0) - 1.0).abs() < 1e-12);
         assert!((recency_score(21.0, 21.0) - 0.5).abs() < 1e-12);
         assert!((recency_score(42.0, 21.0) - 0.25).abs() < 1e-12);
-        assert!((recency_score(-5.0, 21.0) - 1.0).abs() < 1e-12, "negative age clamps to 0");
+        assert!(
+            (recency_score(-5.0, 21.0) - 1.0).abs() < 1e-12,
+            "negative age clamps to 0"
+        );
         assert!((recency_score(90.0, 90.0) - 0.5).abs() < 1e-12);
-        assert!(recency_score(10.0, 0.0) > 0.0, "degenerate half-life does not panic");
+        assert!(
+            recency_score(10.0, 0.0) > 0.0,
+            "degenerate half-life does not panic"
+        );
     }
 
     #[test]
