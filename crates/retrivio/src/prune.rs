@@ -1142,6 +1142,9 @@ VALUES (12, 10, 'related', 'active', 0, 0);
 
     #[test]
     fn remove_projects_not_in_cascades_chunks_and_vectors() {
+        // `remove_projects_not_in` deletes chunk 20 from whatever LanceDB handle this process
+        // holds open; hold the store lock so it is not a concurrent indexer test's store.
+        let _lance = crate::test_support::lance_isolation();
         let conn = seeded_conn();
         let (removed, removed_chunks) =
             remove_projects_not_in(&conn, &["/p/alpha".to_string()], &HashSet::new())

@@ -30,7 +30,9 @@ thread_local! {
 /// recall end-to-end tests): the command spawns worker threads, which do not inherit the
 /// thread-local above.
 static PROCESS_DATA_DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
-/// The LanceDB handle is process-global, so tests that run the indexer take turns.
+/// The LanceDB handle is process-global and not tied to a store path, so every test that can
+/// open it, act on it or read the dirty marker takes turns: [`TestStore`] and
+/// [`lance_isolation`] both hold this lock for the test's lifetime.
 static STORE_LOCK: Mutex<()> = Mutex::new(());
 
 pub(crate) fn data_dir_for_test() -> PathBuf {
@@ -56,6 +58,20 @@ fn reset_lance_store() {
     if let Some(lock) = LANCE_STORE.get() {
         *lock.lock().unwrap_or_else(|p| p.into_inner()) = None;
     }
+}
+
+/// Isolation for a test that needs no data dir but runs a path consulting the process-global
+/// LanceDB handle: `remove_projects_not_in`, `sync_lance_after_publish` and
+/// `repair_lance_from_sqlite` act on whatever handle is open (`lance_store_is_open`), and
+/// `lance_delete_marked` clears the dirty marker after a successful delete. Without the lock a
+/// concurrent indexer test's open handle makes the test delete that test's vectors and read a
+/// cleared marker. Takes the same lock as [`TestStore`] and leaves the handle closed; hold the
+/// returned guard for the whole test (`let _lance = lance_isolation();`).
+pub(crate) fn lance_isolation() -> MutexGuard<'static, ()> {
+    let guard = STORE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    reset_lance_store();
+    LANCE_WRITE_FAILED.store(false, Ordering::SeqCst);
+    guard
 }
 
 /// An isolated data directory under `repo/tmp` for one test, installed as this thread's

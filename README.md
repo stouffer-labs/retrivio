@@ -41,14 +41,16 @@ This tap is real, but it currently builds Retrivio from source from `main`. It i
 
 ### macOS: keep the folder-access grant across rebuilds
 
-macOS grants access to Documents, Desktop and the other protected folders per program, identified by its code signature. A binary you build yourself is unsigned, so every rebuild is a new program to macOS: the background watcher (`retrivio service install`) is asked for access again, and a launchd agent has no window to answer in, so it sits blocked at the prompt. Sign local builds with a self-signed certificate and the grant persists across rebuilds:
+macOS grants access to Documents, Desktop and the other protected folders per program, identified by its code signature. A binary you build yourself is unsigned, so every rebuild is a new program to macOS: the background watcher (`retrivio service install`) is asked for access again, and a launchd agent has no window to answer in, so it sits blocked at the prompt. Sign local builds with a self-signed certificate, with the watcher stopped while you do it:
 
 ```bash
 export RETRIVIO_CODESIGN_IDENTITY="Retrivio Dev"   # a code-signing certificate in your keychain
+retrivio service uninstall                         # the script refuses to sign a running binary
 cargo build --release -p retrivio && scripts/sign-macos.sh
+retrivio service install                           # launchd starts the signed build
 ```
 
-Creating the certificate takes a minute in Keychain Access; the steps are in [`docs/DISTRIBUTION.md`](docs/DISTRIBUTION.md#code-signing-on-macos-local-builds). Without the variable the script signs ad hoc, which still re-prompts after every build. A downloaded release binary only changes when you upgrade, so it asks once per upgrade.
+Creating the certificate takes a minute in Keychain Access; the steps are in [`docs/DISTRIBUTION.md`](docs/DISTRIBUTION.md#code-signing-on-macos-local-builds). The script ends by printing the binary's designated requirement (`codesign -d -r-`), the identity macOS keys the grant to; with the same certificate and identifier it reads the same after every build, so the grant is expected to persist across rebuilds. Confirm that once: rebuild, sign and reinstall twice and check that no new prompt appears (the check is in the same doc). Without the variable the script signs ad hoc, which still re-prompts after every build. A downloaded release binary only changes when you upgrade, so it asks once per upgrade.
 
 ### Linux support
 

@@ -3720,6 +3720,9 @@ VALUES (10, 'bedrock:amazon.titan-embed-text-v2:0', 1024, 1.0, x'00000000'),
 
     #[test]
     fn prune_deletes_commit_the_lance_dirty_marker_with_them() {
+        // The marker must stay set: `remove_projects_not_in` deletes from LanceDB and clears it
+        // whenever the process-global handle is open, so no other test may hold it open.
+        let _lance = crate::test_support::lance_isolation();
         let conn = conn();
         seed_two_file_project(&conn);
         assert_eq!(app_state_get(&conn, APP_STATE_LANCE_DIRTY).unwrap(), None);
@@ -3833,6 +3836,9 @@ VALUES (10, 'bedrock:amazon.titan-embed-text-v2:0', 1024, 1.0, x'00000000'),
         assert_eq!(f.chunk_count, 1);
 
         // Through reindex: no embedder call, no prune, the manifest row carries the new stat.
+        // `reindex_project_chunks` opens and syncs the process-global LanceDB handle when
+        // anything is embedded or pruned; nothing is here, but the path takes the store lock.
+        let _lance = crate::test_support::lance_isolation();
         let conn = conn();
         conn.execute_batch(
             "INSERT INTO projects(id, path, title, summary, project_mtime, last_indexed) VALUES (1, '/p/x', 'x', 'x', 0, 0);",

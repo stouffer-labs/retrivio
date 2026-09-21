@@ -55,17 +55,19 @@ Create the certificate once (Keychain Access):
 2. Name `Retrivio Dev` (any name; it becomes the identity), Identity Type `Self Signed Root`, Certificate Type `Code Signing`. Create.
 3. `security find-identity -v -p codesigning` lists it.
 
-Then, after every build:
+Then, after every build, with the watcher stopped. The script refuses to sign a binary that is running (`lsof`/`pgrep` find it): launchd would keep the old process, and re-signing the file under it changes nothing for TCC. Stop the watcher, build, sign, start it again on the signed build:
 
 ```bash
 export RETRIVIO_CODESIGN_IDENTITY="Retrivio Dev"   # put it in your shell rc
+retrivio service uninstall                         # stop the watcher (a no-op when it is not installed)
 cargo build --release -p retrivio
 scripts/sign-macos.sh                              # default target: target/release/retrivio
+retrivio service install                           # launchd starts the signed build
 ```
 
-The script runs `codesign --force --sign "$RETRIVIO_CODESIGN_IDENTITY" --identifier com.stouffer-labs.retrivio --timestamp=none <binary>` and verifies the result (`codesign --verify --strict`, then `codesign -dv`). The first run of a newly signed binary prompts once; after that, rebuilds signed with the same certificate and identifier keep the grant. Sign the binary the launchd plist names (`retrivio service status` prints the plist path) and reinstall the agent (`retrivio service uninstall && retrivio service install`) so launchd runs the signed build rather than the process it started before.
+The script runs `codesign --force --sign "$RETRIVIO_CODESIGN_IDENTITY" --identifier com.stouffer-labs.retrivio --timestamp=none <binary>`, verifies the result (`codesign --verify --strict`, `codesign -dv`) and prints the designated requirement (`codesign -d -r-`), which for a certificate that is not Apple's reads `identifier "com.stouffer-labs.retrivio" and certificate leaf = H"<sha1 of your certificate>"`. That requirement is what identifies the program to macOS from one build to the next; both of its parts are fixed by the flags (the identifier is given explicitly, the certificate is yours), so the folder-access grant is expected to persist across rebuilds. That is the expectation from the flags, not something demonstrated here yet: confirm it once. Grant access on the first signed run, then rebuild, sign and reinstall twice more; each time compare the designated requirement line with the previous one (it must be identical), check that `~/.retrivio/watch.log` gets its bootstrap tick, and check that `log show --last 30m --predicate 'subsystem == "com.apple.TCC"' | grep -i retrivio` shows no new prompt. `--timestamp=none` stays on: a secure timestamp is for distributed signatures whose certificate may expire, and a local build signed with a self-signed identity gains nothing from the round trip to Apple's timestamp server.
 
-Without `RETRIVIO_CODESIGN_IDENTITY` the script signs ad hoc (`--sign -`): the binary carries a signature but no stable identity, so macOS still asks again after every rebuild. The release workflow does not sign the published binaries; a downloaded release only changes when you upgrade, so it prompts once per upgrade.
+Without `RETRIVIO_CODESIGN_IDENTITY` the script signs ad hoc (`--sign -`): the binary carries a signature, but its designated requirement is the code hash of that build, so macOS still asks again after every rebuild. The release workflow does not sign the published binaries; a downloaded release only changes when you upgrade, so it prompts once per upgrade.
 
 ## Maintainer Release Flow
 

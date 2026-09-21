@@ -775,7 +775,8 @@ mod migration_discipline_tests {
     use crate::config::ConfigValues;
     use crate::embed::{disk_cache_lookup, disk_cache_store, query_cache_key};
     use crate::index::embed_input_hash;
-    use crate::rank::lexical_file_candidates;
+    use crate::rank::{lexical_file_candidates, search_symbols_fts};
+    use crate::test_support::count;
     use rusqlite::Connection;
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
@@ -878,6 +879,125 @@ VALUES (10, 'bedrock:amazon.titan-embed-text-v2:0', 1, 1.0, x'00000000');
         assert_eq!(has_added_columns(&conn), all);
         let hits = lexical_file_candidates(&conn, &cfg, &["runbook".to_string()], 5);
         assert_eq!(hits.len(), 1);
+        drop(conn);
+        drop(writer);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn table_names(conn: &Connection) -> Vec<String> {
+        let mut stmt = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+            .unwrap();
+        stmt.query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    /// 0.1.x created `symbol_chunk_map` and nothing ever wrote or read it. A store that still
+    /// carries the table, rows and all, answers every read path unchanged; the first writer
+    /// drops it inside the one schema transaction, so a failure later in that transaction
+    /// rolls the drop back with everything else, and a success leaves every other table as it
+    /// was.
+    #[test]
+    fn a_legacy_symbol_chunk_map_is_read_past_and_dropped_atomically_by_the_first_writer() {
+        let (dir, db) = old_shape_store("symbol-chunk-map");
+        let cfg = ConfigValues::from_map(HashMap::new());
+        let none = vec![false; ADDED_COLUMNS.len()];
+        let all = vec![true; ADDED_COLUMNS.len()];
+        let tables_before = {
+            let conn = open_db_rw(&db).expect("open rw");
+            // The table as 0.1.x created it, with a row, plus the symbol the row maps.
+            conn.execute_batch(
+                r#"
+INSERT INTO symbols(id, project_id, doc_path, doc_rel_path, name, kind, line_start, line_end, updated_at)
+VALUES (1, 1, '/p/alpha/notes.md', 'notes.md', 'orion_runbook', 'function', 1, 2, 0);
+CREATE TABLE IF NOT EXISTS symbol_chunk_map (
+    symbol_id INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
+    chunk_id INTEGER NOT NULL REFERENCES project_chunks(id) ON DELETE CASCADE,
+    coverage TEXT NOT NULL DEFAULT 'full',
+    PRIMARY KEY(symbol_id, chunk_id)
+);
+INSERT INTO symbol_chunk_map(symbol_id, chunk_id, coverage) VALUES (1, 10, 'full');
+"#,
+            )
+            .expect("legacy table");
+            table_names(&conn)
+        };
+        assert!(tables_before.iter().any(|t| t == "symbol_chunk_map"));
+
+        // Read paths (search, symbol search) and the non-migrating read-write open answer
+        // with the table in place and leave it there.
+        {
+            let ro = open_db_read_only(&db).expect("open ro");
+            assert!(db_has_table(&ro, "symbol_chunk_map").unwrap());
+            assert_eq!(has_added_columns(&ro), none);
+            let hits = lexical_file_candidates(&ro, &cfg, &["runbook".to_string()], 5);
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].doc_rel_path, "notes.md");
+            let symbols = search_symbols_fts(&ro, "orion", 5).expect("symbol search");
+            assert_eq!(symbols.len(), 1);
+            assert_eq!(symbols[0]["name"], "orion_runbook");
+        }
+        {
+            let rw = open_db_rw(&db).expect("open rw");
+            assert!(db_has_table(&rw, "symbol_chunk_map").unwrap());
+            assert_eq!(count(&rw, "SELECT COUNT(*) FROM symbol_chunk_map"), 1);
+        }
+
+        // Atomicity: make a statement that runs after the drop, in the same transaction, fail.
+        // sqlite refuses `CREATE TABLE IF NOT EXISTS x` when an index named `x` exists, and the
+        // writer creates `file_dependency_edges` after it drops `symbol_chunk_map`.
+        {
+            let raw = open_db_rw_raw(&db).unwrap();
+            raw.execute_batch(
+                "DROP TABLE file_dependency_edges; CREATE INDEX file_dependency_edges ON projects(path);",
+            )
+            .unwrap();
+        }
+        let writer = WriterLock::try_acquire(&dir).expect("lock");
+        let err = open_db_writer(&db, &writer).expect_err("the injected fault fails the writer");
+        assert!(err.contains("file_dependency_edges"), "{}", err);
+        {
+            let ro = open_db_read_only(&db).expect("open ro");
+            assert!(
+                db_has_table(&ro, "symbol_chunk_map").unwrap(),
+                "the drop rolled back with the rest of the migration"
+            );
+            assert_eq!(count(&ro, "SELECT COUNT(*) FROM symbol_chunk_map"), 1);
+            assert_eq!(has_added_columns(&ro), none);
+        }
+
+        // Fault removed: the writer migrates, the table is gone, everything else is as before.
+        {
+            let raw = open_db_rw_raw(&db).unwrap();
+            raw.execute_batch("DROP INDEX file_dependency_edges;")
+                .unwrap();
+        }
+        let conn = open_db_writer(&db, &writer).expect("writer migrates");
+        assert!(!db_has_table(&conn, "symbol_chunk_map").unwrap());
+        assert_eq!(has_added_columns(&conn), all);
+        let expected: Vec<String> = tables_before
+            .iter()
+            .filter(|t| t.as_str() != "symbol_chunk_map")
+            .cloned()
+            .collect();
+        assert_eq!(table_names(&conn), expected, "only symbol_chunk_map went");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM projects"), 1);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM project_chunks"), 1);
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM project_chunk_vectors"),
+            1
+        );
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM symbols"), 1);
+        let hits = lexical_file_candidates(&conn, &cfg, &["runbook".to_string()], 5);
+        assert_eq!(hits.len(), 1);
+        let symbols = search_symbols_fts(&conn, "orion", 5).expect("symbol search");
+        assert_eq!(symbols.len(), 1);
+        drop(conn);
+        // Idempotent for the next writer.
+        let conn = open_db_writer(&db, &writer).expect("second writer open");
+        assert!(!db_has_table(&conn, "symbol_chunk_map").unwrap());
         drop(conn);
         drop(writer);
         let _ = fs::remove_dir_all(&dir);
