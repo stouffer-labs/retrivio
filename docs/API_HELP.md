@@ -18,23 +18,30 @@ Run API server: `retrivio api --host 127.0.0.1 --port 8765`
 | Method | Endpoint | Description |
 |---|---|---|
 | GET | `/search?q=<query>&limit=<n>&view=projects` | Search projects |
-| GET | `/search?q=<query>&limit=<n>&view=files&since_days=<n>` | Search files (`since_days` optional: drop files whose content date is older than `n` days) |
+| GET | `/search?q=<query>&limit=<n>&view=files&since_days=<n>&include_superseded=1` | Search files (`since_days` optional: drop files whose content date is older than `n` days; `include_superseded` optional: rank older handoffs of a series at full strength) |
 | GET | `/search/pick?q=<query>&timeout=<seconds>&verbose=<0\|1>&mode=<dirs\|files\|projects>` | Interactive picker response payload used by shell integration |
 
-`retrivio search --json [--since <days>]` prints exactly the `/search` payload for the chosen view.
+`retrivio search --json [--since <days>] [--include-superseded]` prints exactly the `/search` payload for the chosen view.
 
-#### Freshness fields (file, chunk and evidence results)
+#### Freshness, role and score fields (file, chunk and evidence results)
 
 Every file result, chunk result, evidence hit and `/context/pack` `chunks[]` entry carries:
 
 | Field | Type | Meaning |
 |---|---|---|
 | `doc_mtime` | number | File modification time (unix seconds) recorded at index time (file/chunk results) |
-| `content_date` | number | Date used for ranking: the newer of the path date (`YYYYMMDD`/`YYYYMM`/`YYYY-MM-DD` prefix on a path component) and `doc_mtime`, unix seconds |
+| `content_date` | number | Date used for ranking, unix seconds. State and knowledge: the newer of the path date (`YYYYMMDD`/`YYYYMM`/`YYYY-MM-DD` prefix on a path component) and `doc_mtime`. Records: the path date when there is one (the event), else `doc_mtime` |
 | `date_source` | string | `path-date` or `mtime` |
 | `age_days` | number | `now - content_date` in days, never negative |
-| `freshness_tier` | string | `fresh` (< 14 d), `aging` (14–35 d), `stale` (> 35 d); `record` for point-in-time documents matched by `recency_record_patterns` |
-| `is_record` | bool | True when the path matches `recency_record_patterns` |
+| `freshness_tier` | string | `fresh` (< 14 d), `aging` (14–35 d), then `stale` (knowledge) or `verify` (state) over 35 d; `record` for records at any age |
+| `role` | string | `state` (handoffs, status briefs, plans), `knowledge` (specs, notes, code, documents) or `record` (transcripts, call and meeting notes, customer signals), decided from the path relative to the project and, for `.txt`, the text shape; see the README "Roles and supersession" |
+| `verify` | bool | True for `state` older than 35 days: it was current once and must be re-checked before its facts are repeated |
+| `is_record` | bool | Compatibility alias: `role == "record"` |
+| `noise` | bool | True for machine artefacts (chat dumps, `.jsonl`/`.log`, lockfiles, minified code); their `quality` is low (file and chunk results) |
+| `raw_similarity` | number or null | Cosine similarity between the query and the result's best chunk, in [-1, 1]; the honest absolute number that `recall_min_abs_score` and `search_min_abs_score` compare against. `null` only in lexical-only retrieval (recall's fallback) |
+| `superseded_by` | string or null | File results only. For a `state` file, the path of the newest file of the same series (project, parent directory, normalised stem; newest by the date in the path, else the last edit) when this one is not it; such results are downranked unless `include_superseded` is set or the query asks for history explicitly (see README "Roles and supersession") |
+
+`score` and `semantic` stay relative: `semantic` is min-max normalised over the query's vector hits (the best hit is 1.0) and `score` is the fused, recency-blended value. Compare them between results of one query, never with a floor.
 
 Project results (`view=projects`, `search_projects`) carry `recency`: the relevance-weighted mean recency (0..1) of the project's evidence chunks. Scores already include the recency blend `final = (1 - w) * score + w * 0.5^(age_days / half_life)`; see the README "Freshness" section for the config keys.
 
@@ -98,9 +105,9 @@ Project results (`view=projects`, `search_projects`) carry `recency`: the releva
 | `lance_repaired`, `lance_orphans_removed` | LanceDB rows rebuilt from SQLite vectors and LanceDB rows without a SQLite vector removed by the repair step |
 | `graph_edges`, `retrieval_backend`, `retrieval_synced_chunks`, `retrieval_error`, `vector_failures`, `tracked_roots` | Project graph edges rebuilt, backend name, LanceDB row count, last sync error if any, embedding failures, roots covered |
 
-Chunk payloads include a stable `schema` field (`chunk-search-v2`, `chunk-related-v1`, `chunk-get-v1`, `doc-read-v1`) for contract-safe consumers. `chunk-search-v2` added the freshness fields (`doc_mtime`, `content_date`, `date_source`, `age_days`, `freshness_tier`, `is_record`) to every result; `chunk-search-v1` consumers only need to ignore the extra keys.
+Chunk payloads include a stable `schema` field (`chunk-search-v2`, `chunk-related-v1`, `chunk-get-v1`, `doc-read-v1`) for contract-safe consumers. `chunk-search-v2` added the freshness fields (`doc_mtime`, `content_date`, `date_source`, `age_days`, `freshness_tier`, `is_record`) to every result; version 0.2.0 adds `role`, `verify`, `noise` and `raw_similarity` under the same schema name (additive keys); `chunk-search-v1` consumers only need to ignore the extra keys.
 
-The MCP tools `search_files` and `search_chunks` accept the same optional `since_days` argument, and `search_files` / `search_chunks` / `pack_context` return the same freshness fields as the HTTP endpoints.
+The MCP tools `search_files` and `search_chunks` accept the same optional `since_days` argument, `search_files` also accepts `include_superseded` (boolean), and `search_files` / `search_chunks` / `pack_context` return the same freshness, role and score fields as the HTTP endpoints.
 
 ## API / Daemon Env Vars
 
