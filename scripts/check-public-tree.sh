@@ -4,7 +4,7 @@
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
-allowed='^(README\.md|Cargo\.toml|Cargo\.lock|LICENSE|\.gitignore|\.github/workflows/[^/]+\.yml|\.github/branding/[^/]+|crates/retrivio/.+|docs/DISTRIBUTION\.md|docs/API_HELP\.md|docs/skills/.+|scripts/install\.sh|scripts/retrivio-shell\.sh|scripts/retrivio-bedrock-refresh\.sh|scripts/check-public-tree\.sh|Formula/retrivio\.rb|assets/animated/[^/]+\.gif|retrivio)$'
+allowed='^(README\.md|Cargo\.toml|Cargo\.lock|LICENSE|\.gitignore|\.github/workflows/[^/]+\.yml|\.github/branding/[^/]+|crates/retrivio/.+|docs/DISTRIBUTION\.md|docs/API_HELP\.md|docs/TESTING\.md|docs/skills/.+|scripts/install\.sh|scripts/retrivio-shell\.sh|scripts/retrivio-bedrock-refresh\.sh|scripts/check-public-tree\.sh|scripts/smoke\.sh|scripts/harness-check\.sh|Formula/retrivio\.rb|assets/animated/[^/]+\.gif|retrivio)$'
 denied='(^|/)(tmp|\.tmp|internal|sessions|superpowers|\.comparo|\.retrivio[^/]*|target)(/|$)|HANDOFF|\.db$|\.jsonl$|\.DS_Store$'
 
 status=0

@@ -76,10 +76,27 @@ Project results (`view=projects`, `search_projects`) carry `recency`: the releva
 
 | Method | Endpoint | Description |
 |---|---|---|
-| POST | `/refresh` | Force refresh (`path` or `paths` array). No paths: every tracked root. Each path must be a tracked root (discovery runs on it) or a project directory (exactly that project is re-collected; its child directories are never indexed as projects). Any other path returns 400 with a message naming the project or root to use. The MCP tool `run_forced_refresh` applies the same rules and reports the resolved `roots` and `projects` |
+| POST | `/refresh` | Force refresh (`path` or `paths` array). No paths: every tracked root. Each path must be a tracked root (discovery runs on it, including the root's own "root files" project) or a project directory (exactly that project is re-collected; its child directories are never indexed as projects). Any other path returns 400 with a message naming the project or root to use. While another writer (`index`, `prune`, `watch`, another refresh) holds the index lock the call returns 409 with `index busy: another retrivio writer is running (pid N)`. The response carries a `stats` object (see below). The MCP tool `run_forced_refresh` applies the same rules and reports the resolved `roots` and `projects` |
 | POST | `/select` | Record selection event (`path` required, `query` optional) |
-| POST | `/tracked/add` | Add tracked root (`path` or `paths` array) |
-| POST | `/tracked/del` | Remove tracked root (`path` or `paths` array) |
+| POST | `/tracked/add` | Add tracked root (`path` or `paths` array). Taken under the index writer lock like every other write; 409 with `index busy: ...` while another writer runs |
+| POST | `/tracked/del` | Remove tracked root (`path` or `paths` array). Same lock and 409 as `/tracked/add` |
+
+#### Index statistics (`stats` of `POST /refresh`, MCP `run_incremental_index` and `run_forced_refresh`)
+
+| Field | Meaning |
+|---|---|
+| `total_projects`, `updated_projects`, `skipped_projects`, `removed_projects` | Projects discovered, re-collected, skipped by the change gate, and removed because their directory is gone |
+| `vectorized_projects` | Project summary vectors embedded (a summary is re-embedded only when its text changed) |
+| `files_selected`, `files_unchanged`, `files_rechunked` | Files the scans selected; of those, how many the manifest showed unchanged (never read) and how many were read and chunked |
+| `files_unreadable`, `projects_incomplete` | Directory entries that could not be read, and projects with at least one; such a project is indexed from what was readable, nothing of it is pruned and its signature does not advance |
+| `files_evicted_by_cap`, `files_truncated_by_cap` | Files left out entirely by `max_files_per_project` / `max_chunks_per_project`, and files indexed only in part |
+| `documents_extracted`, `documents_failed` | Documents (docx, pptx, odt, odp, xlsx, pdf, html) whose text was extracted this run, and documents that yielded none (over `max_document_bytes` or `max_document_uncompressed_bytes`, corrupt, parser error or panic, PDF child killed at `document_extract_timeout_ms` or 1 GiB). A failed document that was indexed before keeps its old content; one never indexed is absent |
+| `projects_failed`, `failures` | Projects whose run failed and `"<project>: <reason>"` for each; every one keeps its previous state (old signature, nothing pruned, nothing published) and is retried next run; the fingerprints do not advance |
+| `stopped` | Non-empty when the run stopped before visiting every project (the embedding backend failed after retries); names the reason and how many projects were left |
+| `lance_error` | Non-empty when LanceDB could not be opened, repaired or written this run; the dirty marker is set and the next writer run repairs LanceDB from the SQLite vectors, which are complete |
+| `chunk_rows`, `chunk_vectors`, `chunks_embedded`, `chunks_reused`, `chunks_deleted` | Chunks the scanned projects hold after the run, vectors written, chunks sent to the embedder, chunks whose stored vector was reused, chunk rows deleted |
+| `lance_repaired`, `lance_orphans_removed` | LanceDB rows rebuilt from SQLite vectors and LanceDB rows without a SQLite vector removed by the repair step |
+| `graph_edges`, `retrieval_backend`, `retrieval_synced_chunks`, `retrieval_error`, `vector_failures`, `tracked_roots` | Project graph edges rebuilt, backend name, LanceDB row count, last sync error if any, embedding failures, roots covered |
 
 Chunk payloads include a stable `schema` field (`chunk-search-v2`, `chunk-related-v1`, `chunk-get-v1`, `doc-read-v1`) for contract-safe consumers. `chunk-search-v2` added the freshness fields (`doc_mtime`, `content_date`, `date_source`, `age_days`, `freshness_tier`, `is_record`) to every result; `chunk-search-v1` consumers only need to ignore the extra keys.
 
