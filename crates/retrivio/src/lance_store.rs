@@ -56,10 +56,30 @@ pub fn open(path: &Path, dim: usize) -> Result<LanceStore, String> {
             .map_err(|e| format!("failed to list LanceDB tables: {}", e))?;
 
         let table = if table_names.iter().any(|n| n == "chunks") {
-            db.open_table("chunks")
+            let table = db
+                .open_table("chunks")
                 .execute()
                 .await
-                .map_err(|e| format!("failed to open LanceDB 'chunks' table: {}", e))?
+                .map_err(|e| format!("failed to open LanceDB 'chunks' table: {}", e))?;
+            // The table's physical vector width must match the configured model's; writing
+            // vectors of another width would fail row by row or, worse, mix spaces.
+            let schema = table
+                .schema()
+                .await
+                .map_err(|e| format!("failed to read LanceDB 'chunks' schema: {}", e))?;
+            if let Ok(field) = schema.field_with_name("vector") {
+                if let DataType::FixedSizeList(_, width) = field.data_type() {
+                    if *width as usize != dim {
+                        return Err(format!(
+                            "LanceDB table at '{}' stores {}-dimensional vectors but the configured embedding model produces {}; run `retrivio reembed` to rebuild it",
+                            path.display(),
+                            width,
+                            dim
+                        ));
+                    }
+                }
+            }
+            table
         } else {
             let schema = make_schema(dim);
             let batch = empty_batch(&schema, dim)?;
@@ -267,11 +287,17 @@ pub struct OptimizeReport {
 /// Version pruning keeps `delete_unverified` off: a file referenced by any manifest, including
 /// the versions being dropped, is known to be dead and is removed; an unreferenced file
 /// younger than 7 days may belong to another process's in-flight write and is left alone.
-/// What this does not protect is a process still reading an old snapshot at that instant:
-/// its one in-flight query or merge can fail with a missing file. Every Retrivio process
-/// opens the table with strong read consistency (see [`open`]) and so re-checks the latest
-/// version before each operation, which bounds that window to a single operation.
-pub fn optimize(store: &LanceStore) -> Result<OptimizeReport, String> {
+///
+/// Versions younger than `keep_versions_younger_than_secs` are retained (the
+/// `lance_version_grace_secs` key, default 120 s): a reader that opened an older snapshot
+/// (every Retrivio process opens the table with strong read consistency, so that is at most
+/// one operation old) can finish its query before the files it references go away. The recall
+/// hook's whole run is bounded by a 4 s deadline, so the default leaves a wide margin; `0`
+/// drops every old version at once.
+pub fn optimize(
+    store: &LanceStore,
+    keep_versions_younger_than_secs: u64,
+) -> Result<OptimizeReport, String> {
     use lancedb::table::{CompactionOptions, Duration as LanceDuration, OptimizeAction};
     runtime().block_on(async {
         let mut report = OptimizeReport::default();
@@ -292,7 +318,9 @@ pub fn optimize(store: &LanceStore) -> Result<OptimizeReport, String> {
         let pruned = store
             .table
             .optimize(OptimizeAction::Prune {
-                older_than: Some(LanceDuration::zero()),
+                older_than: Some(LanceDuration::seconds(
+                    keep_versions_younger_than_secs.min(i64::MAX as u64) as i64,
+                )),
                 delete_unverified: Some(false),
                 error_if_tagged_old_versions: Some(false),
             })
@@ -304,6 +332,15 @@ pub fn optimize(store: &LanceStore) -> Result<OptimizeReport, String> {
         }
         Ok(report)
     })
+}
+
+/// Number of dataset versions the `chunks` table keeps on disk (files under
+/// `chunks.lance/_versions`); 0 when the store does not exist. Every write commits one more
+/// version until [`optimize`] drops the old ones, so this is the compaction trigger.
+pub fn version_count(lance_dir: &Path) -> usize {
+    std::fs::read_dir(lance_dir.join("chunks.lance").join("_versions"))
+        .map(|rd| rd.flatten().count())
+        .unwrap_or(0)
 }
 
 /// Bytes used by every regular file under `path` (0 when it does not exist). Symlinks are
@@ -515,10 +552,25 @@ mod tests {
             .collect()
     }
 
-    fn version_count(dir: &Path) -> usize {
-        std::fs::read_dir(dir.join("chunks.lance").join("_versions"))
-            .map(|rd| rd.count())
-            .unwrap_or(0)
+    #[test]
+    fn opening_with_another_dimension_fails_with_a_clear_message() {
+        let dir = temp_lance_dir("dim");
+        assert_eq!(version_count(&dir), 0);
+        let mut store = open(&dir, 8).expect("open at 8");
+        upsert_chunks(&mut store, &[(1, vec_for(1, 8))]).unwrap();
+        drop(store);
+        assert!(version_count(&dir) >= 1);
+        let err = match open(&dir, 16) {
+            Ok(_) => panic!("16 against an 8-wide table must fail"),
+            Err(e) => e,
+        };
+        assert!(err.contains("stores 8-dimensional vectors"), "{}", err);
+        assert!(err.contains("produces 16"), "{}", err);
+        assert!(err.contains("retrivio reembed"), "{}", err);
+        // The right dimension still opens, data intact.
+        let again = open(&dir, 8).expect("reopen at 8");
+        assert_eq!(count(&again).unwrap(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Two `LanceStore` handles on one directory stand in for two processes (the watcher
@@ -580,9 +632,26 @@ mod tests {
         let size_before = dir_size_bytes(&dir);
         assert!(size_before > 0);
 
-        let report = optimize(&store).expect("optimize");
+        // A grace period longer than the store's age keeps every version: nothing is dropped
+        // under a reader that may still hold one of them.
+        let kept = optimize(&store, 3600).expect("optimize with grace");
+        assert_eq!(kept.old_versions, 0, "{:?}", kept);
+        assert!(
+            kept.fragments_removed > 0,
+            "compaction still ran: {:?}",
+            kept
+        );
+        // Compaction itself commits one more version; none of the old ones went away.
+        assert!(
+            version_count(&dir) >= versions_before,
+            "{}",
+            version_count(&dir)
+        );
+        assert_eq!(count(&store).unwrap(), 100);
+
+        // Without the grace period the old versions go (the fragments were folded above).
+        let report = optimize(&store, 0).expect("optimize");
         assert!(report.old_versions > 0, "{:?}", report);
-        assert!(report.fragments_removed > 0, "{:?}", report);
         assert!(report.bytes_removed > 0, "{:?}", report);
         let versions_after = version_count(&dir);
         assert!(

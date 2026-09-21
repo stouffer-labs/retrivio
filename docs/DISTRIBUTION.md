@@ -73,6 +73,8 @@ cargo test -p retrivio
 ./target/release/retrivio --version
 ```
 
+Then run the layered plan in [`docs/TESTING.md`](TESTING.md): L0 to L3 (unit tests, offline smoke test, live-store checks, Claude Code and Codex end-to-end checks) before installing a build on your live store, and every layer (L0 to L4 plus the scorecard regression) before a tag.
+
 ### 4. Tag the release
 
 After the version bump has merged to `main`:

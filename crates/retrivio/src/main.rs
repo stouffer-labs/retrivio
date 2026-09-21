@@ -8,6 +8,8 @@ use std::io::{BufRead, BufReader, BufWriter, IsTerminal, Read, Write};
 use std::net::{TcpListener, TcpStream};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
 use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
@@ -25,6 +27,7 @@ use sha1::{Digest, Sha1};
 use xxhash_rust::xxh64;
 
 mod code_intel;
+mod documents;
 mod freshness;
 mod hook_install;
 mod lance_store;
@@ -33,6 +36,21 @@ mod recall;
 const APP_STATE_ACTIVE_MODEL_KEY: &str = "active_model_key";
 const APP_STATE_REEMBED_REQUIRED: &str = "reembed_required";
 const APP_STATE_REEMBED_REASON: &str = "reembed_reason";
+/// The embedding fingerprint (model key, dimension, normalisation, pipeline version; see
+/// [`EmbedIdentity::fingerprint`]) the store was last completely indexed with. A different
+/// current fingerprint revisits every project so the per-chunk identity check decides.
+const APP_STATE_EMBED_FINGERPRINT: &str = "embedding_fingerprint";
+/// The scan caps and document settings of the last complete run (see [`ScanCaps::fingerprint`]).
+const APP_STATE_SCAN_CAPS_FINGERPRINT: &str = "scan_caps_fingerprint";
+/// "1" from the moment a batch of vectors is committed to sqlite until the matching LanceDB
+/// write succeeded; so a failed or interrupted Lance write leaves the marker set and the next
+/// writer run repairs LanceDB from sqlite (no embedding). Absent on stores that predate it,
+/// which makes the first writer run reconcile once.
+const APP_STATE_LANCE_DIRTY: &str = "lance_dirty";
+/// Bump whenever chunking or context-header logic changes the string handed to the embedder.
+/// Stored vectors carrying another version are never reused, and the next full run re-chunks
+/// every project so the new inputs reach the identity check.
+const EMBEDDING_PIPELINE_VERSION: i64 = 1;
 const SHELL_HOOK_MARKER_START: &str = "# >>> retrivio shell >>>";
 const SHELL_HOOK_MARKER_END: &str = "# <<< retrivio shell <<<";
 const SHELL_WRAPPER_ENV: &str = "RETRIVIO_SHELL_WRAPPER";
@@ -47,6 +65,9 @@ static BEDROCK_5XX_DIAG_LOGGED: AtomicBool = AtomicBool::new(false);
 /// the non-interactive credential export is time-boxed. Process-global and one-way.
 static HOOK_MODE: AtomicBool = AtomicBool::new(false);
 static OLLAMA_AUTOSTART_ONCE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+/// Set once a LanceDB write failed in this process: the dirty marker is then never cleared by
+/// a later successful write (the earlier failure's rows are still missing).
+static LANCE_WRITE_FAILED: AtomicBool = AtomicBool::new(false);
 
 /// Enter hook mode for the rest of the process (see [`HOOK_MODE`]).
 pub(crate) fn set_hook_mode() {
@@ -700,6 +721,8 @@ fn main() {
         "self-test" => run_self_test_cmd(&args[1..]),
         "graph" => run_graph_cmd(&args[1..]),
         "legacy" => run_legacy_cmd(&args[1..]),
+        // Hidden: the PDF extraction child the indexer spawns (documents.rs).
+        "documents" => process::exit(documents::run_documents_cmd(&args[1..])),
         _ => {
             if first.starts_with('-') {
                 eprintln!("error: unknown option '{}'", first);
@@ -861,8 +884,31 @@ const KNOWN_BEDROCK_EMBEDDING_MODELS: &[(&str, &str)] = &[
 fn default_embed_model_for_backend(backend: &str) -> &'static str {
     match backend {
         "bedrock" => "amazon.titan-embed-text-v2:0",
+        "hash" => HASH_BACKEND_MODEL,
         _ => "qwen3-embedding",
     }
+}
+
+/// The `embed_backend = "hash"` model name. The backend is [`LocalHashEmbedder`]: offline,
+/// deterministic, unit-length feature-hash vectors of `local_embed_dim` dimensions. For tests
+/// and smoke checks only; the vectors are not semantic. Its model key is `hash:<dim>`, so a
+/// store embedded with it is its own embedding space (a switch to or from it is a re-embed).
+const HASH_BACKEND_MODEL: &str = "local-hash";
+
+/// Model key of the hash backend at `dim` dimensions (the same value [`LocalHashEmbedder`]
+/// reports, so config-derived and embedder-derived keys agree).
+fn hash_model_key(dim: i64) -> String {
+    format!(
+        "hash:{}",
+        LocalHashEmbedder::effective_dim(dim.max(0) as usize)
+    )
+}
+
+/// Backends `retrivio index` can embed with.
+const EMBED_BACKENDS: &[&str] = &["ollama", "bedrock", "hash"];
+
+fn is_known_embed_backend(name: &str) -> bool {
+    EMBED_BACKENDS.contains(&name)
 }
 
 fn is_probably_bedrock_model_id(model: &str) -> bool {
@@ -1101,6 +1147,13 @@ fn run_doctor(args: &[OsString]) {
     );
     println!("embed backend configured: {}", embed_backend);
     println!("embed model configured: {}", embed_model);
+    if embed_backend == "hash" {
+        println!(
+            "embed backend note: hash is offline feature hashing ({} dims, model key {}); for tests and smoke checks only, not semantic",
+            LocalHashEmbedder::effective_dim(cfg.local_embed_dim.max(0) as usize),
+            model_key_for_cfg(&cfg)
+        );
+    }
     if embed_backend == "bedrock" {
         let region = bedrock_region_for_cfg(Some(&cfg));
         let profile =
@@ -2568,7 +2621,10 @@ fn parse_autotune_options(args: &[OsString]) -> AutotuneOptions {
 fn config_rows() -> Vec<(&'static str, &'static str)> {
     vec![
         ("root", "Root path hint (not auto-tracked)"),
-        ("embed_backend", "Embedding backend"),
+        (
+            "embed_backend",
+            "Embedding backend: ollama, bedrock, or hash (offline, tests and smoke checks only; not semantic)",
+        ),
         ("embed_model", "Embedding model id"),
         ("aws_profile", "AWS profile for Bedrock"),
         ("aws_region", "AWS region for Bedrock"),
@@ -2583,6 +2639,37 @@ fn config_rows() -> Vec<(&'static str, &'static str)> {
         ("retrieval_backend", "Retrieval backend"),
         ("local_embed_dim", "Embedding dimension for local models"),
         ("max_chars_per_project", "Indexing cap per project"),
+        ("max_files_per_project", "Files indexed per project at most"),
+        (
+            "max_chunks_per_project",
+            "Chunks indexed per project at most",
+        ),
+        ("max_chunks_per_file", "Chunks indexed per file at most"),
+        ("max_file_chars", "Characters read per file at most"),
+        (
+            "index_documents",
+            "Extract text from docx, pptx, odt, odp, xlsx, pdf (text-based) and html",
+        ),
+        (
+            "max_document_bytes",
+            "Documents larger than this are skipped (counted as failed)",
+        ),
+        (
+            "max_document_uncompressed_bytes",
+            "Office/OpenDocument archives declaring more uncompressed bytes than this are refused unread",
+        ),
+        (
+            "document_extract_timeout_ms",
+            "PDF extraction runs in a child process killed after this many milliseconds",
+        ),
+        (
+            "lance_compact_versions",
+            "Watcher compacts LanceDB when it holds more versions than this (0 = never)",
+        ),
+        (
+            "lance_version_grace_secs",
+            "Compaction keeps LanceDB versions younger than this so concurrent readers finish",
+        ),
         ("lexical_candidates", "Lexical candidates"),
         ("vector_candidates", "Vector candidates"),
         ("rank_chunk_semantic_weight", "Chunk score semantic weight"),
@@ -2696,12 +2783,14 @@ fn config_rows() -> Vec<(&'static str, &'static str)> {
 
 fn config_enum_options(key: &str) -> Option<Vec<&'static str>> {
     match key {
-        "embed_backend" => Some(vec!["ollama", "bedrock"]),
+        "embed_backend" => Some(EMBED_BACKENDS.to_vec()),
         "retrieval_backend" => Some(vec!["lancedb"]),
         "recall_semantic" => Some(vec!["auto", "on", "off"]),
-        "hyde_enabled" | "reranker_enabled" | "recall_excerpts" | "recall_system_message" => {
-            Some(vec!["false", "true"])
-        }
+        "hyde_enabled"
+        | "reranker_enabled"
+        | "recall_excerpts"
+        | "recall_system_message"
+        | "index_documents" => Some(vec!["false", "true"]),
         _ => None,
     }
 }
@@ -2721,6 +2810,16 @@ fn config_value_string(cfg: &ConfigValues, key: &str) -> Option<String> {
         "retrieval_backend" => Some(cfg.retrieval_backend.clone()),
         "local_embed_dim" => Some(cfg.local_embed_dim.to_string()),
         "max_chars_per_project" => Some(cfg.max_chars_per_project.to_string()),
+        "max_files_per_project" => Some(cfg.max_files_per_project.to_string()),
+        "max_chunks_per_project" => Some(cfg.max_chunks_per_project.to_string()),
+        "max_chunks_per_file" => Some(cfg.max_chunks_per_file.to_string()),
+        "max_file_chars" => Some(cfg.max_file_chars.to_string()),
+        "index_documents" => Some(cfg.index_documents.to_string()),
+        "max_document_bytes" => Some(cfg.max_document_bytes.to_string()),
+        "max_document_uncompressed_bytes" => Some(cfg.max_document_uncompressed_bytes.to_string()),
+        "document_extract_timeout_ms" => Some(cfg.document_extract_timeout_ms.to_string()),
+        "lance_compact_versions" => Some(cfg.lance_compact_versions.to_string()),
+        "lance_version_grace_secs" => Some(cfg.lance_version_grace_secs.to_string()),
         "lexical_candidates" => Some(cfg.lexical_candidates.to_string()),
         "vector_candidates" => Some(cfg.vector_candidates.to_string()),
         "rank_chunk_semantic_weight" => Some(format!("{:.6}", cfg.rank_chunk_semantic_weight)),
@@ -2788,8 +2887,11 @@ fn config_set_value(cfg: &mut ConfigValues, key: &str, raw: &str) -> Result<(), 
             let old_backend = cfg.embed_backend.clone();
             let old_default = default_embed_model_for_backend(&old_backend).to_string();
             let v = value.to_lowercase();
-            if !matches!(v.as_str(), "ollama" | "bedrock") {
-                return Err("embed_backend must be one of: ollama, bedrock".to_string());
+            if !is_known_embed_backend(&v) {
+                return Err(format!(
+                    "embed_backend must be one of: {}",
+                    EMBED_BACKENDS.join(", ")
+                ));
             }
             cfg.embed_backend = v;
             let current_model = cfg.embed_model.trim();
@@ -2848,6 +2950,63 @@ fn config_set_value(cfg: &mut ConfigValues, key: &str, raw: &str) -> Result<(), 
                 .parse::<i64>()
                 .map_err(|_| "max_chars_per_project must be an integer".to_string())?
                 .clamp(1000, 500_000);
+        }
+        "max_files_per_project" => {
+            cfg.max_files_per_project = value
+                .parse::<i64>()
+                .map_err(|_| "max_files_per_project must be an integer".to_string())?
+                .clamp(1, 1_000_000);
+        }
+        "max_chunks_per_project" => {
+            cfg.max_chunks_per_project = value
+                .parse::<i64>()
+                .map_err(|_| "max_chunks_per_project must be an integer".to_string())?
+                .clamp(1, 10_000_000);
+        }
+        "max_chunks_per_file" => {
+            cfg.max_chunks_per_file = value
+                .parse::<i64>()
+                .map_err(|_| "max_chunks_per_file must be an integer".to_string())?
+                .clamp(1, 100_000);
+        }
+        "max_file_chars" => {
+            cfg.max_file_chars = value
+                .parse::<i64>()
+                .map_err(|_| "max_file_chars must be an integer".to_string())?
+                .clamp(1000, 50_000_000);
+        }
+        "index_documents" => {
+            cfg.index_documents = parse_bool_setting(key, value)?;
+        }
+        "max_document_bytes" => {
+            cfg.max_document_bytes = value
+                .parse::<i64>()
+                .map_err(|_| "max_document_bytes must be an integer".to_string())?
+                .clamp(1000, 2_000_000_000);
+        }
+        "max_document_uncompressed_bytes" => {
+            cfg.max_document_uncompressed_bytes = value
+                .parse::<i64>()
+                .map_err(|_| "max_document_uncompressed_bytes must be an integer".to_string())?
+                .clamp(1000, 20_000_000_000);
+        }
+        "document_extract_timeout_ms" => {
+            cfg.document_extract_timeout_ms = value
+                .parse::<i64>()
+                .map_err(|_| "document_extract_timeout_ms must be an integer".to_string())?
+                .clamp(500, 600_000);
+        }
+        "lance_compact_versions" => {
+            cfg.lance_compact_versions = value
+                .parse::<i64>()
+                .map_err(|_| "lance_compact_versions must be an integer".to_string())?
+                .clamp(0, 1_000_000);
+        }
+        "lance_version_grace_secs" => {
+            cfg.lance_version_grace_secs = value
+                .parse::<i64>()
+                .map_err(|_| "lance_version_grace_secs must be an integer".to_string())?
+                .clamp(0, 86_400);
         }
         "lexical_candidates" => {
             cfg.lexical_candidates = value
@@ -8006,8 +8165,12 @@ fn run_init(args: &[OsString]) {
                 if v == "auto" {
                     v = "ollama".to_string();
                 }
-                if !matches!(v.as_str(), "ollama" | "bedrock") {
-                    eprintln!("error: invalid --embed-backend '{}'", v);
+                if !is_known_embed_backend(&v) {
+                    eprintln!(
+                        "error: invalid --embed-backend '{}' (one of {})",
+                        v,
+                        EMBED_BACKENDS.join(", ")
+                    );
                     process::exit(2);
                 }
                 cfg.embed_backend = v;
@@ -8612,6 +8775,12 @@ fn run_add(args: &[OsString]) {
         process::exit(2);
     }
 
+    // Every tracked-root mutation happens under the writer lock, like every other write; the
+    // refresh below runs under the same lock.
+    let writer = WriterLock::try_acquire(&data_dir(&cwd)).unwrap_or_else(|e| {
+        eprintln!("error: {}", e);
+        process::exit(1);
+    });
     let conn = open_db_rw(&db_path).unwrap_or_else(|e| {
         eprintln!("error: failed to open database: {}", e);
         process::exit(1);
@@ -8688,19 +8857,24 @@ fn run_add(args: &[OsString]) {
             }
         }
         let force_paths: HashSet<PathBuf> = added.iter().cloned().collect();
-        run_index_with_strategy(
-            &cwd,
-            &cfg,
-            IndexScope::roots(added.clone()),
-            true,
-            Some(force_paths),
-            false,
-            "add refresh",
-        )
-        .unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            process::exit(1);
-        });
+        ensure_retrieval_backend_ready(&cfg, true, "add refresh")
+            .and_then(|_| ensure_native_embed_backend(&cfg, "add refresh"))
+            .and_then(|_| {
+                run_index_with_lock(
+                    &cwd,
+                    &cfg,
+                    &writer,
+                    IndexScope::roots(added.clone()),
+                    true,
+                    Some(force_paths),
+                    false,
+                    "add refresh",
+                )
+            })
+            .unwrap_or_else(|e| {
+                eprintln!("error: {}", e);
+                process::exit(1);
+            });
     } else {
         println!("note: run `retrivio index` when ready.");
     }
@@ -8742,6 +8916,12 @@ fn run_del(args: &[OsString]) {
         process::exit(2);
     }
 
+    // Under the writer lock: a running watcher or index must not see the root vanish
+    // mid-run, and the refresh below runs under the same lock.
+    let writer = WriterLock::try_acquire(&data_dir(&cwd)).unwrap_or_else(|e| {
+        eprintln!("error: {}", e);
+        process::exit(1);
+    });
     let mut removed = 0i64;
     for raw in inputs {
         let path = normalize_path(&raw);
@@ -8760,19 +8940,24 @@ fn run_del(args: &[OsString]) {
         }
     }
     if refresh {
-        run_index_with_strategy(
-            &cwd,
-            &_cfg,
-            IndexScope::AllRoots,
-            false,
-            None,
-            true,
-            "delete refresh",
-        )
-        .unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            process::exit(1);
-        });
+        ensure_retrieval_backend_ready(&_cfg, true, "delete refresh")
+            .and_then(|_| ensure_native_embed_backend(&_cfg, "delete refresh"))
+            .and_then(|_| {
+                run_index_with_lock(
+                    &cwd,
+                    &_cfg,
+                    &writer,
+                    IndexScope::AllRoots,
+                    false,
+                    None,
+                    true,
+                    "delete refresh",
+                )
+            })
+            .unwrap_or_else(|e| {
+                eprintln!("error: {}", e);
+                process::exit(1);
+            });
     } else if removed > 0 {
         println!("note: run `retrivio refresh` when convenient.");
     }
@@ -8844,6 +9029,10 @@ fn run_exclude_cmd(args: &[OsString]) {
         eprintln!("error: failed to initialize database: {}", e);
         process::exit(1);
     });
+    let _writer = WriterLock::try_acquire(&data_dir(&cwd)).unwrap_or_else(|e| {
+        eprintln!("error: {}", e);
+        process::exit(1);
+    });
     let conn = open_db_rw(&db_path).unwrap_or_else(|e| {
         eprintln!("error: failed to open database: {}", e);
         process::exit(1);
@@ -8893,6 +9082,10 @@ fn run_include_cmd(args: &[OsString]) {
     let db_path = db_path(&cwd);
     ensure_db_schema(&db_path).unwrap_or_else(|e| {
         eprintln!("error: failed to initialize database: {}", e);
+        process::exit(1);
+    });
+    let _writer = WriterLock::try_acquire(&data_dir(&cwd)).unwrap_or_else(|e| {
+        eprintln!("error: {}", e);
         process::exit(1);
     });
     let conn = open_db_rw(&db_path).unwrap_or_else(|e| {
@@ -8981,10 +9174,24 @@ fn run_refresh_cmd(args: &[OsString]) {
         scoped.push(normalize_path(&s));
     }
 
+    ensure_retrieval_backend_ready(&cfg, true, "refresh").unwrap_or_else(|e| {
+        eprintln!("error: {}", e);
+        process::exit(1);
+    });
+    ensure_native_embed_backend(&cfg, "refresh").unwrap_or_else(|e| {
+        eprintln!("error: {}", e);
+        process::exit(1);
+    });
+    // Planning a scoped refresh reads project rows, so the writer lock is taken (and the
+    // schema brought up to date) before the plan, not only before the index run.
+    let writer = WriterLock::try_acquire(&data_dir(&cwd)).unwrap_or_else(|e| {
+        eprintln!("error: {}", e);
+        process::exit(1);
+    });
     let (scope, remove_missing) = if scoped.is_empty() {
         (IndexScope::AllRoots, true)
     } else {
-        let conn = open_db_rw(&db_path(&cwd)).unwrap_or_else(|e| {
+        let conn = open_db_writer(&db_path(&cwd), &writer).unwrap_or_else(|e| {
             eprintln!("error: {}", e);
             process::exit(1);
         });
@@ -8995,11 +9202,20 @@ fn run_refresh_cmd(args: &[OsString]) {
         (scope, false)
     };
 
-    run_index_with_strategy(&cwd, &cfg, scope, true, None, remove_missing, "refresh")
-        .unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            process::exit(1);
-        });
+    run_index_with_lock(
+        &cwd,
+        &cfg,
+        &writer,
+        scope,
+        true,
+        None,
+        remove_missing,
+        "refresh",
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("error: {}", e);
+        process::exit(1);
+    });
 }
 
 fn run_reembed_cmd(args: &[OsString]) {
@@ -9028,9 +9244,14 @@ fn run_reembed_cmd(args: &[OsString]) {
         process::exit(1);
     });
 
+    let writer = WriterLock::try_acquire(&data_dir(&cwd)).unwrap_or_else(|e| {
+        eprintln!("error: {}", e);
+        process::exit(1);
+    });
     let mut stats = run_native_index(
         &cwd,
         &cfg,
+        &writer,
         IndexScope::AllRoots,
         true,
         HashSet::new(),
@@ -9042,9 +9263,19 @@ fn run_reembed_cmd(args: &[OsString]) {
         eprintln!("error: {}", e);
         process::exit(1);
     });
+    if let Err(e) = index_run_verdict(&stats) {
+        // Some project still holds vectors of the old model: LanceDB is not rebuilt and the
+        // re-embed is not marked complete; the next `reembed` retries.
+        print_index_stats(&stats, &cfg);
+        eprintln!("error: {}", e);
+        eprintln!(
+            "hint: LanceDB was not rebuilt; rerun `retrivio reembed` once the failure is resolved"
+        );
+        process::exit(1);
+    }
 
     let dbp = db_path(&cwd);
-    let conn = open_db_rw(&dbp).unwrap_or_else(|e| {
+    let conn = open_db_writer(&dbp, &writer).unwrap_or_else(|e| {
         eprintln!("error: {}", e);
         process::exit(1);
     });
@@ -9158,19 +9389,28 @@ fn run_prune(
     if !dbp.exists() {
         return Err("no index database found; run `retrivio index` first".to_string());
     }
-    let conn = open_db_rw(&dbp)?;
+    let writer = WriterLock::try_acquire(&data_dir(cwd))?;
+    let conn = open_db_writer(&dbp, &writer)?;
     let roots = resolve_roots(&conn, cfg, None)?;
     if roots.is_empty() {
         return Err("No tracked roots configured. Add one with `retrivio add <path>`.".to_string());
     }
     let scope_set: Option<HashSet<PathBuf>> = scope.map(|v| v.into_iter().collect());
     let in_scope = |p: &Path| scope_set.as_ref().map_or(true, |s| is_under_any(p, s));
-    let discovered = discover_projects(&roots);
-    let discovered_set: HashSet<String> = discovered
+    let discovery = discover_projects_full(&roots);
+    let incomplete_roots = discovery.incomplete_roots.clone();
+    let discovered_set: HashSet<String> = discovery
+        .projects
         .iter()
         .map(|p| p.to_string_lossy().to_string())
         .collect();
-    let projects: Vec<PathBuf> = discovered.into_iter().filter(|p| in_scope(p)).collect();
+    let projects: Vec<PathBuf> = discovery
+        .projects
+        .iter()
+        .filter(|p| in_scope(p))
+        .cloned()
+        .collect();
+    let discovery = &discovery;
 
     let model_key = model_key_for_cfg(cfg);
     let lance_ready = match vector_dim_from_sqlite(&conn, &model_key) {
@@ -9194,6 +9434,7 @@ fn run_prune(
     );
 
     let max_chars = cfg.max_chars_per_project as usize;
+    let caps = ScanCaps::from_cfg(cfg);
     const PRUNE_PARALLELISM: usize = 4;
     let mut total = PruneOutcome::default();
     let mut projects_pruned = 0usize;
@@ -9209,15 +9450,27 @@ fn run_prune(
                 .map(|(i, dir)| {
                     let results = &results;
                     let roots = &roots;
+                    let caps = &caps;
                     s.spawn(move || {
-                        // An unreadable directory (unmounted volume, permissions) must not
-                        // read as an empty corpus and wipe the project's rows.
-                        let result = match fs::read_dir(dir) {
-                            Err(e) => Err(format!("cannot read {}: {}", dir.display(), e)),
-                            Ok(_) => {
-                                let excludes = project_excludes_for_path(dir, roots);
-                                collect_project_corpus(dir, max_chars, 0.0, &excludes)
-                            }
+                        // An unreadable directory anywhere in the project (unmounted volume,
+                        // permissions) must not read as a smaller corpus and wipe rows.
+                        let excludes = project_excludes_for_path(dir, roots);
+                        let scan = project_scan(dir, &excludes, caps, discovery.is_shallow(dir));
+                        let result = if !scan.complete() {
+                            Err(format!(
+                                "{}: {} directory entries unreadable",
+                                dir.display(),
+                                scan.listing.unreadable
+                            ))
+                        } else {
+                            Ok(collect_project_corpus(
+                                dir,
+                                &scan,
+                                caps,
+                                max_chars,
+                                &FileManifest::new(),
+                                true,
+                            ))
                         };
                         if let Ok(mut v) = results.lock() {
                             v.push((i, dir.clone(), result));
@@ -9240,12 +9493,12 @@ fn run_prune(
                     continue;
                 }
             };
-            let path_str = dir.to_string_lossy().to_string();
+            let path_str = corpus.doc.path.to_string_lossy().to_string();
             // Never indexed: nothing to prune.
             let Some(row) = get_project_by_path(&conn, &path_str)? else {
                 continue;
             };
-            let keep = PruneKeepSet::from_chunks(&corpus.chunks);
+            let keep = PruneKeepSet::from_corpus(&corpus);
             let outcome = prune_stale_project_rows(&conn, row.id, &keep, dry_run)?;
             if outcome.is_empty() {
                 continue;
@@ -9281,7 +9534,7 @@ fn run_prune(
                 }
             );
             if !dry_run && lance_ready && !outcome.chunk_ids.is_empty() {
-                match delete_lance_vectors_for_chunks(&outcome.chunk_ids) {
+                match lance_delete_marked(&conn, &outcome.chunk_ids) {
                     Ok(n) => lance_deleted += n,
                     Err(e) => {
                         lance_delete_failed += outcome.chunk_ids.len();
@@ -9294,12 +9547,9 @@ fn run_prune(
     }
 
     // Projects whose directory vanished, is now excluded, or whose root is no longer tracked.
-    // Projects under a tracked root that is not readable right now are left alone.
-    let unavailable_roots: HashSet<PathBuf> = roots
-        .iter()
-        .filter(|r| !r.path.is_dir())
-        .map(|r| r.path.clone())
-        .collect();
+    // Projects under a tracked root that is not (fully) readable right now are left alone.
+    let mut unavailable_roots = unavailable_roots(&roots);
+    unavailable_roots.extend(incomplete_roots);
     for root in &unavailable_roots {
         println!(
             "  note: tracked root {} is not readable now; its projects are left alone",
@@ -9347,7 +9597,7 @@ fn run_prune(
             conn.execute("DELETE FROM projects WHERE id = ?1", params![id])
                 .map_err(|e| format!("failed deleting stale project row: {}", e))?;
             if lance_ready && !ids.is_empty() {
-                match delete_lance_vectors_for_chunks(&ids) {
+                match lance_delete_marked(&conn, &ids) {
                     Ok(n) => lance_deleted += n,
                     Err(e) => {
                         lance_delete_failed += ids.len();
@@ -9360,31 +9610,48 @@ fn run_prune(
         stale_project_chunks += ids.len();
     }
 
-    // LanceDB rows nothing in sqlite refers to any more.
+    // Reconcile LanceDB with sqlite: rows with no sqlite vector are removed, rows sqlite has
+    // a vector for and LanceDB lacks are rebuilt from the stored blobs (no embedding).
     let mut lance_orphans = 0usize;
+    let mut lance_rebuilt = 0usize;
     let mut lance_rows_after: Option<usize> = None;
-    if lance_ready {
-        match lance_orphan_chunk_ids(&conn) {
-            Ok(orphans) => {
-                lance_orphans = orphans.len();
-                if !orphans.is_empty() {
-                    println!(
-                        "  {} {} LanceDB vectors with no sqlite chunk",
-                        verb,
-                        orphans.len()
-                    );
-                    if !dry_run {
-                        match delete_lance_vectors_for_chunks(&orphans) {
-                            Ok(n) => lance_deleted += n,
-                            Err(e) => {
-                                lance_delete_failed += orphans.len();
-                                eprintln!("warning: LanceDB orphan delete failed: {}", e);
-                            }
-                        }
+    // While a re-embed is pending (model changed), sqlite may hold vectors of two models under
+    // the same chunk ids; reconciling against the new model would drop the old rows LanceDB
+    // still serves. `reembed` rebuilds LanceDB wholesale when it completes.
+    let reembed_pending = reembed_requirement_reason(&conn, cfg)?.is_some();
+    if reembed_pending {
+        println!("  note: a re-embed is pending; LanceDB reconciliation skipped until `retrivio reembed` completes");
+    }
+    if lance_ready && !reembed_pending {
+        if dry_run {
+            match lance_reconcile_preview(&conn, &model_key) {
+                Ok((missing, orphans)) => {
+                    lance_orphans = orphans;
+                    lance_rebuilt = missing;
+                    if orphans > 0 || missing > 0 {
+                        println!(
+                            "  would remove {} LanceDB vectors with no sqlite chunk and rebuild {} missing from sqlite",
+                            orphans, missing
+                        );
                     }
                 }
+                Err(e) => eprintln!("warning: LanceDB reconcile scan failed: {}", e),
             }
-            Err(e) => eprintln!("warning: LanceDB orphan scan failed: {}", e),
+        } else {
+            match repair_lance_from_sqlite(&conn, &model_key, true) {
+                Ok(report) => {
+                    lance_orphans = report.orphans_removed;
+                    lance_rebuilt = report.rebuilt;
+                    lance_deleted += report.orphans_removed;
+                    if report.orphans_removed > 0 || report.rebuilt > 0 {
+                        println!(
+                            "  removed {} LanceDB vectors with no sqlite chunk; rebuilt {} missing from sqlite",
+                            report.orphans_removed, report.rebuilt
+                        );
+                    }
+                }
+                Err(e) => eprintln!("warning: LanceDB repair failed: {}", e),
+            }
         }
         lance_rows_after = with_lance_store(|store| lance_store::count(store)).ok();
     }
@@ -9443,6 +9710,11 @@ fn run_prune(
                 }
             );
         }
+        println!(
+            "  lancedb rows {} from sqlite: {}",
+            if dry_run { "to rebuild" } else { "rebuilt" },
+            lance_rebuilt
+        );
         if let Some(n) = lance_rows_after {
             println!("  lancedb rows now: {}", n);
         }
@@ -9462,13 +9734,18 @@ fn run_prune(
             );
         } else {
             let t_compact = Instant::now();
-            match with_lance_store(|store| lance_store::optimize(store)) {
+            let versions_before = lance_store::version_count(&lance_dir);
+            match with_lance_store(|store| {
+                lance_store::optimize(store, cfg.lance_version_grace_secs.max(0) as u64)
+            }) {
                 Ok(report) => {
                     let size_after = lance_store::dir_size_bytes(&lance_dir);
                     println!(
-                        "  lancedb compacted: {} -> {} on disk; rewrote {} fragments into {}, dropped {} old versions ({})",
+                        "  lancedb compacted: {} -> {} on disk; versions {} -> {}; rewrote {} fragments into {}, dropped {} old versions ({})",
                         format_bytes(size_before),
                         format_bytes(size_after),
+                        versions_before,
+                        lance_store::version_count(&lance_dir),
                         report.fragments_removed,
                         report.fragments_added,
                         report.old_versions,
@@ -9741,6 +10018,9 @@ fn watch_stats_changed(stats: &IndexStats) -> bool {
         || stats.vectorized_projects > 0
         || stats.chunk_vectors > 0
         || stats.vector_failures > 0
+        || stats.projects_failed > 0
+        || !stats.stopped.is_empty()
+        || !stats.lance_error.is_empty()
 }
 
 fn print_watch_tick(label: &str, stats: &IndexStats, quiet: bool) {
@@ -9749,19 +10029,43 @@ fn print_watch_tick(label: &str, stats: &IndexStats, quiet: bool) {
     }
     let now = chrono_like_now();
     println!(
-        "[{}] {} updated={} removed={} vectorized={} chunk_vectors={} skipped={}",
+        "[{}] {} updated={} removed={} vectorized={} chunk_vectors={} skipped={} files={}/{}/{} unreadable={} evicted={} documents={}/{} chunks_embedded={} chunks_reused={} chunks_deleted={} lance_repaired={} failed={}",
         now,
         label,
         stats.updated_projects,
         stats.removed_projects,
         stats.vectorized_projects,
         stats.chunk_vectors,
-        stats.skipped_projects
+        stats.skipped_projects,
+        stats.files_selected,
+        stats.files_unchanged,
+        stats.files_rechunked,
+        stats.files_unreadable,
+        stats.files_evicted_by_cap,
+        stats.documents_extracted,
+        stats.documents_failed,
+        stats.chunks_embedded,
+        stats.chunks_reused,
+        stats.chunks_deleted,
+        stats.lance_repaired,
+        stats.projects_failed
     );
     if stats.vector_failures > 0 {
         println!(
             "[{}] {} vector_failures={}",
             now, label, stats.vector_failures
+        );
+    }
+    for line in &stats.failures {
+        println!("[{}] {} failed: {}", now, label, line);
+    }
+    if !stats.stopped.is_empty() {
+        println!("[{}] {} stopped early: {}", now, label, stats.stopped);
+    }
+    if !stats.lance_error.is_empty() {
+        println!(
+            "[{}] {} lancedb: {} (dirty marker set; repaired on the next run)",
+            now, label, stats.lance_error
         );
     }
 }
@@ -9793,11 +10097,22 @@ fn normalize_watch_path(path: &Path) -> PathBuf {
     normalize_lexical(&cwd.join(path))
 }
 
+/// Whether a changed path can affect the index at all. Dropped before it is even queued:
+/// anything under a hidden directory, a built-in or `skip_dir_names` directory or a macOS
+/// `.app` bundle, hidden files, and files whose suffix the indexer never reads. A path without
+/// a suffix (a directory being created, moved or deleted) stays relevant, because that is how
+/// a new or vanished project announces itself.
 fn watch_path_relevant(path: &Path) -> bool {
+    watch_path_relevant_with(path, &is_skip_dir)
+}
+
+/// [`watch_path_relevant`] with the skip-directory predicate supplied (tests pass their own
+/// set instead of the process-wide `skip_dir_names`).
+fn watch_path_relevant_with(path: &Path, is_skip: &dyn Fn(&str) -> bool) -> bool {
     for comp in path.components() {
         if let Component::Normal(name) = comp {
             let seg = name.to_string_lossy();
-            if seg.starts_with('.') || is_skip_dir(&seg) {
+            if seg.starts_with('.') || is_skip(&seg) {
                 return false;
             }
         }
@@ -9819,6 +10134,71 @@ fn watch_path_relevant(path: &Path) -> bool {
     is_indexable_suffix(&format!(".{}", ext))
 }
 
+/// One line naming what a watch run is about to scan, printed even with `--quiet` so the log
+/// always shows which project a tick belonged to.
+fn watch_scope_line(scope: &IndexScope) -> String {
+    let mut names: Vec<String> = Vec::new();
+    if let IndexScope::Targets { roots, projects } = scope {
+        for root in roots {
+            names.push(format!(
+                "{} (discovery)",
+                path_basename(&root.to_string_lossy())
+            ));
+        }
+        for project in projects {
+            names.push(path_basename(&project.to_string_lossy()));
+        }
+    }
+    format!(
+        "[{}] watch: changes in {}",
+        chrono_like_now(),
+        names.join(", ")
+    )
+}
+
+/// Compact LanceDB when it holds more than `threshold` versions on disk; 0 disables. Called
+/// from the watcher's periodic sweep, so a busy day of small writes cannot grow the store
+/// without bound (Slice 0 measured 1,793 versions and 3.7 GB before this existed).
+fn lance_compaction_due(versions: usize, threshold: i64) -> bool {
+    threshold > 0 && versions as i64 > threshold
+}
+
+fn maybe_compact_lance(cwd: &Path, cfg: &ConfigValues, label: &str) {
+    let lance_dir = data_dir(cwd).join("lance");
+    let versions_before = lance_store::version_count(&lance_dir);
+    if !lance_compaction_due(versions_before, cfg.lance_compact_versions) || !lance_store_is_open()
+    {
+        return;
+    }
+    let size_before = lance_store::dir_size_bytes(&lance_dir);
+    let t = Instant::now();
+    match with_lance_store(|store| {
+        lance_store::optimize(store, cfg.lance_version_grace_secs.max(0) as u64)
+    }) {
+        Ok(report) => println!(
+            "[{}] {} lancedb compacted: versions {} -> {} (threshold {}), {} -> {} on disk, rewrote {} fragments into {}, dropped {} old versions ({})",
+            chrono_like_now(),
+            label,
+            versions_before,
+            lance_store::version_count(&lance_dir),
+            cfg.lance_compact_versions,
+            format_bytes(size_before),
+            format_bytes(lance_store::dir_size_bytes(&lance_dir)),
+            report.fragments_removed,
+            report.fragments_added,
+            report.old_versions,
+            format_duration_ms(t.elapsed().as_millis() as u64)
+        ),
+        Err(e) => eprintln!(
+            "[{}] {} warning: LanceDB compaction failed ({} versions on disk): {}",
+            chrono_like_now(),
+            label,
+            versions_before,
+            e
+        ),
+    }
+}
+
 /// Map changed paths onto what to index: a path inside a known project forces that project
 /// (as a project, never as a root to discover); a path under a tracked root but outside every
 /// known project (a new directory) sends discovery to that root.
@@ -9829,7 +10209,7 @@ fn derive_watch_targets(
     if pending_paths.is_empty() || tracked_roots.is_empty() {
         return (IndexScope::projects(Vec::new()), HashSet::new());
     }
-    let known_projects = discover_projects(tracked_roots);
+    let discovery = discover_projects_full(tracked_roots);
     let root_paths: Vec<PathBuf> = tracked_roots.iter().map(|r| r.path.clone()).collect();
     let mut root_set: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
     let mut project_set: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
@@ -9842,10 +10222,17 @@ fn derive_watch_targets(
         let Some(root) = longest_prefix_match(&path, &root_paths) else {
             continue;
         };
-        if let Some(project) = longest_prefix_match(&path, &known_projects) {
-            project_set.insert(normalize_path(&project.to_string_lossy()));
-        } else {
-            root_set.insert(normalize_path(&root.to_string_lossy()));
+        match longest_prefix_match(&path, &discovery.projects) {
+            // A root-files project owns only the files directly under the root; a change
+            // deeper down is a new or unknown directory that discovery has to place.
+            Some(project)
+                if !(discovery.is_shallow(project) && path.parent() != Some(project.as_path())) =>
+            {
+                project_set.insert(normalize_path(&project.to_string_lossy()));
+            }
+            _ => {
+                root_set.insert(normalize_path(&root.to_string_lossy()));
+            }
         }
     }
 
@@ -9857,16 +10244,49 @@ fn derive_watch_targets(
     (scope, force_paths)
 }
 
+/// The tracked roots as the store has them now. Reloaded before every watcher run so a root
+/// removed meanwhile is ignored (its events map to nothing) and an added one is watched.
+fn load_watch_roots(cwd: &Path, cfg: &ConfigValues) -> Result<Vec<TrackedRoot>, String> {
+    let conn = open_db_rw(&db_path(cwd))?;
+    resolve_roots(&conn, cfg, None)
+}
+
+/// Reload the roots and, when the set of root paths changed, restart the fswatch stream on
+/// the new set (fswatch watches the paths it was started with; a root added later would be
+/// silent, a removed one would keep sending events).
+fn refresh_watch_roots(
+    cwd: &Path,
+    cfg: &ConfigValues,
+    stream: &mut FswatchStream,
+    root_paths: &mut Vec<PathBuf>,
+) -> Result<Vec<TrackedRoot>, String> {
+    let roots = load_watch_roots(cwd, cfg)?;
+    let current: Vec<PathBuf> = roots.iter().map(|r| r.path.clone()).collect();
+    if current != *root_paths {
+        println!(
+            "[{}] watch: tracked roots changed ({} -> {}); restarting the file watcher",
+            chrono_like_now(),
+            root_paths.len(),
+            current.len()
+        );
+        let _ = stream.child.kill();
+        let _ = stream.child.wait();
+        *stream = start_fswatch_stream(&current)?;
+        *root_paths = current;
+    }
+    Ok(roots)
+}
+
 fn run_watch_event_loop(
     cwd: &Path,
     cfg: &ConfigValues,
-    tracked_roots: &[TrackedRoot],
+    tracked_roots: Vec<TrackedRoot>,
     interval_seconds: f64,
     debounce_ms: u64,
     quiet: bool,
 ) -> Result<(), String> {
     ensure_retrieval_backend_ready(cfg, true, "watch event-loop")?;
-    let root_paths: Vec<PathBuf> = tracked_roots.iter().map(|r| r.path.clone()).collect();
+    let mut root_paths: Vec<PathBuf> = tracked_roots.iter().map(|r| r.path.clone()).collect();
     let mut stream = start_fswatch_stream(&root_paths)?;
     if !quiet {
         println!(
@@ -9883,8 +10303,13 @@ fn run_watch_event_loop(
     loop {
         match stream.rx.recv_timeout(Duration::from_millis(200)) {
             Ok(path) => {
-                pending_paths.insert(path);
-                last_event_at = Some(Instant::now());
+                // Filtered on receipt: an event under `.git`, `node_modules`, a `.app`
+                // bundle, a `skip_dir_names` directory or for a `.png` never starts the
+                // debounce clock, let alone a scan.
+                if watch_path_relevant(&normalize_watch_path(&path)) {
+                    pending_paths.insert(path);
+                    last_event_at = Some(Instant::now());
+                }
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
@@ -9904,16 +10329,22 @@ fn run_watch_event_loop(
                 .map(|t| t.elapsed() >= debounce)
                 .unwrap_or(false)
         {
-            let (scope, force_paths) = derive_watch_targets(&pending_paths, tracked_roots);
+            // Roots as of now: events under a root removed since the last run map to no
+            // target and are dropped here.
+            let roots = refresh_watch_roots(cwd, cfg, &mut stream, &mut root_paths)?;
+            let (scope, force_paths) = derive_watch_targets(&pending_paths, &roots);
             pending_paths.clear();
             last_event_at = None;
             if scope.is_empty() {
                 continue;
             }
+            println!("{}", watch_scope_line(&scope));
             ensure_retrieval_backend_ready(cfg, true, "watch events")?;
+            let writer = acquire_writer_lock_for_watch(cwd)?;
             let stats = run_native_index(
                 cwd,
                 cfg,
+                &writer,
                 scope,
                 false,
                 force_paths,
@@ -9925,10 +10356,13 @@ fn run_watch_event_loop(
         }
 
         if last_sweep_at.elapsed() >= sweep_every {
+            refresh_watch_roots(cwd, cfg, &mut stream, &mut root_paths)?;
             ensure_retrieval_backend_ready(cfg, true, "watch sweep")?;
+            let writer = acquire_writer_lock_for_watch(cwd)?;
             let stats = run_native_index(
                 cwd,
                 cfg,
+                &writer,
                 IndexScope::AllRoots,
                 false,
                 HashSet::new(),
@@ -9937,9 +10371,34 @@ fn run_watch_event_loop(
                 "watch sweep",
             )?;
             print_watch_tick("sweep", &stats, quiet);
+            maybe_compact_lance(cwd, cfg, "sweep");
             last_sweep_at = Instant::now();
         }
     }
+}
+
+/// One polling pass: take the writer lock, index every root (roots are read from the store
+/// by the run itself), compact when due, and release the lock before returning, so nothing is
+/// held while the loop sleeps and a manual `index`, `prune` or root change can run between
+/// passes.
+fn run_watch_poll_once(cwd: &Path, cfg: &ConfigValues, quiet: bool) -> Result<IndexStats, String> {
+    ensure_retrieval_backend_ready(cfg, true, "watch poll")?;
+    let writer = acquire_writer_lock_for_watch(cwd)?;
+    let stats = run_native_index(
+        cwd,
+        cfg,
+        &writer,
+        IndexScope::AllRoots,
+        false,
+        HashSet::new(),
+        true,
+        !quiet,
+        "watch poll",
+    )?;
+    print_watch_tick("poll", &stats, quiet);
+    maybe_compact_lance(cwd, cfg, "poll");
+    drop(writer);
+    Ok(stats)
 }
 
 fn run_watch_polling_loop(cwd: &Path, cfg: &ConfigValues, interval_seconds: f64, quiet: bool) {
@@ -9947,25 +10406,10 @@ fn run_watch_polling_loop(cwd: &Path, cfg: &ConfigValues, interval_seconds: f64,
         println!("watch mode: polling");
     }
     loop {
-        ensure_retrieval_backend_ready(cfg, true, "watch poll").unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            process::exit(1);
-        });
-        let stats = run_native_index(
-            cwd,
-            cfg,
-            IndexScope::AllRoots,
-            false,
-            HashSet::new(),
-            true,
-            !quiet,
-            "watch poll",
-        )
-        .unwrap_or_else(|e| {
+        if let Err(e) = run_watch_poll_once(cwd, cfg, quiet) {
             eprintln!("error: watch poll failed: {}", e);
             process::exit(1);
-        });
-        print_watch_tick("poll", &stats, quiet);
+        }
         thread::sleep(Duration::from_secs_f64(interval_seconds));
     }
 }
@@ -10072,9 +10516,14 @@ fn run_watch_cmd(args: &[OsString]) {
         println!("press Ctrl-C to stop");
     }
 
+    let writer = acquire_writer_lock_for_watch(&cwd).unwrap_or_else(|e| {
+        eprintln!("error: {}", e);
+        process::exit(1);
+    });
     let bootstrap = run_native_index(
         &cwd,
         &cfg,
+        &writer,
         IndexScope::AllRoots,
         false,
         HashSet::new(),
@@ -10087,6 +10536,7 @@ fn run_watch_cmd(args: &[OsString]) {
         process::exit(1);
     });
     print_watch_tick("bootstrap", &bootstrap, quiet);
+    drop(writer);
     if once {
         return;
     }
@@ -10095,7 +10545,7 @@ fn run_watch_cmd(args: &[OsString]) {
         match run_watch_event_loop(
             &cwd,
             &cfg,
-            &tracked_roots,
+            tracked_roots,
             interval_seconds,
             debounce_ms,
             quiet,
@@ -11441,6 +11891,9 @@ fn print_bench_help() {
 
 fn default_bench_model_key(cfg: &ConfigValues) -> String {
     let backend = cfg.embed_backend.trim().to_lowercase();
+    if backend == "hash" {
+        return model_key_for_cfg(cfg);
+    }
     if backend == "ollama" {
         let model = if cfg.embed_model.trim().is_empty() {
             "qwen3-embedding".to_string()
@@ -13467,11 +13920,13 @@ fn handle_search_pick_request(req: &ApiRequest) -> (u16, String) {
 
 fn ensure_native_embed_backend(cfg: &ConfigValues, context: &str) -> Result<(), String> {
     match cfg.embed_backend.as_str() {
-        "ollama" => Ok(()),
+        "ollama" | "hash" => Ok(()),
         "bedrock" => bedrock_preflight_credentials(cfg, context),
         other => Err(format!(
-            "{} requires native embed_backend in [ollama, bedrock] (current='{}')",
-            context, other
+            "{} requires native embed_backend in [{}] (current='{}')",
+            context,
+            EMBED_BACKENDS.join(", "),
+            other
         )),
     }
 }
@@ -13705,6 +14160,24 @@ fn stats_payload_json(stats: &IndexStats) -> Value {
         "graph_edges": stats.graph_edges,
         "chunk_rows": stats.chunk_rows,
         "chunk_vectors": stats.chunk_vectors,
+        "files_selected": stats.files_selected,
+        "files_unchanged": stats.files_unchanged,
+        "files_rechunked": stats.files_rechunked,
+        "chunks_embedded": stats.chunks_embedded,
+        "chunks_reused": stats.chunks_reused,
+        "chunks_deleted": stats.chunks_deleted,
+        "files_unreadable": stats.files_unreadable,
+        "projects_incomplete": stats.projects_incomplete,
+        "files_evicted_by_cap": stats.files_evicted_by_cap,
+        "files_truncated_by_cap": stats.files_truncated_by_cap,
+        "lance_repaired": stats.lance_repaired,
+        "lance_orphans_removed": stats.lance_orphans_removed,
+        "documents_extracted": stats.documents_extracted,
+        "documents_failed": stats.documents_failed,
+        "projects_failed": stats.projects_failed,
+        "failures": stats.failures,
+        "stopped": stats.stopped,
+        "lance_error": stats.lance_error,
         "retrieval_backend": stats.retrieval_backend,
         "retrieval_synced_chunks": stats.retrieval_synced_chunks,
         "retrieval_error": stats.retrieval_error,
@@ -14711,10 +15184,18 @@ fn handle_api_request(req: ApiRequest) -> (u16, Value) {
                 return (503, serde_json::json!({"error": e}));
             }
             let raw_paths = payload_paths(&body);
+            let writer = match WriterLock::try_acquire(&data_dir(&cwd)) {
+                Ok(v) => v,
+                Err(e) if is_index_busy_error(&e) => {
+                    return (409, serde_json::json!({"error": e}));
+                }
+                Err(e) => return (500, serde_json::json!({"error": e})),
+            };
             let result = if raw_paths.is_empty() {
                 run_native_index(
                     &cwd,
                     &cfg,
+                    &writer,
                     IndexScope::AllRoots,
                     true,
                     HashSet::new(),
@@ -14730,7 +15211,7 @@ fn handle_api_request(req: ApiRequest) -> (u16, Value) {
                         serde_json::json!({"error": "No valid directory paths provided."}),
                     );
                 }
-                let conn = match open_db_rw(&db_path(&cwd)) {
+                let conn = match open_db_writer(&db_path(&cwd), &writer) {
                     Ok(v) => v,
                     Err(e) => return (500, serde_json::json!({"error": e})),
                 };
@@ -14742,6 +15223,7 @@ fn handle_api_request(req: ApiRequest) -> (u16, Value) {
                 run_native_index(
                     &cwd,
                     &cfg,
+                    &writer,
                     scope,
                     true,
                     HashSet::new(),
@@ -14805,11 +15287,20 @@ fn handle_api_request(req: ApiRequest) -> (u16, Value) {
             if let Err(e) = ensure_db_schema(&dbp) {
                 return (500, serde_json::json!({"error": e}));
             }
+            // A tracked-root mutation is a write: it takes the writer lock like every other.
+            let writer = match WriterLock::try_acquire(&data_dir(&cwd)) {
+                Ok(v) => v,
+                Err(e) if is_index_busy_error(&e) => {
+                    return (409, serde_json::json!({"error": e}));
+                }
+                Err(e) => return (500, serde_json::json!({"error": e})),
+            };
             for root in roots {
                 if let Err(e) = ensure_tracked_root(&dbp, &root, now_ts()) {
                     return (500, serde_json::json!({"error": e}));
                 }
             }
+            drop(writer);
             let rows = match list_tracked_roots(&dbp) {
                 Ok(v) => v,
                 Err(e) => return (500, serde_json::json!({"error": e})),
@@ -14834,10 +15325,18 @@ fn handle_api_request(req: ApiRequest) -> (u16, Value) {
             if let Err(e) = ensure_db_schema(&dbp) {
                 return (500, serde_json::json!({"error": e}));
             }
+            let writer = match WriterLock::try_acquire(&data_dir(&cwd)) {
+                Ok(v) => v,
+                Err(e) if is_index_busy_error(&e) => {
+                    return (409, serde_json::json!({"error": e}));
+                }
+                Err(e) => return (500, serde_json::json!({"error": e})),
+            };
             let mut removed: i64 = 0;
             for raw in paths {
                 removed += remove_tracked_root(&dbp, &normalize_path(&raw)).unwrap_or(0);
             }
+            drop(writer);
             let rows = match list_tracked_roots(&dbp) {
                 Ok(v) => v,
                 Err(e) => return (500, serde_json::json!({"error": e})),
@@ -16259,6 +16758,8 @@ fn mcp_tool_call(name: &str, args: &Value) -> Result<Value, String> {
             if !root.exists() || !root.is_dir() {
                 return Err(format!("path is not a directory: {}", root.display()));
             }
+            // The root mutation and the refresh that follows share one writer lock.
+            let writer = WriterLock::try_acquire(&data_dir(&cwd))?;
             ensure_tracked_root_conn(&conn, &root, now_ts())?;
             let mut out = serde_json::json!({"added": root.to_string_lossy(), "refreshed": false});
             if refresh {
@@ -16269,6 +16770,7 @@ fn mcp_tool_call(name: &str, args: &Value) -> Result<Value, String> {
                 let stats = run_native_index(
                     &cwd,
                     &cfg,
+                    &writer,
                     IndexScope::roots(vec![root.clone()]),
                     true,
                     force_paths,
@@ -16296,6 +16798,7 @@ fn mcp_tool_call(name: &str, args: &Value) -> Result<Value, String> {
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true);
             let root = normalize_path(&path).to_string_lossy().to_string();
+            let writer = WriterLock::try_acquire(&data_dir(&cwd))?;
             let removed = remove_tracked_root(&dbp, &normalize_path(&root))?;
             let mut out = serde_json::json!({"removed": removed, "path": root, "refreshed": false});
             if refresh {
@@ -16304,6 +16807,7 @@ fn mcp_tool_call(name: &str, args: &Value) -> Result<Value, String> {
                 let stats = run_native_index(
                     &cwd,
                     &cfg,
+                    &writer,
                     IndexScope::AllRoots,
                     false,
                     HashSet::new(),
@@ -16319,9 +16823,11 @@ fn mcp_tool_call(name: &str, args: &Value) -> Result<Value, String> {
         "run_incremental_index" => {
             ensure_native_embed_backend(&cfg, "mcp incremental index")?;
             ensure_retrieval_backend_ready(&cfg, true, "mcp incremental index")?;
+            let writer = WriterLock::try_acquire(&data_dir(&cwd))?;
             let stats = run_native_index(
                 &cwd,
                 &cfg,
+                &writer,
                 IndexScope::AllRoots,
                 false,
                 HashSet::new(),
@@ -16334,6 +16840,7 @@ fn mcp_tool_call(name: &str, args: &Value) -> Result<Value, String> {
         "run_forced_refresh" => {
             ensure_native_embed_backend(&cfg, "mcp forced refresh")?;
             ensure_retrieval_backend_ready(&cfg, true, "mcp forced refresh")?;
+            let writer = WriterLock::try_acquire(&data_dir(&cwd))?;
             let paths: Vec<String> = args
                 .get("paths")
                 .and_then(|v| v.as_array())
@@ -16347,6 +16854,7 @@ fn mcp_tool_call(name: &str, args: &Value) -> Result<Value, String> {
                 let stats = run_native_index(
                     &cwd,
                     &cfg,
+                    &writer,
                     IndexScope::AllRoots,
                     true,
                     HashSet::new(),
@@ -16362,7 +16870,10 @@ fn mcp_tool_call(name: &str, args: &Value) -> Result<Value, String> {
             if dirs.is_empty() {
                 return Err("no valid directory paths provided".to_string());
             }
-            let scope = plan_scoped_refresh(&conn, &cfg, &dirs)?;
+            let scope = {
+                let writer_conn = open_db_writer(&dbp, &writer)?;
+                plan_scoped_refresh(&writer_conn, &cfg, &dirs)?
+            };
             let (scope_roots, scope_projects) = match &scope {
                 IndexScope::Targets { roots, projects } => (roots.clone(), projects.clone()),
                 IndexScope::AllRoots => (Vec::new(), Vec::new()),
@@ -16376,6 +16887,7 @@ fn mcp_tool_call(name: &str, args: &Value) -> Result<Value, String> {
             let stats = run_native_index(
                 &cwd,
                 &cfg,
+                &writer,
                 scope,
                 true,
                 HashSet::new(),
@@ -16785,10 +17297,34 @@ fn run_index_with_strategy(
 ) -> Result<(), String> {
     ensure_retrieval_backend_ready(cfg, true, reason)?;
     ensure_native_embed_backend(cfg, reason)?;
+    let writer = WriterLock::try_acquire(&data_dir(cwd))?;
+    run_index_with_lock(
+        cwd,
+        cfg,
+        &writer,
+        scope,
+        force_all,
+        force_paths,
+        remove_missing,
+        reason,
+    )
+}
 
+/// [`run_index_with_strategy`] for a caller that already holds the writer lock.
+fn run_index_with_lock(
+    cwd: &Path,
+    cfg: &ConfigValues,
+    writer: &WriterLock,
+    scope: IndexScope,
+    force_all: bool,
+    force_paths: Option<HashSet<PathBuf>>,
+    remove_missing: bool,
+    reason: &str,
+) -> Result<(), String> {
     let stats = run_native_index(
         cwd,
         cfg,
+        writer,
         scope,
         force_all,
         force_paths.unwrap_or_default(),
@@ -16797,10 +17333,40 @@ fn run_index_with_strategy(
         reason,
     )?;
     print_index_stats(&stats, cfg);
-    Ok(())
+    index_run_verdict(&stats)
 }
 
-#[derive(Default)]
+/// `Err` (a non-zero exit for the CLI) when the run left work behind: a failed project, a run
+/// stopped early, or a LanceDB open, repair or write failure. Everything sqlite holds is
+/// committed either way; the message says what the next run will retry.
+fn index_run_verdict(stats: &IndexStats) -> Result<(), String> {
+    let mut problems: Vec<String> = Vec::new();
+    if stats.projects_failed > 0 {
+        problems.push(format!(
+            "{} project(s) failed and keep their previous state",
+            stats.projects_failed
+        ));
+    }
+    if !stats.stopped.is_empty() {
+        problems.push(format!("run stopped early: {}", stats.stopped));
+    }
+    if !stats.lance_error.is_empty() {
+        problems.push(format!(
+            "LanceDB: {} (dirty marker set; repaired on the next run)",
+            stats.lance_error
+        ));
+    }
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "index finished with problems: {}; sqlite content is committed, rerun `retrivio index` to retry",
+            problems.join("; ")
+        ))
+    }
+}
+
+#[derive(Default, Debug)]
 struct IndexStats {
     total_projects: i64,
     updated_projects: i64,
@@ -16814,6 +17380,50 @@ struct IndexStats {
     chunk_vectors: i64,
     pruned_chunks: i64,
     pruned_files: i64,
+    /// Indexable files the scanned projects selected (skipped projects contribute nothing).
+    files_selected: i64,
+    /// Selected files the manifest showed unchanged: kept as stored, never read or chunked.
+    files_unchanged: i64,
+    /// Selected files that were new or changed and were read and chunked.
+    files_rechunked: i64,
+    /// Directory entries the scans could not read; such a project is indexed from what was
+    /// readable but nothing is pruned and its signature is not advanced.
+    files_unreadable: i64,
+    /// Scanned projects with at least one unreadable entry.
+    projects_incomplete: i64,
+    /// Candidate files a cap left out of the index entirely.
+    files_evicted_by_cap: i64,
+    /// Files indexed only in part because a cap cut their chunks or text.
+    files_truncated_by_cap: i64,
+    /// Chunks sent to the embedder.
+    chunks_embedded: i64,
+    /// Chunks whose stored vector matched the embedding identity and was kept.
+    chunks_reused: i64,
+    /// Chunk rows deleted: pruned from scanned projects plus those of removed projects.
+    chunks_deleted: i64,
+    /// LanceDB rows rebuilt from sqlite vectors by the repair step (no embedding).
+    lance_repaired: i64,
+    /// LanceDB rows with no sqlite vector removed by the repair step.
+    lance_orphans_removed: i64,
+    /// Documents (docx, pptx, odt, odp, xlsx, pdf, html) whose text was extracted this run.
+    documents_extracted: i64,
+    /// Documents that yielded no text (over a bound, corrupt, parser error or panic, PDF
+    /// child killed). A previously indexed one keeps its old content.
+    documents_failed: i64,
+    /// Projects whose run failed (collector panic, sqlite or code-intelligence error, the
+    /// embedding failure that stopped the run). Each keeps its previous state: old signature,
+    /// nothing pruned, nothing published; the fingerprints do not advance. `index` exits
+    /// non-zero when this is non-zero.
+    projects_failed: i64,
+    /// `<project>: <reason>` for every failed project, in run order.
+    failures: Vec<String>,
+    /// Non-empty when the run stopped before visiting every project (the embedding backend
+    /// failed); names the reason and how many projects were left for the next run.
+    stopped: String,
+    /// Non-empty when LanceDB could not be opened, repaired or written this run. The dirty
+    /// marker is set and the next writer run repairs LanceDB from sqlite; sqlite content is
+    /// complete and committed. `index` exits non-zero when this is non-empty.
+    lance_error: String,
     retrieval_backend: String,
     retrieval_synced_chunks: i64,
     retrieval_error: String,
@@ -16848,9 +17458,68 @@ struct ProjectChunk {
     context_header: String,
 }
 
+/// One indexable file a project scan selected.
+#[derive(Clone, Debug, PartialEq)]
+struct ScannedFile {
+    rel_path: String,
+    /// `<canonical project path>/<rel_path>`: the `doc_path` of its chunks and symbols. Derived
+    /// from the project path, never canonicalised per file, so the keep set and the stored rows
+    /// always agree (a file that is or becomes a symlink keeps its identity).
+    doc_path: String,
+    size: i64,
+    mtime: f64,
+    content_hash: String,
+    /// Chunks the file contributes: freshly produced when `rechunked`, else the manifest's.
+    chunk_count: i64,
+    /// True when the file was read and chunked this run (new or changed); false when the
+    /// manifest showed it unchanged and its stored chunks, vectors, symbols and imports stand.
+    rechunked: bool,
+    /// True when the stat differed from the manifest but the content hash did not (touch,
+    /// restored copy): the manifest row gets the new stat so the file is not re-hashed on
+    /// every run, and nothing is re-chunked.
+    stat_changed: bool,
+}
+
 struct ProjectCorpus {
     doc: ProjectDoc,
+    /// Chunks of the re-chunked files only (the work set).
     chunks: Vec<ProjectChunk>,
+    /// Every selected file, unchanged ones included (the full keep set).
+    files: Vec<ScannedFile>,
+    /// The scan signature of the selected files, stored on the project row once the whole
+    /// project succeeded (see [`scan_signature_for`]).
+    scan_signature: String,
+    /// False when the walk could not read every directory entry: prune and the signature
+    /// update are skipped for this project, so nothing unseen is treated as deleted.
+    complete: bool,
+    /// Directory entries the walk could not read.
+    files_unreadable: i64,
+    /// Selected candidates left out entirely by `max_files_per_project` or
+    /// `max_chunks_per_project`.
+    files_evicted_by_cap: i64,
+    /// Files indexed only partially: chunks cut by `max_chunks_per_file`, text cut by
+    /// `max_file_chars`, or the project chunk cap reached mid-file.
+    files_truncated_by_cap: i64,
+    /// One line naming the caps that bit, empty when none did.
+    caps_note: String,
+    /// Documents (docx, pptx, odt, odp, xlsx, pdf, html) whose text was extracted this run.
+    documents_extracted: i64,
+    /// Documents in the work set that yielded no text: over a bound, corrupt, a parser error
+    /// or panic, or the PDF child killed. One indexed before stays exactly as indexed (carried
+    /// as unchanged, manifest entry not advanced); one never indexed is absent.
+    documents_failed: i64,
+    /// (rel_path, reason) for every failed document, for the run's warnings.
+    document_failures: Vec<(String, String)>,
+}
+
+impl ProjectCorpus {
+    fn files_unchanged(&self) -> i64 {
+        self.files.iter().filter(|f| !f.rechunked).count() as i64
+    }
+
+    fn files_rechunked(&self) -> i64 {
+        self.files.iter().filter(|f| f.rechunked).count() as i64
+    }
 }
 
 struct ExistingProject {
@@ -16859,6 +17528,10 @@ struct ExistingProject {
     title: String,
     summary: String,
     project_mtime: f64,
+    /// Signature of the last complete, successful scan ('' before the first one).
+    scan_signature: String,
+    /// True when a previous run started writing this project and never finished.
+    index_in_progress: bool,
 }
 
 #[derive(Default)]
@@ -17080,9 +17753,48 @@ impl Drop for LiveProgressReporter {
     }
 }
 
+/// One indexing run. The caller holds the writer lock (`writer`), so this is the only process
+/// writing to the store and the only place a schema migration can happen.
 fn run_native_index(
     cwd: &Path,
     cfg: &ConfigValues,
+    writer: &WriterLock,
+    scope: IndexScope,
+    force_all: bool,
+    force_paths: HashSet<PathBuf>,
+    remove_missing: bool,
+    emit_progress: bool,
+    reason: &str,
+) -> Result<IndexStats, String> {
+    set_extra_skip_dirs(cfg);
+    let embedder = build_embedder(cfg)?;
+    run_native_index_with_embedder(
+        cwd,
+        cfg,
+        writer,
+        embedder.as_ref(),
+        scope,
+        force_all,
+        force_paths,
+        remove_missing,
+        emit_progress,
+        reason,
+    )
+}
+
+/// [`run_native_index`] with the embedder supplied (tests inject a local or failing one).
+///
+/// Per project the order is: mark the row in progress; upsert chunks, reuse or embed their
+/// vectors, prune (complete scans only) and write the manifest; refresh code intelligence;
+/// embed the summary when it changed; then publish title, summary, mtime, summary vector,
+/// scan signature and the cleared marker in one transaction. A failure anywhere leaves the
+/// old signature (and the marker), so the next run rescans the project; nothing of the
+/// unchanged files is ever deleted by a failed run.
+fn run_native_index_with_embedder(
+    cwd: &Path,
+    cfg: &ConfigValues,
+    writer: &WriterLock,
+    embedder: &dyn Embedder,
     scope: IndexScope,
     force_all: bool,
     force_paths: HashSet<PathBuf>,
@@ -17092,9 +17804,8 @@ fn run_native_index(
 ) -> Result<IndexStats, String> {
     let t_start = Instant::now();
     reset_embed_runtime_metrics();
-    set_extra_skip_dirs(cfg);
     let dbp = db_path(cwd);
-    let conn = open_db_rw(&dbp)?;
+    let conn = open_db_writer(&dbp, writer)?;
     if reason != "reembed" {
         ensure_reembed_ready(&conn, cfg, &format!("{} indexing", reason))?;
     }
@@ -17103,11 +17814,15 @@ fn run_native_index(
     if remove_missing && scope != IndexScope::AllRoots {
         return Err("internal error: remove_missing requires the all-roots scope".to_string());
     }
-    let (roots, projects) = resolve_index_targets(&conn, cfg, &scope)?;
+    let IndexTargets {
+        roots,
+        projects,
+        incomplete_roots,
+        shallow: shallow_projects,
+    } = resolve_index_targets(&conn, cfg, &scope)?;
     if roots.is_empty() {
         return Err("No tracked roots configured. Add one with `retrivio add <path>`.".to_string());
     }
-    let embedder = build_embedder(cfg)?;
     let model_key = embedder.model_key();
     let mode = if force_all {
         "forced refresh"
@@ -17146,51 +17861,176 @@ fn run_native_index(
     }
 
     // If this model already has vectors, pre-open LanceDB at that known dimension.
-    // Otherwise defer opening until we have real embeddings from the current run.
+    // Otherwise defer opening until we have real embeddings from the current run. A failure
+    // is an error of this run (non-zero exit): sqlite is still written in full, the dirty
+    // marker is set and the next writer run repairs LanceDB from it.
     if let Some(lance_dim) = vector_dim_from_sqlite(&conn, &model_key) {
         if let Err(e) = get_or_open_lance(cwd, lance_dim) {
+            lance_mark_dirty(&conn)?;
+            LANCE_WRITE_FAILED.store(true, Ordering::SeqCst);
+            progress_clear_line();
             eprintln!(
-                "warning: LanceDB open failed (vectors still written to sqlite): {}",
+                "error: LanceDB open failed: {}; vectors are written to sqlite only, the dirty marker is set and the next index run repairs LanceDB",
                 e
             );
+            stats.lance_error = format!("open failed: {}", e);
         }
+    }
+    // Reconcile LanceDB with sqlite before writing anything, when a previous write failed or
+    // was interrupted (dirty marker) or the store has never been checked. `reembed` rebuilds
+    // LanceDB wholesale at its end and skips this. A repair that cannot complete (malformed
+    // or missing sqlite vector, LanceDB error) fails closed: marker and pending ids stay.
+    if reason != "reembed" {
+        match repair_lance_from_sqlite(&conn, &model_key, false) {
+            Ok(report) => {
+                stats.lance_repaired = report.rebuilt as i64;
+                stats.lance_orphans_removed = report.orphans_removed as i64;
+                if emit_progress && (report.rebuilt > 0 || report.orphans_removed > 0) {
+                    progress_clear_line();
+                    println!(
+                        "{}: LanceDB repaired from sqlite: {} rows rebuilt, {} orphan rows removed (no embedding)",
+                        reason, report.rebuilt, report.orphans_removed
+                    );
+                }
+            }
+            Err(e) => {
+                lance_mark_dirty(&conn)?;
+                progress_clear_line();
+                eprintln!(
+                    "error: LanceDB repair failed: {}; the dirty marker stays set and the next index run retries",
+                    e
+                );
+                if stats.lance_error.is_empty() {
+                    stats.lance_error = format!("repair failed: {}", e);
+                }
+            }
+        }
+    }
+
+    let identity = EmbedIdentity::for_run(&conn, embedder);
+    // `reembed` is the only path that discards matching stored vectors.
+    let force_embed = reason == "reembed";
+    // The embedding fingerprint (model, dimension, normalisation, pipeline version) of the
+    // last complete run. A change means stored vectors may no longer match the current
+    // identity even for unchanged files, so every project is re-chunked this run and the
+    // per-chunk identity check decides what to embed (a read and a hash per chunk when
+    // nothing changed, never an embed). Written after a complete all-roots run.
+    let stored_fingerprint = app_state_get(&conn, APP_STATE_EMBED_FINGERPRINT)?;
+    let current_fingerprint = identity.fingerprint();
+    let fingerprint_changed =
+        stored_fingerprint.is_none() || stored_fingerprint != current_fingerprint;
+    if emit_progress && fingerprint_changed && !projects.is_empty() {
+        progress_clear_line();
+        println!(
+            "{}: embedding fingerprint {} -> {}; every project is revisited (vectors are reused where their identity matches)",
+            reason,
+            stored_fingerprint.as_deref().unwrap_or("none"),
+            current_fingerprint.as_deref().unwrap_or("unknown")
+        );
+    }
+    let caps = ScanCaps::from_cfg(cfg);
+    // The caps are not part of any file's stat, so a tighter or looser cap (or a change to
+    // document indexing) would otherwise wait for the next edit in each project. Like the
+    // embedding fingerprint: a change revisits every project once, re-chunking so per-file
+    // caps apply too; vectors are reused where their identity matches.
+    let stored_caps = app_state_get(&conn, APP_STATE_SCAN_CAPS_FINGERPRINT)?;
+    let current_caps = caps.fingerprint();
+    let caps_changed = stored_caps.as_deref() != Some(current_caps.as_str());
+    if emit_progress && caps_changed && !projects.is_empty() {
+        progress_clear_line();
+        println!(
+            "{}: scan caps {} -> {}; every project is revisited (files past a cap are pruned, vectors are reused where their identity matches)",
+            reason,
+            stored_caps.as_deref().unwrap_or("none"),
+            current_caps
+        );
     }
 
     let mut keep_paths: Vec<String> = Vec::new();
     let mut docs_by_id: HashMap<i64, ProjectDoc> = HashMap::new();
     let now = now_ts();
+    let project_label = |dir: &Path| -> String {
+        let base = dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("project")
+            .to_string();
+        if shallow_projects.contains(dir) {
+            format!("{} (root files)", base)
+        } else {
+            base
+        }
+    };
 
     // ── Phase 1: Determine which projects need updating (sequential, needs conn) ──
     struct ProjectWork {
         idx: usize,
         dir: PathBuf,
-        latest_mtime: f64,
-        exclude_abs: HashSet<PathBuf>,
+        /// The gate's walk and selection, handed to the collector so it never walks again.
+        scan: ProjectScan,
+        /// The stored per-file manifest; empty for a project never indexed with one.
+        manifest: FileManifest,
+        /// Read and chunk every file, not only the changed ones.
+        rechunk_all: bool,
+        /// The stored row, whose title, summary and vector are reused when unchanged.
+        existing: Option<ExistingProject>,
     }
     let mut needs_update: Vec<ProjectWork> = Vec::new();
 
     for (idx, project_dir) in projects.iter().enumerate() {
-        let project_path = project_dir.to_string_lossy().to_string();
+        let project_path = normalize_path(&project_dir.to_string_lossy())
+            .to_string_lossy()
+            .to_string();
         keep_paths.push(project_path.clone());
         let forced = force_all || is_under_any(project_dir, &force_paths);
         let project_excludes = project_excludes_for_path(project_dir, &roots);
-        let latest_mtime = project_latest_mtime(project_dir, &project_excludes)?;
+        let scan = project_scan(
+            project_dir,
+            &project_excludes,
+            &caps,
+            shallow_projects.contains(project_dir),
+        );
+        if !scan.complete() && emit_progress {
+            progress_clear_line();
+            println!(
+                "[{}/{}] warning: {}: {} directory entries unreadable; nothing of it is pruned and its signature is not advanced",
+                idx + 1,
+                projects.len(),
+                project_label(project_dir),
+                scan.listing.unreadable
+            );
+        }
         let existing = get_project_by_path(&conn, &project_path)?;
-        if let Some(row) = existing {
-            if !forced && row.project_mtime >= latest_mtime {
-                let project_vec_ready = has_project_vector(&conn, row.id, &model_key)?;
+        let mut manifest = FileManifest::new();
+        let mut rechunk_all = forced || fingerprint_changed || caps_changed;
+        if let Some(row) = &existing {
+            // The gate: signature differs, vectors incomplete for the current identity, the
+            // fingerprint changed, or a previous run was interrupted.
+            let signature_unchanged =
+                !row.scan_signature.is_empty() && row.scan_signature == scan.signature;
+            if !forced
+                && !fingerprint_changed
+                && !caps_changed
+                && signature_unchanged
+                && !row.index_in_progress
+            {
+                let project_vec_ready = project_vector_matches(&conn, row.id, &identity)?;
                 let chunk_count = count_project_chunks(&conn, row.id)?;
-                let chunk_vec_count = count_project_chunk_vectors(&conn, row.id, &model_key)?;
+                let chunk_vec_count = count_project_chunk_vectors(&conn, row.id, &identity)?;
                 let chunk_vec_ready = chunk_count == 0 || chunk_vec_count >= chunk_count;
                 if project_vec_ready && chunk_vec_ready {
                     stats.skipped_projects += 1;
+                    if !scan.complete() {
+                        stats.projects_incomplete += 1;
+                        stats.files_unreadable += scan.listing.unreadable as i64;
+                    }
                     live_progress.mark_project_done();
                     docs_by_id.insert(
                         row.id,
                         ProjectDoc {
-                            path: PathBuf::from(row.path),
-                            title: row.title,
-                            summary: row.summary,
+                            path: PathBuf::from(row.path.clone()),
+                            title: row.title.clone(),
+                            summary: row.summary.clone(),
                             mtime: row.project_mtime,
                         },
                     );
@@ -17200,10 +18040,7 @@ fn run_native_index(
                             "[{}/{}] skip {}",
                             idx + 1,
                             projects.len(),
-                            project_dir
-                                .file_name()
-                                .and_then(|s| s.to_str())
-                                .unwrap_or("project")
+                            project_label(project_dir)
                         );
                         render_live_progress_line(
                             reason,
@@ -17214,17 +18051,16 @@ fn run_native_index(
                     }
                     continue;
                 }
-                // Log when re-indexing due to incomplete vectors
+                // Vectors are missing for chunks no file change would revisit: check every
+                // file's chunks against the stored identities.
+                rechunk_all = true;
                 if emit_progress && !chunk_vec_ready && chunk_count > 0 {
                     progress_clear_line();
                     println!(
                         "[{}/{}] re-indexing {} (incomplete vectors: {}/{} chunks have embeddings)",
                         idx + 1,
                         projects.len(),
-                        project_dir
-                            .file_name()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("project"),
+                        project_label(project_dir),
                         chunk_vec_count,
                         chunk_count,
                     );
@@ -17236,57 +18072,104 @@ fn run_native_index(
                     );
                 }
             }
+            if row.index_in_progress {
+                // A previous run stopped part-way: every file goes through the identity check
+                // (reads and hashes, no embedding where the stored vector matches).
+                rechunk_all = true;
+                if emit_progress {
+                    progress_clear_line();
+                    println!(
+                        "[{}/{}] re-indexing {} (previous run was interrupted)",
+                        idx + 1,
+                        projects.len(),
+                        project_label(project_dir)
+                    );
+                }
+            }
+            manifest = load_file_manifest(&conn, row.id)?;
         }
         needs_update.push(ProjectWork {
             idx,
             dir: project_dir.clone(),
-            latest_mtime,
-            exclude_abs: project_excludes,
+            scan,
+            manifest,
+            rechunk_all,
+            existing,
         });
     }
 
     // ── Phase 2+3: Collect corpus + embed/store in bounded batches ──
-    // Keep peak memory bounded by processing only INDEX_PARALLELISM corpora at once.
+    // Keep peak memory bounded by processing only INDEX_PARALLELISM corpora at once. A
+    // project that fails anywhere (collector panic, embedding, sqlite, code intelligence)
+    // keeps its previous state and is counted in `projects_failed`; an embedding failure
+    // stops the run, since every later project would fail the same way.
     live_progress.set_phase("collect");
     let max_chars = cfg.max_chars_per_project as usize;
     const INDEX_PARALLELISM: usize = 4;
-    for work_batch in needs_update.chunks(INDEX_PARALLELISM) {
-        let results =
-            std::sync::Mutex::new(
-                Vec::<(usize, PathBuf, f64, Result<ProjectCorpus, String>)>::new(),
-            );
+    let total = projects.len();
+    let mut visited_work = 0usize;
+    'batches: for work_batch in needs_update.chunks(INDEX_PARALLELISM) {
+        let results = std::sync::Mutex::new(Vec::<(usize, ProjectCorpus)>::new());
+        let mut panics: Vec<(usize, String)> = Vec::new();
         std::thread::scope(|s| {
-            let handles: Vec<_> = work_batch
+            let handles: Vec<(usize, _)> = work_batch
                 .iter()
                 .map(|pw| {
                     let results = &results;
-                    s.spawn(move || {
-                        let result = collect_project_corpus(
+                    let caps = &caps;
+                    let handle = s.spawn(move || {
+                        let corpus = collect_project_corpus(
                             &pw.dir,
+                            &pw.scan,
+                            caps,
                             max_chars,
-                            pw.latest_mtime,
-                            &pw.exclude_abs,
+                            &pw.manifest,
+                            pw.rechunk_all,
                         );
                         if let Ok(mut vec) = results.lock() {
-                            vec.push((pw.idx, pw.dir.clone(), pw.latest_mtime, result));
+                            vec.push((pw.idx, corpus));
                         }
-                    })
+                    });
+                    (pw.idx, handle)
                 })
                 .collect();
-            for h in handles {
-                let _ = h.join();
+            for (idx, handle) in handles {
+                if let Err(payload) = handle.join() {
+                    panics.push((idx, panic_payload_message(payload.as_ref())));
+                }
             }
         });
-        let mut corpus_results = results.into_inner().unwrap_or_default();
-        corpus_results.sort_by_key(|(idx, _, _, _)| *idx);
+        let mut corpora: HashMap<usize, ProjectCorpus> = results
+            .into_inner()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
 
-        for (idx, project_dir, _latest_mtime, corpus_result) in corpus_results {
-            let corpus = corpus_result?;
-            let project_name = project_dir
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("project")
-                .to_string();
+        for work in work_batch {
+            visited_work += 1;
+            let idx = work.idx;
+            let project_dir = &work.dir;
+            let project_name = project_label(project_dir);
+            let existing_doc = work.existing.as_ref().map(|row| ProjectDoc {
+                path: PathBuf::from(row.path.clone()),
+                title: row.title.clone(),
+                summary: row.summary.clone(),
+                mtime: row.project_mtime,
+            });
+            let Some(corpus) = corpora.remove(&idx) else {
+                let msg = panics
+                    .iter()
+                    .find(|(i, _)| *i == idx)
+                    .map(|(_, m)| format!("collecting the project panicked: {}", m))
+                    .unwrap_or_else(|| "collecting the project produced nothing".to_string());
+                record_project_failure(&mut stats, idx, total, &project_name, &msg, emit_progress);
+                if let (Some(row), Some(doc)) = (&work.existing, existing_doc) {
+                    docs_by_id.insert(row.id, doc);
+                }
+                live_progress.mark_project_done();
+                continue;
+            };
+            let project_path = corpus.doc.path.to_string_lossy().to_string();
             let project_total_tokens: u64 = corpus
                 .chunks
                 .iter()
@@ -17298,172 +18181,228 @@ fn run_native_index(
                 corpus.chunks.len(),
                 project_total_tokens,
             );
-            let project_id = upsert_project(
-                &conn,
-                &corpus.doc.path.to_string_lossy(),
-                &corpus.doc.title,
-                &corpus.doc.summary,
-                corpus.doc.mtime,
-                now,
-            )?;
-            stats.updated_projects += 1;
-            docs_by_id.insert(project_id, corpus.doc.clone());
-
-            {
-                let summary_text = format!("{}\n{}", corpus.doc.title, corpus.doc.summary);
-                let mut last_err = String::new();
-                let mut succeeded = false;
-                for attempt in 0..=3usize {
-                    if attempt > 0 {
-                        thread::sleep(Duration::from_millis(500 * 2u64.pow((attempt - 1) as u32)));
-                    }
-                    match embedder.embed_one(&summary_text) {
-                        Ok(pvec) => {
-                            set_project_vector(&conn, project_id, &model_key, &pvec)?;
-                            stats.vectorized_projects += 1;
-                            succeeded = true;
-                            break;
-                        }
-                        Err(e) => {
-                            last_err = e;
-                        }
-                    }
+            // Scan-level counters describe what the scan saw, whatever happens next.
+            stats.files_selected += corpus.files.len() as i64;
+            stats.files_unchanged += corpus.files_unchanged();
+            stats.files_rechunked += corpus.files_rechunked();
+            stats.files_unreadable += corpus.files_unreadable;
+            stats.files_evicted_by_cap += corpus.files_evicted_by_cap;
+            stats.files_truncated_by_cap += corpus.files_truncated_by_cap;
+            stats.documents_extracted += corpus.documents_extracted;
+            stats.documents_failed += corpus.documents_failed;
+            if !corpus.complete {
+                stats.projects_incomplete += 1;
+            }
+            if emit_progress && !corpus.caps_note.is_empty() {
+                progress_clear_line();
+                println!(
+                    "[{}/{}] warning: {}: {}",
+                    idx + 1,
+                    total,
+                    project_name,
+                    corpus.caps_note
+                );
+            }
+            if emit_progress && !corpus.document_failures.is_empty() {
+                // Five per project, or every one with RETRIVIO_DOCUMENT_FAILURES=all.
+                let shown: usize = if env::var("RETRIVIO_DOCUMENT_FAILURES")
+                    .map(|v| v == "all")
+                    .unwrap_or(false)
+                {
+                    usize::MAX
+                } else {
+                    5
+                };
+                progress_clear_line();
+                for (rel, reason) in corpus.document_failures.iter().take(shown) {
+                    println!(
+                        "[{}/{}] warning: {}: document not extracted: {}: {} (previously indexed content, if any, is kept)",
+                        idx + 1,
+                        total,
+                        project_name,
+                        rel,
+                        reason
+                    );
                 }
-                if !succeeded {
-                    return Err(format!(
-                        "failed embedding project summary for '{}' after retries: {}",
-                        project_dir.display(),
-                        last_err
-                    ));
+                if corpus.document_failures.len() > shown {
+                    println!(
+                        "[{}/{}] warning: {}: {} more documents not extracted (RETRIVIO_DOCUMENT_FAILURES=all lists every one)",
+                        idx + 1,
+                        total,
+                        project_name,
+                        corpus.document_failures.len() - shown
+                    );
                 }
             }
 
-            let reindex = reindex_project_chunks(
+            let outcome = index_one_project(
                 cwd,
                 &conn,
-                project_id,
-                &model_key,
-                embedder.as_ref(),
-                &corpus.chunks,
+                &caps,
+                &identity,
+                embedder,
+                &corpus,
+                project_dir,
+                &project_path,
+                work.existing.as_ref(),
                 now,
                 Some(&live_progress),
-            )?;
-            let (rows, vecs, failures) = (reindex.rows, reindex.vectors, reindex.failures);
-            stats.chunk_rows += rows;
-            stats.chunk_vectors += vecs;
-            stats.vector_failures += failures;
-            stats.pruned_chunks += reindex.pruned.chunks as i64;
-            stats.pruned_files += reindex.pruned.files as i64;
-            if emit_progress && reindex.pruned.chunks > 0 {
+                force_embed,
+            );
+            let outcome = match outcome {
+                Ok(outcome) => outcome,
+                Err(failure) => {
+                    let (msg, stop) = match failure {
+                        ProjectFailure::Project(msg) => (msg, false),
+                        ProjectFailure::Embedding(msg) => (msg, true),
+                    };
+                    record_project_failure(
+                        &mut stats,
+                        idx,
+                        total,
+                        &project_name,
+                        &msg,
+                        emit_progress,
+                    );
+                    if let (Some(row), Some(doc)) = (&work.existing, existing_doc) {
+                        docs_by_id.insert(row.id, doc);
+                    }
+                    live_progress.mark_project_done();
+                    if stop {
+                        let left = needs_update.len() - visited_work;
+                        stats.stopped = format!(
+                            "embedding failed while indexing {} ({}); {} project(s) not visited this run",
+                            project_name, msg, left
+                        );
+                        if emit_progress {
+                            progress_clear_line();
+                            println!("error: {}", stats.stopped);
+                        }
+                        // Unvisited projects keep their rows and edges as they are.
+                        for pending in &needs_update[visited_work..] {
+                            if let Some(row) = &pending.existing {
+                                docs_by_id.insert(
+                                    row.id,
+                                    ProjectDoc {
+                                        path: PathBuf::from(row.path.clone()),
+                                        title: row.title.clone(),
+                                        summary: row.summary.clone(),
+                                        mtime: row.project_mtime,
+                                    },
+                                );
+                            }
+                        }
+                        break 'batches;
+                    }
+                    continue;
+                }
+            };
+
+            stats.updated_projects += 1;
+            stats.chunk_rows += outcome.rows;
+            stats.chunk_vectors += outcome.vectors;
+            stats.chunks_embedded += outcome.vectors;
+            stats.chunks_reused += outcome.reused;
+            stats.pruned_chunks += outcome.pruned.chunks as i64;
+            stats.pruned_files += outcome.pruned.files as i64;
+            stats.chunks_deleted += outcome.pruned.chunks as i64;
+            if outcome.summary_embedded {
+                stats.vectorized_projects += 1;
+            }
+            if emit_progress && outcome.pruned.chunks > 0 {
                 progress_clear_line();
                 println!(
                     "[{}/{}] pruned {} chunks from {} files in {}",
                     idx + 1,
-                    projects.len(),
-                    reindex.pruned.chunks,
-                    reindex.pruned.files,
+                    total,
+                    outcome.pruned.chunks,
+                    outcome.pruned.files,
                     project_name
                 );
             }
-
-            // Extract symbols and imports from code files via AST.
-            // Iterates over unique doc_paths in the chunks to avoid re-parsing.
-            {
-                live_progress.set_phase("code-intel");
-                let mut seen_docs: HashSet<String> = HashSet::new();
-                let mut total_symbols = 0usize;
-                let mut total_imports = 0usize;
-                let project_file_list: Vec<String> = corpus
-                    .chunks
-                    .iter()
-                    .map(|c| c.doc_rel_path.clone())
-                    .collect::<HashSet<_>>()
-                    .into_iter()
-                    .collect();
-                let _ = conn.execute_batch("BEGIN TRANSACTION;");
-                for chunk in &corpus.chunks {
-                    if !seen_docs.insert(chunk.doc_path.clone()) {
-                        continue;
-                    }
-                    let path = Path::new(&chunk.doc_path);
-                    let ext = path
-                        .extension()
-                        .and_then(|e| e.to_str())
-                        .unwrap_or("")
-                        .to_lowercase();
-                    let lang = code_intel::language_for_extension(&ext);
-                    if lang.is_none() {
-                        continue;
-                    }
-                    let lang = lang.unwrap();
-                    if let Some(source) = read_for_index(path) {
-                        let symbols = code_intel::extract_symbols(path, &source);
-                        if !symbols.is_empty() {
-                            let stored = match store_project_symbols(
-                                &conn,
-                                project_id,
-                                &symbols,
-                                &chunk.doc_path,
-                                &chunk.doc_rel_path,
-                            ) {
-                                Ok(n) => n,
-                                Err(e) => {
-                                    let _ = conn.execute_batch("ROLLBACK;");
-                                    return Err(e);
-                                }
-                            };
-                            total_symbols += stored;
-                        }
-                        let raw_imports = code_intel::extract_imports(path, &source);
-                        if !raw_imports.is_empty() {
-                            let stored = match store_file_imports(
-                                &conn,
-                                project_id,
-                                &chunk.doc_path,
-                                lang,
-                                path,
-                                &project_dir,
-                                &raw_imports,
-                                &project_file_list,
-                            ) {
-                                Ok(n) => n,
-                                Err(e) => {
-                                    let _ = conn.execute_batch("ROLLBACK;");
-                                    return Err(e);
-                                }
-                            };
-                            total_imports += stored;
-                        }
-                    }
-                }
-                let _ = conn.execute_batch("COMMIT;");
-                let _ = total_symbols;
-                let _ = total_imports;
-            }
+            docs_by_id.insert(
+                outcome.project_id,
+                ProjectDoc {
+                    path: corpus.doc.path.clone(),
+                    title: outcome.title,
+                    summary: outcome.summary,
+                    mtime: corpus.doc.mtime,
+                },
+            );
 
             if emit_progress {
                 progress_clear_line();
                 println!(
-                    "[{}/{}] index {} chunks={} chunk_vecs={} vector_failures={}",
+                    "[{}/{}] index {} files={} (unchanged={}, rechunked={}) chunks={} embedded={} reused={} deleted={} chunk_vecs={} vector_failures={}{}",
                     idx + 1,
-                    projects.len(),
+                    total,
                     project_name,
-                    rows,
-                    vecs,
-                    failures
+                    corpus.files.len(),
+                    corpus.files_unchanged(),
+                    corpus.files_rechunked(),
+                    outcome.rows,
+                    outcome.vectors,
+                    outcome.reused,
+                    outcome.pruned.chunks,
+                    outcome.vectors,
+                    0,
+                    if corpus.complete {
+                        String::new()
+                    } else {
+                        format!(" unreadable={} (incomplete)", corpus.files_unreadable)
+                    }
                 );
-                render_live_progress_line(reason, projects.len(), live_started_at, &live_progress);
+                render_live_progress_line(reason, total, live_started_at, &live_progress);
             }
             live_progress.mark_project_done();
             if emit_progress {
-                render_live_progress_line(reason, projects.len(), live_started_at, &live_progress);
+                render_live_progress_line(reason, total, live_started_at, &live_progress);
             }
         }
     }
 
-    if remove_missing {
+    // A run that stopped early or lost a project has not seen everything: it neither removes
+    // projects nor advances the fingerprints (the next run revisits under the same rules).
+    let run_ok = stats.projects_failed == 0 && stats.stopped.is_empty();
+    if remove_missing && stats.stopped.is_empty() {
         live_progress.set_phase("cleanup");
-        stats.removed_projects = remove_projects_not_in(&conn, &keep_paths)?;
+        // Projects under a tracked root that cannot be listed right now, or whose listing
+        // was incomplete, are not "missing".
+        let mut protected = unavailable_roots(&roots);
+        protected.extend(incomplete_roots.iter().cloned());
+        if emit_progress {
+            for root in &protected {
+                progress_clear_line();
+                println!(
+                    "note: tracked root {} is not fully readable now; its projects are left alone",
+                    root.display()
+                );
+            }
+        }
+        let (removed_projects, removed_chunks) =
+            remove_projects_not_in(&conn, &keep_paths, &protected)?;
+        stats.removed_projects = removed_projects;
+        stats.chunks_deleted += removed_chunks;
+    }
+    // The fingerprint advances only when every project was revisited under it: a complete
+    // all-roots run with no incomplete scan and no failed project.
+    if fingerprint_changed
+        && scope == IndexScope::AllRoots
+        && stats.projects_incomplete == 0
+        && run_ok
+    {
+        // The dimension may have become known only during this run (first vectors).
+        if let Some(fp) = EmbedIdentity::for_run(&conn, embedder).fingerprint() {
+            if stored_fingerprint.as_deref() != Some(fp.as_str()) {
+                app_state_set(&conn, APP_STATE_EMBED_FINGERPRINT, &fp)?;
+            }
+        }
+    }
+    if caps_changed && scope == IndexScope::AllRoots && stats.projects_incomplete == 0 && run_ok {
+        app_state_set(&conn, APP_STATE_SCAN_CAPS_FINGERPRINT, &current_caps)?;
+    }
+    if LANCE_WRITE_FAILED.load(Ordering::SeqCst) && stats.lance_error.is_empty() {
+        stats.lance_error = "LanceDB writes failed during this run".to_string();
     }
     live_progress.set_phase("graph-edges");
     stats.graph_edges = rebuild_relationship_edges(&conn, &docs_by_id)?;
@@ -17502,12 +18441,54 @@ fn print_index_stats(stats: &IndexStats, cfg: &ConfigValues) {
     println!("projects skipped (unchanged): {}", stats.skipped_projects);
     println!("projects removed: {}", stats.removed_projects);
     println!("vectors refreshed: {}", stats.vectorized_projects);
+    println!(
+        "files selected: {} (unchanged {}, rechunked {})",
+        stats.files_selected, stats.files_unchanged, stats.files_rechunked
+    );
+    println!(
+        "files unreadable: {} (projects incomplete: {})",
+        stats.files_unreadable, stats.projects_incomplete
+    );
+    println!(
+        "files evicted by caps: {} (truncated: {})",
+        stats.files_evicted_by_cap, stats.files_truncated_by_cap
+    );
     println!("chunks indexed: {}", stats.chunk_rows);
     println!("chunk vectors refreshed: {}", stats.chunk_vectors);
+    println!(
+        "chunks embedded: {}, reused: {}, deleted: {}",
+        stats.chunks_embedded, stats.chunks_reused, stats.chunks_deleted
+    );
     println!(
         "stale chunks pruned: {} (from {} files)",
         stats.pruned_chunks, stats.pruned_files
     );
+    println!(
+        "lance repaired: {} (orphans removed: {})",
+        stats.lance_repaired, stats.lance_orphans_removed
+    );
+    println!(
+        "documents extracted: {} (failed: {})",
+        stats.documents_extracted, stats.documents_failed
+    );
+    if stats.projects_failed > 0 {
+        println!(
+            "projects failed: {} (each keeps its previous state and is retried next run)",
+            stats.projects_failed
+        );
+        for line in &stats.failures {
+            println!("  - {}", line);
+        }
+    }
+    if !stats.stopped.is_empty() {
+        println!("run stopped early: {}", stats.stopped);
+    }
+    if !stats.lance_error.is_empty() {
+        println!(
+            "lancedb: {} (dirty marker set; the next index run repairs LanceDB from sqlite)",
+            stats.lance_error
+        );
+    }
     println!("graph edges refreshed: {}", stats.graph_edges);
     println!("retrieval backend: {}", stats.retrieval_backend);
     println!("retrieval chunks synced: {}", stats.retrieval_synced_chunks);
@@ -17994,6 +18975,7 @@ fn model_key_for_cfg(cfg: &ConfigValues) -> String {
             format!("ollama:{}", model)
         }
         "bedrock" => bedrock_embedding_space_key(&cfg.embed_model),
+        "hash" => hash_model_key(cfg.local_embed_dim),
         other => {
             let model = if cfg.embed_model.trim().is_empty() {
                 "qwen3-embedding".to_string()
@@ -18035,9 +19017,11 @@ fn embed_query_cached(cfg: &ConfigValues, query: &str) -> Result<(String, Vec<f3
         cache.retain(|_, entry| entry.cached_at.elapsed() <= ttl);
     }
 
-    // Check persistent disk cache (survives process restarts)
+    // Persistent disk cache (survives process restarts). Read-only and never migrating: this
+    // runs inside `recall` on every prompt, and a store that predates the cache table or is
+    // absent simply misses.
     let db_p = db_path(&cfg.root);
-    if let Ok(conn) = open_db_rw(&db_p) {
+    if let Ok(conn) = open_db_read_only(&db_p) {
         if let Ok(cached_vec) = disk_cache_lookup(&conn, &normalized_query, &model_key_guess) {
             // Found in disk cache — populate in-memory cache and return
             let cache_key = format!("{}::{}", model_key_guess, normalized_query);
@@ -18060,7 +19044,7 @@ fn embed_query_cached(cfg: &ConfigValues, query: &str) -> Result<(String, Vec<f3
 
     let embedder = build_embedder(cfg)?;
     let model_key = embedder.model_key();
-    let vector = embedder.embed_one(q)?;
+    let vector = embedder.embed_query(q)?;
     let cache_key = format!("{}::{}", model_key, normalized_query);
     {
         let mut cache = query_embed_cache()
@@ -18078,9 +19062,12 @@ fn embed_query_cached(cfg: &ConfigValues, query: &str) -> Result<(String, Vec<f3
         );
     }
 
-    // Write to persistent disk cache (best-effort, don't fail the query if this errors)
-    if let Ok(conn) = open_db_rw(&db_p) {
-        let _ = disk_cache_store(&conn, &normalized_query, &model_key, &vector);
+    // Best-effort write to the disk cache on a non-migrating connection: an absent store or
+    // an old table shape is skipped silently, never repaired from here.
+    if db_p.is_file() {
+        if let Ok(conn) = open_db_rw(&db_p) {
+            let _ = disk_cache_store(&conn, &normalized_query, &model_key, &vector);
+        }
     }
 
     Ok((model_key, vector))
@@ -19157,6 +20144,16 @@ mod chunk_contract_tests {
 
         let mut cfg = ConfigValues::from_map(std::collections::HashMap::new());
         for key in [
+            "max_files_per_project",
+            "max_chunks_per_project",
+            "max_chunks_per_file",
+            "max_file_chars",
+            "index_documents",
+            "max_document_bytes",
+            "max_document_uncompressed_bytes",
+            "document_extract_timeout_ms",
+            "lance_compact_versions",
+            "lance_version_grace_secs",
             "rank_recency_weight",
             "rank_recency_record_weight",
             "recency_half_life_days",
@@ -22051,6 +23048,26 @@ struct ConfigValues {
     retrieval_backend: String,
     local_embed_dim: i64,
     max_chars_per_project: i64,
+    // Scan caps (Slice 1): what one project scan may index. Defaults unchanged from the
+    // former constants; `retrivio index` warns per project when one of them bites.
+    max_files_per_project: i64,
+    max_chunks_per_project: i64,
+    max_chunks_per_file: i64,
+    max_file_chars: i64,
+    // Document extraction (documents.rs): docx, pptx, odt, odp, xlsx, pdf and html-as-text.
+    index_documents: bool,
+    max_document_bytes: i64,
+    /// Declared uncompressed total an Office/OpenDocument archive may have before it is
+    /// refused unread (zip-bomb bound).
+    max_document_uncompressed_bytes: i64,
+    /// Deadline for the PDF extraction child process.
+    document_extract_timeout_ms: i64,
+    // LanceDB compaction threshold for the watcher (versions on disk); 0 disables.
+    lance_compact_versions: i64,
+    /// Compaction keeps LanceDB versions younger than this many seconds, so a reader that
+    /// opened an older snapshot can finish its query (longer than the recall hook's 4 s
+    /// deadline by a wide margin).
+    lance_version_grace_secs: i64,
     lexical_candidates: i64,
     vector_candidates: i64,
     rank_chunk_semantic_weight: f64,
@@ -22146,7 +23163,7 @@ impl ConfigValues {
             .unwrap_or_else(|| "ollama".to_string())
             .trim()
             .to_lowercase();
-        if !matches!(embed_backend.as_str(), "ollama" | "bedrock") {
+        if !is_known_embed_backend(&embed_backend) {
             embed_backend = "ollama".to_string();
         }
 
@@ -22221,6 +23238,52 @@ impl ConfigValues {
             .get("max_chars_per_project")
             .and_then(|v| v.parse::<i64>().ok())
             .unwrap_or(12000);
+        let max_files_per_project = map
+            .get("max_files_per_project")
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(2000)
+            .clamp(1, 1_000_000);
+        let max_chunks_per_project = map
+            .get("max_chunks_per_project")
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(6000)
+            .clamp(1, 10_000_000);
+        let max_chunks_per_file = map
+            .get("max_chunks_per_file")
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(28)
+            .clamp(1, 100_000);
+        let max_file_chars = map
+            .get("max_file_chars")
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(80_000)
+            .clamp(1000, 50_000_000);
+        let index_documents = parse_bool_config(&map, "index_documents", true);
+        let max_document_bytes = map
+            .get("max_document_bytes")
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(200_000_000)
+            .clamp(1000, 2_000_000_000);
+        let max_document_uncompressed_bytes = map
+            .get("max_document_uncompressed_bytes")
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(documents::DEFAULT_MAX_DOCUMENT_UNCOMPRESSED_BYTES as i64)
+            .clamp(1000, 20_000_000_000);
+        let document_extract_timeout_ms = map
+            .get("document_extract_timeout_ms")
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(documents::DEFAULT_DOCUMENT_EXTRACT_TIMEOUT_MS as i64)
+            .clamp(500, 600_000);
+        let lance_compact_versions = map
+            .get("lance_compact_versions")
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(200)
+            .clamp(0, 1_000_000);
+        let lance_version_grace_secs = map
+            .get("lance_version_grace_secs")
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(120)
+            .clamp(0, 86_400);
         let lexical_candidates = map
             .get("lexical_candidates")
             .and_then(|v| v.parse::<i64>().ok())
@@ -22447,6 +23510,16 @@ impl ConfigValues {
             retrieval_backend,
             local_embed_dim,
             max_chars_per_project,
+            max_files_per_project,
+            max_chunks_per_project,
+            max_chunks_per_file,
+            max_file_chars,
+            index_documents,
+            max_document_bytes,
+            max_document_uncompressed_bytes,
+            document_extract_timeout_ms,
+            lance_compact_versions,
+            lance_version_grace_secs,
             lexical_candidates,
             vector_candidates,
             rank_chunk_semantic_weight,
@@ -22575,6 +23648,25 @@ fn write_config_file(path: &Path, cfg: &ConfigValues) -> Result<(), String> {
         ),
         format!("local_embed_dim = {}", cfg.local_embed_dim),
         format!("max_chars_per_project = {}", cfg.max_chars_per_project),
+        format!("max_files_per_project = {}", cfg.max_files_per_project),
+        format!("max_chunks_per_project = {}", cfg.max_chunks_per_project),
+        format!("max_chunks_per_file = {}", cfg.max_chunks_per_file),
+        format!("max_file_chars = {}", cfg.max_file_chars),
+        format!("index_documents = {}", cfg.index_documents),
+        format!("max_document_bytes = {}", cfg.max_document_bytes),
+        format!(
+            "max_document_uncompressed_bytes = {}",
+            cfg.max_document_uncompressed_bytes
+        ),
+        format!(
+            "document_extract_timeout_ms = {}",
+            cfg.document_extract_timeout_ms
+        ),
+        format!("lance_compact_versions = {}", cfg.lance_compact_versions),
+        format!(
+            "lance_version_grace_secs = {}",
+            cfg.lance_version_grace_secs
+        ),
         format!("lexical_candidates = {}", cfg.lexical_candidates),
         format!("vector_candidates = {}", cfg.vector_candidates),
         format!(
@@ -22677,6 +23769,7 @@ fn toml_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+/// Make sure a store exists (creating a brand-new one). Never migrates an existing store.
 fn ensure_db_schema(db_path: &Path) -> Result<(), String> {
     let _ = open_db_rw(db_path)?;
     Ok(())
@@ -23035,7 +24128,33 @@ fn now_ts() -> f64 {
         .unwrap_or(0.0)
 }
 
+/// Open the database read-write WITHOUT migrating it.
+///
+/// Every command that is not a writer (search, recall, the MCP read tools, the API read
+/// endpoints, `roots`, `config`, ...) opens this way; none of them depends on a column a
+/// migration adds. The one exception is a brand-new store (no `projects` table yet), which is
+/// created in full here: there is nothing to migrate, and `add --no-refresh`, `roots` and
+/// friends must work before the first `index`. Schema migrations of an existing store run
+/// only through [`open_db_writer`], under the writer lock.
 fn open_db_rw(db_path: &Path) -> Result<Connection, String> {
+    let conn = open_db_rw_raw(db_path)?;
+    if !db_has_table(&conn, "projects")? {
+        init_schema(&conn)?;
+    }
+    Ok(conn)
+}
+
+/// Open the database for a writer that holds the lock and bring the schema up to date. Every
+/// CREATE, ALTER and backfill runs inside one `BEGIN IMMEDIATE` transaction with the column
+/// checks re-done inside it, so two writers can never both migrate and a reader never sees a
+/// half migration. The lock parameter is only proof that the caller holds it.
+fn open_db_writer(db_path: &Path, _writer: &WriterLock) -> Result<Connection, String> {
+    let conn = open_db_rw_raw(db_path)?;
+    init_schema(&conn)?;
+    Ok(conn)
+}
+
+fn open_db_rw_raw(db_path: &Path) -> Result<Connection, String> {
     if let Some(parent) = db_path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("failed creating db dir: {}", e))?;
     }
@@ -23051,8 +24170,349 @@ PRAGMA synchronous = NORMAL;
 "#,
     )
     .map_err(|e| format!("failed setting db pragmas: {}", e))?;
-    init_schema(&conn)?;
     Ok(conn)
+}
+
+fn db_has_table(conn: &Connection, table: &str) -> Result<bool, String> {
+    conn.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        params![table],
+        |_| Ok(()),
+    )
+    .optional()
+    .map(|row| row.is_some())
+    .map_err(|e| format!("failed inspecting database schema: {}", e))
+}
+
+/// Name of the advisory lock file in the data directory that serialises writers.
+const WRITER_LOCK_FILE: &str = "index.lock";
+/// Prefix of the error every writer entry point returns while another writer holds the lock.
+const INDEX_BUSY_PREFIX: &str = "index busy: another retrivio writer is running";
+
+/// The one writer at a time: an OS advisory lock (`flock`) on `<data_dir>/index.lock`, taken
+/// by index, refresh, reembed, prune, the watcher and the API/MCP index tools before the
+/// database is opened for writing and before any schema migration. The kernel drops the lock
+/// when the holding process exits, however it exits, so there is no stale sentinel to clean
+/// up. The holder's pid is written into the file for the "busy" message only.
+#[derive(Debug)]
+struct WriterLock {
+    file: fs::File,
+}
+
+impl WriterLock {
+    /// Try once. `Err` is the busy message (see [`is_index_busy_error`]) when another process
+    /// holds the lock, or an I/O error.
+    fn try_acquire(data_dir: &Path) -> Result<WriterLock, String> {
+        fs::create_dir_all(data_dir)
+            .map_err(|e| format!("failed creating {}: {}", data_dir.display(), e))?;
+        let path = data_dir.join(WRITER_LOCK_FILE);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|e| format!("failed opening writer lock {}: {}", path.display(), e))?;
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EWOULDBLOCK)
+                || err.kind() == std::io::ErrorKind::WouldBlock
+            {
+                let holder = fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u32>().ok());
+                return Err(match holder {
+                    Some(pid) => format!("{} (pid {})", INDEX_BUSY_PREFIX, pid),
+                    None => format!("{} (pid unknown)", INDEX_BUSY_PREFIX),
+                });
+            }
+            return Err(format!("failed locking {}: {}", path.display(), err));
+        }
+        // Our pid, for the busy message of the next contender. Best effort: the lock itself
+        // is the kernel's, not this file's content.
+        let _ = file.set_len(0);
+        let _ = (&file).write_all(format!("{}\n", process::id()).as_bytes());
+        let _ = (&file).flush();
+        Ok(WriterLock { file })
+    }
+
+    /// Wait for the lock, retrying every `poll`, calling `on_wait` once with the busy message.
+    /// The watcher uses this: it would rather wait for a manual `index` to finish than fail.
+    fn acquire_waiting(
+        data_dir: &Path,
+        poll: Duration,
+        mut on_wait: impl FnMut(&str),
+    ) -> Result<WriterLock, String> {
+        let mut reported = false;
+        loop {
+            match Self::try_acquire(data_dir) {
+                Ok(lock) => return Ok(lock),
+                Err(e) if is_index_busy_error(&e) => {
+                    if !reported {
+                        on_wait(&e);
+                        reported = true;
+                    }
+                    thread::sleep(poll);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+}
+
+impl Drop for WriterLock {
+    fn drop(&mut self) {
+        // Closing the descriptor releases the lock as well; the explicit unlock keeps the
+        // order obvious. The file stays: deleting it would let a later opener lock a
+        // different inode than a concurrent holder.
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+#[cfg(test)]
+mod writer_lock_tests {
+    use super::*;
+
+    fn lock_dir(name: &str) -> PathBuf {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tmp")
+            .join(format!("lock-{}-{}", name, process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("lock dir");
+        dir
+    }
+
+    #[test]
+    fn a_second_writer_is_told_who_holds_the_lock_and_gets_it_after_release() {
+        let dir = lock_dir("contend");
+        let first = WriterLock::try_acquire(&dir).expect("first lock");
+        let err = WriterLock::try_acquire(&dir).expect_err("second must be busy");
+        assert!(is_index_busy_error(&err), "{}", err);
+        assert_eq!(
+            err,
+            format!(
+                "index busy: another retrivio writer is running (pid {})",
+                process::id()
+            )
+        );
+        drop(first);
+        WriterLock::try_acquire(&dir).expect("lock is free after drop");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn acquire_waiting_reports_once_and_returns_when_the_holder_releases() {
+        let dir = lock_dir("waiting");
+        let held = WriterLock::try_acquire(&dir).expect("hold");
+        let dir2 = dir.clone();
+        let releaser = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(300));
+            drop(held);
+        });
+        let mut reports = 0usize;
+        let got = WriterLock::acquire_waiting(&dir2, Duration::from_millis(50), |msg| {
+            reports += 1;
+            assert!(is_index_busy_error(msg), "{}", msg);
+        })
+        .expect("acquired after release");
+        releaser.join().expect("releaser thread");
+        assert_eq!(reports, 1);
+        drop(got);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Helper body, not a test of its own: when `RETRIVIO_TEST_HOLD_LOCK` names a directory,
+    /// take its writer lock, drop a marker file and sleep until killed. The SIGKILL test runs
+    /// this very test binary with that variable set.
+    #[test]
+    fn hold_writer_lock_helper() {
+        let Ok(dir) = env::var("RETRIVIO_TEST_HOLD_LOCK") else {
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        let _lock = WriterLock::try_acquire(&dir).expect("helper lock");
+        fs::write(dir.join("held"), b"1").expect("marker");
+        thread::sleep(Duration::from_secs(120));
+    }
+
+    #[test]
+    fn the_lock_is_released_when_the_holder_dies_from_sigkill() {
+        let dir = lock_dir("sigkill");
+        let exe = env::current_exe().expect("test exe");
+        let mut child = Command::new(&exe)
+            .args([
+                "writer_lock_tests::hold_writer_lock_helper",
+                "--exact",
+                "--nocapture",
+            ])
+            .env("RETRIVIO_TEST_HOLD_LOCK", &dir)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn helper");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !dir.join("held").exists() {
+            assert!(Instant::now() < deadline, "helper never took the lock");
+            thread::sleep(Duration::from_millis(20));
+        }
+        let err = WriterLock::try_acquire(&dir).expect_err("busy while the helper lives");
+        assert_eq!(
+            err,
+            format!(
+                "index busy: another retrivio writer is running (pid {})",
+                child.id()
+            )
+        );
+        unsafe {
+            libc::kill(child.id() as libc::pid_t, libc::SIGKILL);
+        }
+        let _ = child.wait();
+        // No cleanup ran in the child (SIGKILL), yet the kernel released the flock. The stale
+        // pid in the file is overwritten by the new holder.
+        let ours = WriterLock::try_acquire(&dir).expect("lock released after SIGKILL");
+        let recorded = fs::read_to_string(dir.join(WRITER_LOCK_FILE)).expect("lock file");
+        assert_eq!(recorded.trim(), process::id().to_string());
+        drop(ours);
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod migration_discipline_tests {
+    use super::*;
+
+    /// Columns 0.2 adds to a 0.1.x store. Dropping them from a freshly created schema yields
+    /// the 0.1.x shape, which is what an un-upgraded store looks like to this binary.
+    const ADDED_COLUMNS: &[(&str, &str)] = &[
+        ("projects", "scan_signature"),
+        ("projects", "index_in_progress"),
+        ("project_vectors", "normalized"),
+        ("project_vectors", "pipeline_version"),
+        ("project_chunk_vectors", "embed_input_hash"),
+        ("project_chunk_vectors", "normalized"),
+        ("project_chunk_vectors", "pipeline_version"),
+    ];
+
+    fn old_shape_store(name: &str) -> (PathBuf, PathBuf) {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tmp")
+            .join(format!("migrate-{}-{}", name, process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("store dir");
+        let db = dir.join("retrivio.db");
+        {
+            let conn = open_db_rw(&db).expect("create fresh store");
+            for (table, column) in ADDED_COLUMNS {
+                conn.execute(&format!("ALTER TABLE {} DROP COLUMN {}", table, column), [])
+                    .expect("drop added column");
+            }
+            conn.execute_batch(
+                r#"
+INSERT INTO projects(id, path, title, summary, project_mtime, last_indexed)
+VALUES (1, '/p/alpha', 'alpha', 'alpha notes', 0, 0);
+INSERT INTO project_chunks(id, project_id, doc_path, doc_rel_path, doc_mtime, chunk_index, token_count, text_hash, text, updated_at)
+VALUES (10, 1, '/p/alpha/notes.md', 'notes.md', 0, 0, 3, 'h10', 'orion runbook bedrock region', 0);
+INSERT INTO project_chunk_vectors(chunk_id, model, dim, norm, vector)
+VALUES (10, 'bedrock:amazon.titan-embed-text-v2:0', 1, 1.0, x'00000000');
+"#,
+            )
+            .expect("seed 0.1.x rows");
+        }
+        (dir, db)
+    }
+
+    fn has_added_columns(conn: &Connection) -> Vec<bool> {
+        ADDED_COLUMNS
+            .iter()
+            .map(|(t, c)| table_has_column(conn, t, c).expect("table_info"))
+            .collect()
+    }
+
+    #[test]
+    fn read_paths_never_migrate_and_still_answer_then_a_writer_migrates_once() {
+        let (dir, db) = old_shape_store("read-paths");
+        let none = vec![false; ADDED_COLUMNS.len()];
+        let all = vec![true; ADDED_COLUMNS.len()];
+        let cfg = ConfigValues::from_map(HashMap::new());
+
+        // The plain read-write open (roots, config, MCP tools, the query cache write) and the
+        // read-only open (recall, search) leave the schema exactly as it was ...
+        {
+            let conn = open_db_rw(&db).expect("open rw");
+            assert_eq!(has_added_columns(&conn), none);
+            let hits = lexical_file_candidates(&conn, &cfg, &["runbook".to_string()], 5);
+            assert_eq!(hits.len(), 1, "search answers on the old shape");
+            assert_eq!(hits[0].doc_rel_path, "notes.md");
+        }
+        {
+            let conn = open_db_read_only(&db).expect("open ro");
+            assert_eq!(has_added_columns(&conn), none);
+            let hits = lexical_file_candidates(&conn, &cfg, &["bedrock".to_string()], 5);
+            assert_eq!(hits.len(), 1);
+        }
+        assert!(ensure_db_schema(&db).is_ok());
+        assert_eq!(
+            has_added_columns(&open_db_read_only(&db).unwrap()),
+            none,
+            "ensure_db_schema is not a migration either"
+        );
+
+        // ... and the writer open, under the lock, migrates in one go.
+        let writer = WriterLock::try_acquire(&dir).expect("lock");
+        {
+            let conn = open_db_writer(&db, &writer).expect("open writer");
+            assert_eq!(has_added_columns(&conn), all);
+            assert_eq!(
+                conn.query_row(
+                    "SELECT embed_input_hash FROM project_chunk_vectors WHERE chunk_id = 10",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+                embed_input_hash("orion runbook bedrock region"),
+                "the backfill ran with the migration"
+            );
+        }
+        // Idempotent for the next writer, and the read paths see the same rows as before.
+        let conn = open_db_writer(&db, &writer).expect("second writer open");
+        assert_eq!(has_added_columns(&conn), all);
+        let hits = lexical_file_candidates(&conn, &cfg, &["runbook".to_string()], 5);
+        assert_eq!(hits.len(), 1);
+        drop(conn);
+        drop(writer);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_brand_new_store_is_created_by_whoever_opens_it_first() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tmp")
+            .join(format!("migrate-fresh-{}", process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let db = dir.join("retrivio.db");
+        let conn = open_db_rw(&db).expect("fresh store through the non-migrating open");
+        assert!(db_has_table(&conn, "projects").unwrap());
+        assert!(db_has_table(&conn, "query_embed_cache").unwrap());
+        assert!(table_has_column(&conn, "project_chunk_vectors", "embed_input_hash").unwrap());
+        drop(conn);
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+/// True for the error [`WriterLock::try_acquire`] returns while another writer runs.
+fn is_index_busy_error(e: &str) -> bool {
+    e.starts_with(INDEX_BUSY_PREFIX)
+}
+
+/// The watcher's lock acquisition: wait for a manual `index`/`prune` to finish instead of
+/// failing, and say so once (also under `--quiet`; a long wait is worth one line in the log).
+fn acquire_writer_lock_for_watch(cwd: &Path) -> Result<WriterLock, String> {
+    WriterLock::acquire_waiting(&data_dir(cwd), Duration::from_secs(2), |msg| {
+        println!("[{}] watch: {}; waiting", chrono_like_now(), msg);
+    })
 }
 
 /// How long a connection waits on a locked database before returning SQLITE_BUSY.
@@ -23069,7 +24529,26 @@ fn open_db_read_only(db_path: &Path) -> Result<Connection, String> {
     Ok(conn)
 }
 
+/// Create the schema and migrate an existing one, inside a single `BEGIN IMMEDIATE`
+/// transaction: the write lock is taken up front, every `ensure_*` re-checks the column state
+/// inside the transaction, and a failure rolls everything back so the next writer retries.
+/// Only [`open_db_writer`] (writers holding the lock) and the creation of a brand-new store
+/// reach this; see [`open_db_rw`].
 fn init_schema(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch("BEGIN IMMEDIATE;")
+        .map_err(|e| format!("failed starting schema transaction: {}", e))?;
+    match init_schema_in_tx(conn) {
+        Ok(()) => conn
+            .execute_batch("COMMIT;")
+            .map_err(|e| format!("failed committing schema transaction: {}", e)),
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK;");
+            Err(e)
+        }
+    }
+}
+
+fn init_schema_in_tx(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(
         r#"
 CREATE TABLE IF NOT EXISTS projects (
@@ -23078,7 +24557,9 @@ CREATE TABLE IF NOT EXISTS projects (
     title TEXT NOT NULL,
     summary TEXT NOT NULL,
     project_mtime REAL NOT NULL,
-    last_indexed REAL NOT NULL
+    last_indexed REAL NOT NULL,
+    scan_signature TEXT NOT NULL DEFAULT '',
+    index_in_progress INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS project_vectors (
@@ -23086,7 +24567,9 @@ CREATE TABLE IF NOT EXISTS project_vectors (
     model TEXT NOT NULL,
     dim INTEGER NOT NULL,
     norm REAL NOT NULL,
-    vector BLOB NOT NULL
+    vector BLOB NOT NULL,
+    normalized INTEGER NOT NULL DEFAULT 0,
+    pipeline_version INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS project_chunks (
@@ -23119,7 +24602,10 @@ CREATE TABLE IF NOT EXISTS project_chunk_vectors (
     model TEXT NOT NULL,
     dim INTEGER NOT NULL,
     norm REAL NOT NULL,
-    vector BLOB NOT NULL
+    vector BLOB NOT NULL,
+    embed_input_hash TEXT NOT NULL DEFAULT '',
+    normalized INTEGER NOT NULL DEFAULT 0,
+    pipeline_version INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS selection_events (
@@ -23141,6 +24627,10 @@ CREATE TABLE IF NOT EXISTS app_state (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL,
     updated_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS lance_pending (
+    chunk_id INTEGER PRIMARY KEY
 );
 
 CREATE INDEX IF NOT EXISTS idx_tracked_roots_enabled_path
@@ -23377,7 +24867,161 @@ CREATE INDEX IF NOT EXISTS idx_file_dep_edges_target ON file_dependency_edges(ta
     ensure_relation_feedback_quality_column(conn)?;
     ensure_tracked_roots_exclude_column(conn)?;
     ensure_chunk_code_intel_columns(conn)?;
+    ensure_projects_scan_columns(conn)?;
+    ensure_chunk_vector_identity_columns(conn)?;
+    ensure_project_vector_identity_columns(conn)?;
     Ok(())
+}
+
+/// True when `table` already has a column named `column`. Both are code constants.
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool, String> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({})", table))
+        .map_err(|e| format!("failed inspecting {} schema: {}", table, e))?;
+    let mut rows = stmt
+        .query([])
+        .map_err(|e| format!("failed reading {} schema: {}", table, e))?;
+    while let Some(row) = rows
+        .next()
+        .map_err(|e| format!("failed iterating schema rows: {}", e))?
+    {
+        let name: String = row
+            .get(1)
+            .map_err(|e| format!("failed reading schema column name: {}", e))?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// `projects.scan_signature` (digest of the selected files' path, size and mtime, written only
+/// after a complete successful scan) and `projects.index_in_progress` (set while a run writes
+/// the project, cleared with the signature). Existing rows get '' / 0 and are re-scanned once.
+fn ensure_projects_scan_columns(conn: &Connection) -> Result<(), String> {
+    if !table_has_column(conn, "projects", "scan_signature")? {
+        conn.execute(
+            "ALTER TABLE projects ADD COLUMN scan_signature TEXT NOT NULL DEFAULT ''",
+            [],
+        )
+        .map_err(|e| format!("failed migrating projects.scan_signature: {}", e))?;
+    }
+    if !table_has_column(conn, "projects", "index_in_progress")? {
+        conn.execute(
+            "ALTER TABLE projects ADD COLUMN index_in_progress INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .map_err(|e| format!("failed migrating projects.index_in_progress: {}", e))?;
+    }
+    Ok(())
+}
+
+/// Embedding identity on `project_vectors` (`normalized`, `pipeline_version`; `model` and
+/// `dim` already exist), backfilled from the current normalisation setting and pipeline
+/// version 1, never by re-embedding.
+fn ensure_project_vector_identity_columns(conn: &Connection) -> Result<(), String> {
+    if table_has_column(conn, "project_vectors", "pipeline_version")? {
+        return Ok(());
+    }
+    for sql in [
+        "ALTER TABLE project_vectors ADD COLUMN normalized INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE project_vectors ADD COLUMN pipeline_version INTEGER NOT NULL DEFAULT 0",
+    ] {
+        conn.execute(sql, [])
+            .map_err(|e| format!("failed migrating project_vectors identity: {}", e))?;
+    }
+    let bedrock_normalized = bool_env("RETRIVIO_BEDROCK_NORMALIZE", true);
+    conn.execute(
+        r#"
+UPDATE project_vectors
+SET normalized = CASE WHEN model LIKE 'bedrock:%' AND ?1 THEN 1 ELSE 0 END,
+    pipeline_version = 1
+WHERE pipeline_version = 0
+"#,
+        params![bedrock_normalized as i64],
+    )
+    .map_err(|e| format!("failed backfilling project_vectors identity: {}", e))?;
+    Ok(())
+}
+
+/// Embedding identity on `project_chunk_vectors` (`embed_input_hash`, `normalized`,
+/// `pipeline_version`; `model` and `dim` already exist). Existing rows are backfilled from the
+/// stored chunk text and context header with the current normalisation setting and pipeline
+/// version 1, so an upgrade never re-embeds. Column adds and backfill share init_schema's
+/// transaction: a failure leaves the old schema in place and the next writer retries.
+fn ensure_chunk_vector_identity_columns(conn: &Connection) -> Result<(), String> {
+    if table_has_column(conn, "project_chunk_vectors", "embed_input_hash")? {
+        return Ok(());
+    }
+    // Runs inside init_schema's transaction: the column adds and the backfill commit together.
+    for sql in [
+        "ALTER TABLE project_chunk_vectors ADD COLUMN embed_input_hash TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE project_chunk_vectors ADD COLUMN normalized INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE project_chunk_vectors ADD COLUMN pipeline_version INTEGER NOT NULL DEFAULT 0",
+    ] {
+        conn.execute(sql, [])
+            .map_err(|e| format!("failed migrating project_chunk_vectors identity: {}", e))?;
+    }
+    backfill_chunk_vector_identity(conn)?;
+    Ok(())
+}
+
+/// Fill empty identity columns from the stored chunk rows. Pages by chunk id so a large store
+/// never holds every chunk text in memory at once. Returns the number of rows updated.
+fn backfill_chunk_vector_identity(conn: &Connection) -> Result<usize, String> {
+    const PAGE: i64 = 2000;
+    let bedrock_normalized = bool_env("RETRIVIO_BEDROCK_NORMALIZE", true);
+    let mut select = conn
+        .prepare(
+            r#"
+SELECT v.chunk_id, v.model, c.context_header, c.text
+FROM project_chunk_vectors v
+JOIN project_chunks c ON c.id = v.chunk_id
+WHERE v.embed_input_hash = '' AND v.chunk_id > ?1
+ORDER BY v.chunk_id
+LIMIT ?2
+"#,
+        )
+        .map_err(|e| format!("failed preparing vector identity backfill: {}", e))?;
+    let mut update = conn
+        .prepare(
+            "UPDATE project_chunk_vectors SET embed_input_hash = ?1, normalized = ?2, pipeline_version = ?3 WHERE chunk_id = ?4",
+        )
+        .map_err(|e| format!("failed preparing vector identity update: {}", e))?;
+    let mut last_id = i64::MIN;
+    let mut updated = 0usize;
+    loop {
+        let page: Vec<(i64, String, String, String)> = {
+            let rows = select
+                .query_map(params![last_id, PAGE], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })
+                .map_err(|e| format!("failed reading vector identity backfill page: {}", e))?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.map_err(|e| format!("failed reading backfill row: {}", e))?);
+            }
+            out
+        };
+        if page.is_empty() {
+            break;
+        }
+        for (chunk_id, model, header, text) in &page {
+            let hash = embed_input_hash(&embed_input_for(header, text));
+            let normalized = model.starts_with("bedrock:") && bedrock_normalized;
+            update
+                .execute(params![hash, normalized as i64, 1i64, chunk_id])
+                .map_err(|e| format!("failed backfilling vector identity: {}", e))?;
+            updated += 1;
+            last_id = *chunk_id;
+        }
+    }
+    Ok(updated)
 }
 
 fn ensure_vector_model_column(conn: &Connection) -> Result<(), String> {
@@ -23657,23 +25301,32 @@ impl IndexScope {
 
 /// Resolve an [`IndexScope`] into the tracked roots (needed for per-project excludes) and the
 /// exact project directories the run covers.
+/// The roots and projects of a run, plus the roots whose discovery listing was incomplete
+/// (their projects are protected from removal).
 fn resolve_index_targets(
     conn: &Connection,
     cfg: &ConfigValues,
     scope: &IndexScope,
-) -> Result<(Vec<TrackedRoot>, Vec<PathBuf>), String> {
+) -> Result<IndexTargets, String> {
     let mut roots = resolve_roots(conn, cfg, None)?;
     match scope {
         IndexScope::AllRoots => {
-            let projects = discover_projects(&roots);
-            Ok((roots, projects))
+            let discovery = discover_projects_full(&roots);
+            Ok(IndexTargets {
+                roots,
+                projects: discovery.projects,
+                incomplete_roots: discovery.incomplete_roots,
+                shallow: discovery.shallow,
+            })
         }
         IndexScope::Targets {
             roots: root_paths,
             projects: project_paths,
         } => {
             let scoped = resolve_roots(conn, cfg, Some(root_paths.clone()))?;
-            let mut projects = discover_projects(&scoped);
+            let discovery = discover_projects_full(&scoped);
+            let mut projects = discovery.projects;
+            let mut shallow = discovery.shallow;
             for root in scoped {
                 if !roots.iter().any(|t| t.path == root.path) {
                     roots.push(root);
@@ -23682,12 +25335,40 @@ fn resolve_index_targets(
             for raw in project_paths {
                 let project = normalize_path(&raw.to_string_lossy());
                 if project.is_dir() && !projects.contains(&project) {
+                    // A tracked root named as a project is its root-files project when
+                    // discovery splits that root; otherwise the root is one recursive project.
+                    if let Some(tracked) = roots.iter().find(|t| t.path == project) {
+                        if discover_root(&tracked.path, &tracked.absolute_excludes())
+                            .root_files
+                            .is_some()
+                        {
+                            shallow.insert(project.clone());
+                        }
+                    }
                     projects.push(project);
                 }
             }
-            Ok((roots, projects))
+            Ok(IndexTargets {
+                roots,
+                projects,
+                incomplete_roots: HashSet::new(),
+                shallow,
+            })
         }
     }
+}
+
+/// What one index run covers.
+#[derive(Default)]
+struct IndexTargets {
+    /// Tracked roots (for per-project excludes and root protection).
+    roots: Vec<TrackedRoot>,
+    /// The exact project directories, root-files projects included.
+    projects: Vec<PathBuf>,
+    /// Roots whose discovery listing was incomplete; their projects are protected from removal.
+    incomplete_roots: HashSet<PathBuf>,
+    /// Projects scanned shallow (a root's top-level files only).
+    shallow: HashSet<PathBuf>,
 }
 
 /// Interpret the paths given to a scoped refresh (`retrivio refresh <path>`, `POST /refresh`,
@@ -23824,7 +25505,9 @@ mod scoped_refresh_tests {
 
         let scope = plan_scoped_refresh(&conn, &cfg(), &[a.clone()]).expect("plan");
         assert_eq!(scope, IndexScope::projects(vec![a.clone()]));
-        let (roots, projects) = resolve_index_targets(&conn, &cfg(), &scope).expect("resolve");
+        let IndexTargets {
+            roots, projects, ..
+        } = resolve_index_targets(&conn, &cfg(), &scope).expect("resolve");
         assert_eq!(
             projects,
             vec![a.clone()],
@@ -23834,7 +25517,7 @@ mod scoped_refresh_tests {
 
         // prune's stale-row criterion: a row survives when discovery of the tracked roots
         // yields its path. Every target here is such a path, so prune finds nothing to remove.
-        let discovered = discover_projects(&roots);
+        let discovered = discover_projects_full(&roots).projects;
         assert!(projects.iter().all(|p| discovered.contains(p)));
         let _ = fs::remove_dir_all(&root);
     }
@@ -23846,7 +25529,8 @@ mod scoped_refresh_tests {
 
         let scope = plan_scoped_refresh(&conn, &cfg(), &[root.clone()]).expect("plan");
         assert_eq!(scope, IndexScope::roots(vec![root.clone()]));
-        let (_, projects) = resolve_index_targets(&conn, &cfg(), &scope).expect("resolve");
+        let IndexTargets { projects, .. } =
+            resolve_index_targets(&conn, &cfg(), &scope).expect("resolve");
         assert_eq!(projects, vec![root.join("proj-a"), root.join("proj-b")]);
         let _ = fs::remove_dir_all(&root);
     }
@@ -23888,11 +25572,12 @@ mod scoped_refresh_tests {
         let root = workspace("indexed");
         let conn = conn_tracking(&root);
         let stale = root.join("proj-a").join("reports");
-        upsert_project(&conn, &stale.to_string_lossy(), "reports", "", 0.0, 0.0).expect("row");
+        begin_project_update(&conn, &stale.to_string_lossy(), "reports").expect("row");
 
         let scope = plan_scoped_refresh(&conn, &cfg(), &[stale.clone()]).expect("plan");
         assert_eq!(scope, IndexScope::projects(vec![stale.clone()]));
-        let (_, projects) = resolve_index_targets(&conn, &cfg(), &scope).expect("resolve");
+        let IndexTargets { projects, .. } =
+            resolve_index_targets(&conn, &cfg(), &scope).expect("resolve");
         assert_eq!(projects, vec![stale]);
         let _ = fs::remove_dir_all(&root);
     }
@@ -23911,7 +25596,8 @@ mod scoped_refresh_tests {
                 projects: vec![a.clone()]
             }
         );
-        let (_, projects) = resolve_index_targets(&conn, &cfg(), &scope).expect("resolve");
+        let IndexTargets { projects, .. } =
+            resolve_index_targets(&conn, &cfg(), &scope).expect("resolve");
         assert_eq!(projects, vec![a, root.join("proj-b")]);
         let _ = fs::remove_dir_all(&root);
     }
@@ -23929,7 +25615,8 @@ mod scoped_refresh_tests {
         let (scope, force) = derive_watch_targets(&pending, &tracked);
         assert_eq!(scope, IndexScope::projects(vec![a.clone()]));
         assert_eq!(force, HashSet::from([a.clone()]));
-        let (_, projects) = resolve_index_targets(&conn, &cfg(), &scope).expect("resolve");
+        let IndexTargets { projects, .. } =
+            resolve_index_targets(&conn, &cfg(), &scope).expect("resolve");
         assert_eq!(projects, vec![a]);
 
         // A new directory is discovered at event time and targeted as a project itself.
@@ -24004,52 +25691,169 @@ fn project_excludes_for_path(project_dir: &Path, roots: &[TrackedRoot]) -> HashS
     out
 }
 
-fn discover_projects(roots: &[TrackedRoot]) -> Vec<PathBuf> {
+/// What discovery found under every tracked root.
+#[derive(Clone, Debug, Default)]
+struct Discovery {
+    /// Every project path, root-files projects included, sorted by basename.
+    projects: Vec<PathBuf>,
+    /// The paths in `projects` that are root-files projects: a tracked root indexed for its
+    /// own top-level files only (see [`RootDiscovery::root_files`]). Scanned shallow.
+    shallow: HashSet<PathBuf>,
+    /// Roots whose listing was incomplete (a directory entry could not be read). Projects
+    /// under them may be missing from `projects`, so `index` and `prune` never remove project
+    /// rows under them.
+    incomplete_roots: HashSet<PathBuf>,
+}
+
+impl Discovery {
+    fn is_shallow(&self, project: &Path) -> bool {
+        self.shallow.contains(project)
+    }
+}
+
+fn discover_projects_full(roots: &[TrackedRoot]) -> Discovery {
     let mut seen: HashSet<String> = HashSet::new();
-    let mut out: Vec<PathBuf> = Vec::new();
+    let mut out = Discovery::default();
 
     for root in roots {
         if !root.path.is_dir() {
             continue;
         }
-        let exclude_abs = root.absolute_excludes();
-        let candidates = discover_root_projects(&root.path, &exclude_abs);
-        for candidate in candidates {
+        let found = discover_root(&root.path, &root.absolute_excludes());
+        if found.incomplete {
+            out.incomplete_roots.insert(root.path.clone());
+        }
+        for candidate in found.projects {
             let key = candidate.to_string_lossy().to_string();
             if seen.insert(key) {
-                out.push(candidate);
+                out.projects.push(candidate);
+            }
+        }
+        if let Some(root_files) = found.root_files {
+            let key = root_files.to_string_lossy().to_string();
+            if seen.insert(key) {
+                out.shallow.insert(root_files.clone());
+                out.projects.push(root_files);
             }
         }
     }
 
-    out.sort_by_key(|p| p.file_name().map(|s| s.to_string_lossy().to_lowercase()));
+    out.projects
+        .sort_by_key(|p| p.file_name().map(|s| s.to_string_lossy().to_lowercase()));
     out
 }
 
-fn list_project_child_dirs(root: &Path, exclude_abs: &HashSet<PathBuf>) -> Vec<PathBuf> {
+/// What discovery found under one tracked root.
+#[derive(Clone, Debug, Default)]
+struct RootDiscovery {
+    /// Project directories, each indexed recursively.
+    projects: Vec<PathBuf>,
+    /// The root itself as a project for the files lying directly under it, when the root is
+    /// split into child projects and holds at least one indexable file of its own. Its path is
+    /// the root's path, its title `<root basename> (root files)`, and it is scanned shallow:
+    /// direct files only, no subdirectories. It takes part in index, prune and refresh like
+    /// any project and disappears when its last file does.
+    root_files: Option<PathBuf>,
+    /// A directory listing on the way could not be read in full.
+    incomplete: bool,
+}
+
+fn discover_root(root: &Path, exclude_abs: &HashSet<PathBuf>) -> RootDiscovery {
+    let (projects, incomplete) = discover_root_projects_checked(root, exclude_abs);
+    let root_path = normalize_path(&root.to_string_lossy());
+    let root_files = (!projects.contains(&root_path) && has_direct_indexable_files(&root_path))
+        .then_some(root_path);
+    RootDiscovery {
+        projects,
+        root_files,
+        incomplete,
+    }
+}
+
+/// True when `dir` holds, directly, at least one file the walk would index (same rules as
+/// [`walk_project_files`]: a regular, non-hidden file with an indexable suffix and content).
+fn has_direct_indexable_files(dir: &Path) -> bool {
+    let Ok(rd) = fs::read_dir(dir) else {
+        return false;
+    };
+    rd.flatten().any(|entry| {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            return false;
+        }
+        let Ok(ft) = entry.file_type() else {
+            return false;
+        };
+        if !ft.is_file() {
+            return false;
+        }
+        let ext = Path::new(&name)
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        is_indexable_suffix(&format!(".{}", ext))
+            && entry.metadata().map(|m| m.len() > 0).unwrap_or(false)
+    })
+}
+
+/// Child directories of `root` (project candidates). `incomplete` is set when the listing
+/// could not be read in full, so the caller never treats an unlisted project as gone.
+fn list_project_child_dirs(
+    root: &Path,
+    exclude_abs: &HashSet<PathBuf>,
+    incomplete: &mut bool,
+) -> Vec<PathBuf> {
     let mut children: Vec<PathBuf> = Vec::new();
-    if let Ok(rd) = fs::read_dir(root) {
-        for entry in rd.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with('.') || is_skip_dir(&name) {
-                continue;
-            }
-            if let Ok(ft) = entry.file_type() {
-                if ft.is_dir() {
-                    let p = normalize_path(&entry.path().to_string_lossy());
-                    if exclude_abs.contains(&p) {
-                        continue;
+    match fs::read_dir(root) {
+        Ok(rd) => {
+            for entry in rd {
+                let Ok(entry) = entry else {
+                    *incomplete = true;
+                    continue;
+                };
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with('.') || is_skip_dir(&name) {
+                    continue;
+                }
+                match entry.file_type() {
+                    Ok(ft) if ft.is_dir() => {
+                        let p = normalize_path(&entry.path().to_string_lossy());
+                        if exclude_abs.contains(&p) {
+                            continue;
+                        }
+                        children.push(p);
                     }
-                    children.push(p);
+                    Ok(_) => {}
+                    Err(_) => *incomplete = true,
                 }
             }
         }
+        Err(_) => *incomplete = true,
     }
     children.sort_by_key(|p| p.file_name().map(|s| s.to_string_lossy().to_lowercase()));
     children
 }
 
 fn discover_root_projects(root: &Path, exclude_abs: &HashSet<PathBuf>) -> Vec<PathBuf> {
+    discover_root_projects_checked(root, exclude_abs).0
+}
+
+/// [`discover_root_projects`] plus whether any directory listing on the way was incomplete.
+fn discover_root_projects_checked(
+    root: &Path,
+    exclude_abs: &HashSet<PathBuf>,
+) -> (Vec<PathBuf>, bool) {
+    let mut incomplete = false;
+    let projects = discover_root_projects_inner(root, exclude_abs, &mut incomplete);
+    (projects, incomplete)
+}
+
+fn discover_root_projects_inner(
+    root: &Path,
+    exclude_abs: &HashSet<PathBuf>,
+    incomplete: &mut bool,
+) -> Vec<PathBuf> {
     // Unwrap common single-container roots (e.g. demo-data/projects/*) so users
     // can track the parent and still get project-level indexing.
     let mut cursor = normalize_path(&root.to_string_lossy());
@@ -24057,7 +25861,7 @@ fn discover_root_projects(root: &Path, exclude_abs: &HashSet<PathBuf>) -> Vec<Pa
         .into_iter()
         .collect();
     for _ in 0..4 {
-        let children = list_project_child_dirs(&cursor, exclude_abs);
+        let children = list_project_child_dirs(&cursor, exclude_abs, incomplete);
         if children.is_empty() {
             return vec![cursor];
         }
@@ -24069,7 +25873,7 @@ fn discover_root_projects(root: &Path, exclude_abs: &HashSet<PathBuf>) -> Vec<Pa
                 .unwrap_or("")
                 .to_ascii_lowercase();
             if container_names.contains(child_name.as_str()) {
-                let mut grand = list_project_child_dirs(child, exclude_abs);
+                let mut grand = list_project_child_dirs(child, exclude_abs, incomplete);
                 if grand.is_empty() {
                     expanded_from_containers.push(child.clone());
                 } else {
@@ -24192,7 +25996,7 @@ mod project_discovery_tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("zz-skip-me")).expect("create skipped dir");
         fs::create_dir_all(root.join("keep-me")).expect("create kept dir");
-        let children = list_project_child_dirs(&root, &HashSet::new());
+        let children = list_project_child_dirs(&root, &HashSet::new(), &mut false);
         let names: Vec<String> = children
             .iter()
             .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
@@ -24320,8 +26124,9 @@ mod project_discovery_tests {
         .expect("write tmp");
 
         let no_excludes: HashSet<PathBuf> = HashSet::new();
-        let newest = project_latest_mtime(&root, &no_excludes).expect("mtime");
-        let all = collect_project_corpus(&root, 100_000, newest, &no_excludes).expect("all corpus");
+        let caps = ScanCaps::default();
+        let scan = project_scan(&root, &no_excludes, &caps, false);
+        let all = collect_project_corpus(&root, &scan, &caps, 100_000, &FileManifest::new(), true);
         assert!(all
             .chunks
             .iter()
@@ -24329,9 +26134,15 @@ mod project_discovery_tests {
 
         let mut excludes: HashSet<PathBuf> = HashSet::new();
         excludes.insert(normalize_path(&root.join("tmp").to_string_lossy()));
-        let newest_excluded = project_latest_mtime(&root, &excludes).expect("mtime excluded");
-        let filtered =
-            collect_project_corpus(&root, 100_000, newest_excluded, &excludes).expect("filtered");
+        let scan_excluded = project_scan(&root, &excludes, &caps, false);
+        let filtered = collect_project_corpus(
+            &root,
+            &scan_excluded,
+            &caps,
+            100_000,
+            &FileManifest::new(),
+            true,
+        );
         assert!(filtered
             .chunks
             .iter()
@@ -24398,134 +26209,552 @@ fn has_indexable_files_in_root(root: &Path) -> bool {
     false
 }
 
-fn project_latest_mtime(project_dir: &Path, exclude_abs: &HashSet<PathBuf>) -> Result<f64, String> {
-    let mut newest = file_mtime(project_dir).unwrap_or(0.0);
-    let mut stack = vec![project_dir.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(rd) = fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in rd.flatten() {
-            let path = entry.path();
-            if is_under_any(&path, exclude_abs) {
-                continue;
-            }
-            let name = entry.file_name().to_string_lossy().to_string();
-            let Ok(ft) = entry.file_type() else {
-                continue;
-            };
-            if ft.is_dir() {
-                if name.starts_with('.') || is_skip_dir(&name) {
-                    continue;
-                }
-                stack.push(path);
-                continue;
-            }
-            if !ft.is_file() || name.starts_with('.') {
-                continue;
-            }
-            if let Ok(meta) = entry.metadata() {
-                let mt = metadata_mtime(&meta);
-                if mt > newest {
-                    newest = mt;
-                }
-            }
-        }
-    }
-    Ok(newest)
+/// Per-scan limits. The defaults are the historical constants; every one is a config key
+/// (`max_files_per_project`, `max_chunks_per_project`, `max_chunks_per_file`,
+/// `max_file_chars`).
+#[derive(Clone, Debug, PartialEq)]
+struct ScanCaps {
+    max_files_per_project: usize,
+    max_chunks_per_project: usize,
+    max_chunks_per_file: usize,
+    /// Characters of a file's text the indexer looks at (the read cap).
+    max_file_chars: usize,
+    /// Documents (docx, pptx, ...) larger than this are refused without a read
+    /// (`max_document_bytes`); a refusal counts as a failed document.
+    max_document_bytes: u64,
+    /// Declared uncompressed total an Office/OpenDocument archive may have
+    /// (`max_document_uncompressed_bytes`); over it the document is refused unread.
+    max_document_uncompressed_bytes: u64,
+    /// Deadline for the PDF extraction child (`document_extract_timeout_ms`).
+    document_extract_timeout_ms: u64,
 }
 
-fn collect_project_corpus(
+impl Default for ScanCaps {
+    fn default() -> Self {
+        ScanCaps {
+            max_files_per_project: 2000,
+            max_chunks_per_project: 6000,
+            max_chunks_per_file: 28,
+            max_file_chars: 80_000,
+            max_document_bytes: 200_000_000,
+            max_document_uncompressed_bytes: documents::DEFAULT_MAX_DOCUMENT_UNCOMPRESSED_BYTES,
+            document_extract_timeout_ms: documents::DEFAULT_DOCUMENT_EXTRACT_TIMEOUT_MS,
+        }
+    }
+}
+
+impl ScanCaps {
+    /// `files|chunks|chunks_per_file|chars|documents|document_bytes|uncompressed_bytes`:
+    /// stored in `app_state` after a complete run; a different value on the next run revisits
+    /// every project. The extraction timeout is a timing parameter, not part of it.
+    fn fingerprint(&self) -> String {
+        format!(
+            "{}|{}|{}|{}|{}|{}|{}",
+            self.max_files_per_project,
+            self.max_chunks_per_project,
+            self.max_chunks_per_file,
+            self.max_file_chars,
+            index_documents_enabled(),
+            self.max_document_bytes,
+            self.max_document_uncompressed_bytes
+        )
+    }
+
+    fn from_cfg(cfg: &ConfigValues) -> Self {
+        ScanCaps {
+            max_files_per_project: cfg.max_files_per_project.max(1) as usize,
+            max_chunks_per_project: cfg.max_chunks_per_project.max(1) as usize,
+            max_chunks_per_file: cfg.max_chunks_per_file.max(1) as usize,
+            max_file_chars: cfg.max_file_chars.max(1) as usize,
+            max_document_bytes: cfg.max_document_bytes.max(1) as u64,
+            max_document_uncompressed_bytes: cfg.max_document_uncompressed_bytes.max(1) as u64,
+            document_extract_timeout_ms: cfg.document_extract_timeout_ms.max(1) as u64,
+        }
+    }
+
+    /// The bounds one document extraction gets: the text cut at about `max_file_chars`
+    /// characters (the collector cuts at exactly that many afterwards), the archive and PDF
+    /// bounds from the config keys.
+    fn extract_limits(&self) -> documents::ExtractLimits {
+        documents::ExtractLimits {
+            archive_uncompressed_bytes: self.max_document_uncompressed_bytes,
+            pdf_timeout: Duration::from_millis(self.document_extract_timeout_ms),
+            ..documents::ExtractLimits::with_text_bytes(
+                self.max_file_chars.saturating_mul(4).saturating_add(16),
+            )
+        }
+    }
+}
+
+/// Files larger than this are never indexed. A byte bound on what is read at all, distinct
+/// from the `max_file_chars` text cap; not configurable.
+const MAX_FILE_BYTES: u64 = 2_000_000;
+
+/// One indexable file the walk found, before selection.
+#[derive(Clone, Debug, PartialEq)]
+struct CandidateFile {
+    rel_path: String,
+    /// Where to read it: the project directory joined with `rel_path` (follows symlinks).
+    fs_path: PathBuf,
+    size: u64,
+    mtime: f64,
+    /// Modification time in whole nanoseconds, the form the signature hashes.
+    mtime_ns: i128,
+    /// Selection tier (see [`selection_tier`]): 1 human documents, 2 code, 3 config and data.
+    tier: u8,
+}
+
+/// What one walk of a project directory found.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct ProjectListing {
+    /// Indexable files within the size bounds, in directory order (unsorted).
+    candidates: Vec<CandidateFile>,
+    /// Every regular file's relative path (any suffix), for the summary's file list.
+    file_names: Vec<String>,
+    /// Newest mtime seen, the project directory itself included.
+    latest_mtime: f64,
+    /// Directory entries the walk could not read (`read_dir`, entry, file type or metadata
+    /// errors). Non-zero means the listing is incomplete: whatever is missing must not be
+    /// treated as deleted.
+    unreadable: usize,
+}
+
+/// Walk a project directory once. Shared by the gate ([`project_scan`]) and the collector, so
+/// the signature the gate stores describes exactly the files the collector indexed. With
+/// `shallow`, only the files directly in `project_dir` are listed (a root-files project).
+///
+/// The project directory is canonicalised once; every entry's absolute path is the canonical
+/// project path joined with its relative path (the walk never descends into symlinked
+/// directories, so the two agree), and the exclude set is matched against that lexically.
+fn walk_project_files(
     project_dir: &Path,
-    max_chars: usize,
-    newest_mtime: f64,
     exclude_abs: &HashSet<PathBuf>,
-) -> Result<ProjectCorpus, String> {
-    const MAX_FILE_BYTES: u64 = 2_000_000;
-    const MAX_FILES_PER_PROJECT: usize = 2000;
-    const MAX_CHUNKS_PER_FILE: usize = 28;
-    const MAX_CHUNKS_PER_PROJECT: usize = 6000;
-    const CHUNK_SIZE_CHARS: usize = 1000;
-    const CHUNK_OVERLAP_CHARS: usize = 180;
-    const SUMMARY_SNIPPET_CHARS: usize = 900;
-    const SUMMARY_SNIPPET_FILES: usize = 30;
-
-    let mut file_names: Vec<String> = Vec::new();
-    let mut candidate_files: Vec<(f64, PathBuf, String)> = Vec::new();
-
+    shallow: bool,
+) -> ProjectListing {
+    let mut out = ProjectListing {
+        latest_mtime: file_mtime(project_dir).unwrap_or(0.0),
+        ..ProjectListing::default()
+    };
+    let project_path = normalize_path(&project_dir.to_string_lossy());
     let mut stack = vec![project_dir.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let Ok(rd) = fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in rd.flatten() {
-            let path = entry.path();
-            if is_under_any(&path, exclude_abs) {
+        let rd = match fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(_) => {
+                out.unreadable += 1;
                 continue;
             }
-            let name = entry.file_name().to_string_lossy().to_string();
-            let Ok(ft) = entry.file_type() else {
+        };
+        for entry in rd {
+            let Ok(entry) = entry else {
+                out.unreadable += 1;
                 continue;
             };
-            if ft.is_dir() {
-                if name.starts_with('.') || is_skip_dir(&name) {
-                    continue;
-                }
-                stack.push(path);
-                continue;
-            }
-            if !ft.is_file() || name.starts_with('.') {
-                continue;
-            }
-
+            let path = entry.path();
             let rel = path
                 .strip_prefix(project_dir)
                 .unwrap_or(&path)
                 .to_string_lossy()
                 .to_string();
-            file_names.push(rel.clone());
-            let ext = path
-                .extension()
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_lowercase();
-            if !is_indexable_suffix(&format!(".{}", ext)) {
+            if !exclude_abs.is_empty() && path_is_under_any(&project_path.join(&rel), exclude_abs) {
                 continue;
             }
-            let Ok(meta) = entry.metadata() else {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let Ok(ft) = entry.file_type() else {
+                out.unreadable += 1;
                 continue;
             };
-            if meta.len() == 0 || meta.len() > MAX_FILE_BYTES {
+            if ft.is_dir() {
+                if shallow || name.starts_with('.') || is_skip_dir(&name) {
+                    continue;
+                }
+                stack.push(path);
                 continue;
             }
-            candidate_files.push((metadata_mtime(&meta), path, rel));
+            // Regular files only: symlinks (to files or directories) and special files are
+            // skipped, as they always were. Office owner/lock files (`~$deck.pptx`, a few
+            // bytes naming who has the document open) are not documents.
+            if !ft.is_file() || name.starts_with('.') || name.starts_with("~$") {
+                continue;
+            }
+            let meta = match entry.metadata() {
+                Ok(m) => m,
+                Err(_) => {
+                    out.unreadable += 1;
+                    continue;
+                }
+            };
+            out.file_names.push(rel.clone());
+            let mtime = metadata_mtime(&meta);
+            if mtime > out.latest_mtime {
+                out.latest_mtime = mtime;
+            }
+            let suffix = format!(
+                ".{}",
+                path.extension()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_lowercase()
+            );
+            if !is_indexable_suffix(&suffix) {
+                continue;
+            }
+            // Text files have a fixed byte bound; document formats are bounded by
+            // `max_document_bytes` in the collector, where the refusal is counted.
+            if meta.len() == 0
+                || (meta.len() > MAX_FILE_BYTES && !documents::is_document_only_suffix(&suffix))
+            {
+                continue;
+            }
+            out.candidates.push(CandidateFile {
+                rel_path: rel,
+                tier: selection_tier(&suffix),
+                fs_path: path,
+                size: meta.len(),
+                mtime,
+                mtime_ns: metadata_mtime_ns(&meta),
+            });
+        }
+    }
+    out.file_names.sort();
+    out
+}
+
+/// The files a scan indexes, in a fully deterministic order: by tier (human documents, then
+/// code, then config and data; see [`selection_tier`]), newest first within a tier, then by
+/// relative path, cut at `max_files_per_project`. The collector consumes the same order, so
+/// when `max_chunks_per_project` bites, config and data files are the first left out and
+/// notes the last. The same input always yields the same selection, so nothing shuffles in or
+/// out between runs unless a file changes. Returns the selection and how many candidates the
+/// file cap left out.
+fn select_scan_files(listing: &ProjectListing, caps: &ScanCaps) -> (Vec<CandidateFile>, usize) {
+    let mut files = listing.candidates.clone();
+    files.sort_by(|a, b| {
+        a.tier
+            .cmp(&b.tier)
+            .then_with(|| b.mtime.total_cmp(&a.mtime))
+            .then_with(|| a.rel_path.cmp(&b.rel_path))
+    });
+    let evicted = files.len().saturating_sub(caps.max_files_per_project);
+    files.truncate(caps.max_files_per_project);
+    (files, evicted)
+}
+
+/// `count:xxh64` over the sorted `(rel_path, size, mtime_ns)` tuples of the selected files.
+/// It changes when a selected file is added, removed, renamed, resized or touched (an edit
+/// with a preserved timestamp still changes the size in almost every case; a future-dated
+/// file cannot mask a later edit to another file); it does not change for files the scan
+/// would not index anyway. This is the project gate's whole memory of the file system.
+fn scan_signature_for(selected: &[CandidateFile]) -> String {
+    let mut rows: Vec<(&str, u64, i128)> = selected
+        .iter()
+        .map(|f| (f.rel_path.as_str(), f.size, f.mtime_ns))
+        .collect();
+    rows.sort();
+    let mut buf = String::new();
+    for (rel, size, ns) in &rows {
+        buf.push_str(rel);
+        buf.push('\0');
+        buf.push_str(&size.to_string());
+        buf.push('\0');
+        buf.push_str(&ns.to_string());
+        buf.push('\n');
+    }
+    format!("{}:{}", rows.len(), content_hash_xxh64(buf.as_bytes()))
+}
+
+/// The gate's view of a project: one walk, the deterministic selection and its signature.
+/// Handed to [`collect_project_corpus`] so the collector never walks again.
+#[derive(Clone, Debug)]
+struct ProjectScan {
+    listing: ProjectListing,
+    selected: Vec<CandidateFile>,
+    /// Candidates `max_files_per_project` left out.
+    evicted_by_file_cap: usize,
+    signature: String,
+    /// A root-files project: the root's direct files only.
+    shallow: bool,
+}
+
+impl ProjectScan {
+    fn latest_mtime(&self) -> f64 {
+        self.listing.latest_mtime
+    }
+
+    /// True when every directory entry could be read.
+    fn complete(&self) -> bool {
+        self.listing.unreadable == 0
+    }
+}
+
+fn project_scan(
+    project_dir: &Path,
+    exclude_abs: &HashSet<PathBuf>,
+    caps: &ScanCaps,
+    shallow: bool,
+) -> ProjectScan {
+    let listing = walk_project_files(project_dir, exclude_abs, shallow);
+    let (selected, evicted_by_file_cap) = select_scan_files(&listing, caps);
+    let signature = scan_signature_for(&selected);
+    ProjectScan {
+        listing,
+        selected,
+        evicted_by_file_cap,
+        signature,
+        shallow,
+    }
+}
+
+/// Produce the project's chunks for this run from a finished [`ProjectScan`].
+///
+/// Every selected file is listed in the returned `files` (the full keep set); only files that
+/// are new or changed against `manifest` (or all of them with `rechunk_all`) are read,
+/// chunked and listed in `chunks` (the work set). Unchanged files contribute their manifest
+/// chunk count towards the per-project cap and are kept whole by the prune step. Change
+/// detection is the manifest's size+mtime fast path, then the content hash when the stat
+/// differs (touch without edit; such files get their new stat written, nothing else).
+///
+/// `doc_path` is `<canonical project path>/<rel_path>` for every file and chunk, so the keep
+/// set and the stored rows are keyed the same way regardless of symlinks.
+fn collect_project_corpus(
+    project_dir: &Path,
+    scan: &ProjectScan,
+    caps: &ScanCaps,
+    max_chars: usize,
+    manifest: &FileManifest,
+    rechunk_all: bool,
+) -> ProjectCorpus {
+    const CHUNK_SIZE_CHARS: usize = 1000;
+    const CHUNK_OVERLAP_CHARS: usize = 180;
+    const SUMMARY_SNIPPET_CHARS: usize = 900;
+    const SUMMARY_SNIPPET_FILES: usize = 30;
+    const AST_CHUNK_SIZE: usize = 1500; // larger for AST chunks since they're semantic units
+
+    #[cfg(test)]
+    {
+        let target = INJECT_COLLECTOR_PANIC
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        if let Some(name) = target {
+            if project_dir.file_name().and_then(|s| s.to_str()) == Some(name.as_str()) {
+                panic!("injected collector panic for {}", name);
+            }
         }
     }
 
-    candidate_files.sort_by(|a, b| {
-        let a_doc = is_doc_extension(&a.1);
-        let b_doc = is_doc_extension(&b.1);
-        b_doc.cmp(&a_doc).then_with(|| b.0.total_cmp(&a.0))
-    });
+    let project_path = normalize_path(&project_dir.to_string_lossy());
+    let doc_path_for =
+        |rel: &str| -> String { project_path.join(rel).to_string_lossy().to_string() };
+
     let mut chunks: Vec<ProjectChunk> = Vec::new();
-    let mut snippets: Vec<String> = Vec::new();
-    let mut indexed_files = 0i64;
+    let mut files: Vec<ScannedFile> = Vec::new();
+    // The summary quotes the first SUMMARY_SNIPPET_FILES selected files in relative-path
+    // order (not selection order, which follows mtime), so the summary text is independent
+    // of touches and the project vector is reused until content or membership changes.
+    // Documents are never quoted: their raw bytes are not text, and extracting an unchanged
+    // document on every scan is exactly what the manifest fast path avoids.
+    let is_document_candidate = |cand: &CandidateFile| -> bool {
+        index_documents_enabled() && documents::is_document_suffix(&suffix_with_dot(&cand.fs_path))
+    };
+    let snippet_files: HashSet<&str> = {
+        let mut rels: Vec<&str> = scan
+            .selected
+            .iter()
+            .filter(|c| !is_document_candidate(c))
+            .map(|c| c.rel_path.as_str())
+            .collect();
+        rels.sort_unstable();
+        rels.into_iter().take(SUMMARY_SNIPPET_FILES).collect()
+    };
+    let mut snippets: BTreeMap<String, String> = BTreeMap::new();
+    let mut documents_extracted = 0usize;
+    let mut document_failures: Vec<(String, String)> = Vec::new();
+    // Chunks of unchanged files count towards the per-project cap without being re-produced.
+    let mut carried_chunks = 0usize;
+    let mut visited = 0usize;
+    let mut files_truncated = 0usize;
+    // Selected files whose read failed after the walk listed them: the scan is incomplete
+    // (prune and the signature update are skipped), they are not treated as deleted.
+    let mut read_failures = 0usize;
+    let mut chunk_cap_hit = false;
+    let mut file_chunk_cap_hit = false;
+    let mut text_cap_hit = false;
+    let extract_limits = caps.extract_limits();
 
-    const AST_CHUNK_SIZE: usize = 1500; // larger for AST chunks since they're semantic units
+    // A document that fails extraction (refused by a bound, corrupt, parser error or panic,
+    // PDF child timed out or killed) must never cost content that was indexed before: when
+    // the manifest knows the file, it is carried exactly as an unchanged file (its stored
+    // chunks, vectors, symbols and manifest row stand; the manifest entry is not advanced,
+    // so the file is retried on the next full revisit), and the failure is reported once for
+    // this run. A never-indexed document that fails is simply absent from the keep set.
+    let carry_failed_document =
+        |rel: String,
+         doc_path: String,
+         reason: String,
+         files: &mut Vec<ScannedFile>,
+         carried: &mut usize,
+         failures: &mut Vec<(String, String)>| {
+            failures.push((rel.clone(), reason));
+            if let Some(entry) = manifest.get(&rel) {
+                *carried += entry.chunk_count.max(0) as usize;
+                files.push(ScannedFile {
+                    rel_path: rel,
+                    doc_path,
+                    size: entry.size,
+                    mtime: entry.mtime,
+                    content_hash: entry.content_hash.clone(),
+                    chunk_count: entry.chunk_count,
+                    rechunked: false,
+                    stat_changed: false,
+                });
+            }
+        };
 
-    for (doc_mtime, path, rel) in candidate_files.into_iter().take(MAX_FILES_PER_PROJECT) {
-        let Some(text) = read_for_index(&path) else {
+    for cand in &scan.selected {
+        if carried_chunks + chunks.len() >= caps.max_chunks_per_project {
+            chunk_cap_hit = true;
+            break;
+        }
+        visited += 1;
+        let rel = cand.rel_path.clone();
+        let doc_path = doc_path_for(&rel);
+        let size_i64 = cand.size as i64;
+        let doc_mtime = cand.mtime;
+
+        // Fast path: manifest says size and mtime are what they were. No read, no chunking;
+        // the first few files are still read for the project summary snippet.
+        if !rechunk_all {
+            if let Some(entry) = manifest_stat_match(manifest, &rel, size_i64, doc_mtime) {
+                if snippet_files.contains(rel.as_str()) {
+                    if let Some((text, _)) = read_for_index(&cand.fs_path, caps.max_file_chars) {
+                        let snippet: String = text.chars().take(SUMMARY_SNIPPET_CHARS).collect();
+                        snippets.insert(rel.clone(), format!("{}\n{}", rel, snippet));
+                    }
+                }
+                carried_chunks += entry.chunk_count.max(0) as usize;
+                files.push(ScannedFile {
+                    rel_path: rel,
+                    doc_path,
+                    size: size_i64,
+                    mtime: doc_mtime,
+                    content_hash: entry.content_hash.clone(),
+                    chunk_count: entry.chunk_count,
+                    rechunked: false,
+                    stat_changed: false,
+                });
+                continue;
+            }
+        }
+
+        let is_document = is_document_candidate(cand);
+        if is_document && cand.size > caps.max_document_bytes {
+            // Refused without a read; a previously indexed version stays as it was.
+            carry_failed_document(
+                rel,
+                doc_path,
+                format!(
+                    "{} bytes exceeds max_document_bytes={}",
+                    cand.size, caps.max_document_bytes
+                ),
+                &mut files,
+                &mut carried_chunks,
+                &mut document_failures,
+            );
+            continue;
+        }
+
+        let raw = match fs::read(&cand.fs_path) {
+            Ok(raw) => raw,
+            Err(_) => {
+                read_failures += 1;
+                continue;
+            }
+        };
+
+        // Stat differed (or the file is new): the content hash decides.
+        let (changed, content_hash) = if rechunk_all {
+            (true, content_hash_xxh64(&raw))
+        } else {
+            file_has_changed(manifest, &rel, size_i64, doc_mtime, &raw)
+        };
+        if !changed {
+            let entry = manifest.get(&rel);
+            let chunk_count = entry.map(|e| e.chunk_count).unwrap_or(0);
+            carried_chunks += chunk_count.max(0) as usize;
+            files.push(ScannedFile {
+                rel_path: rel,
+                doc_path,
+                size: size_i64,
+                mtime: doc_mtime,
+                content_hash,
+                chunk_count,
+                rechunked: false,
+                stat_changed: true,
+            });
+            continue;
+        }
+
+        // Documents go through the extractor (changed files only: an unchanged document was
+        // handled by the manifest above and is never re-extracted). A failure keeps the
+        // previously indexed version of the file, if any (see `carry_failed_document`).
+        let mut document_cut = false;
+        let indexed_text = if is_document {
+            match documents::extract_from_bytes(&cand.fs_path, &raw, &extract_limits) {
+                Ok(Some(doc)) => {
+                    documents_extracted += 1;
+                    document_cut = doc.truncated;
+                    let body = match doc.title {
+                        Some(title) if !doc.text.starts_with(&title) => {
+                            format!("{}\n{}", title, doc.text)
+                        }
+                        _ => doc.text,
+                    };
+                    cap_indexed_text(&collapse_whitespace(&body), caps.max_file_chars)
+                }
+                Ok(None) => index_text_from_bytes(&cand.fs_path, &raw, caps.max_file_chars),
+                Err(reason) => {
+                    carry_failed_document(
+                        rel,
+                        doc_path,
+                        reason,
+                        &mut files,
+                        &mut carried_chunks,
+                        &mut document_failures,
+                    );
+                    continue;
+                }
+            }
+        } else {
+            index_text_from_bytes(&cand.fs_path, &raw, caps.max_file_chars)
+        };
+        let Some((text, text_truncated)) = indexed_text else {
+            // Selected, readable, but without indexable text (whitespace only, or a document
+            // that yielded none): a file with zero chunks. It stays in the keep set, so its
+            // manifest row is written and its stored chunks (from an earlier, non-empty
+            // version) are pruned; a code file's symbol and import rows are replaced by the
+            // empty extraction.
+            files.push(ScannedFile {
+                rel_path: rel,
+                doc_path,
+                size: size_i64,
+                mtime: doc_mtime,
+                content_hash,
+                chunk_count: 0,
+                rechunked: true,
+                stat_changed: false,
+            });
             continue;
         };
-        indexed_files += 1;
-        if snippets.len() < SUMMARY_SNIPPET_FILES {
+        if snippet_files.contains(rel.as_str()) {
             let snippet: String = text.chars().take(SUMMARY_SNIPPET_CHARS).collect();
-            snippets.push(format!("{}\n{}", rel, snippet));
+            snippets.insert(rel.clone(), format!("{}\n{}", rel, snippet));
         }
 
         // Try AST-aware chunking for code files, fall back to text windows for prose
         let is_code = code_intel::language_for_extension(
-            &path
+            &cand
+                .fs_path
                 .extension()
                 .and_then(|e| e.to_str())
                 .unwrap_or("")
@@ -24533,18 +26762,24 @@ fn collect_project_corpus(
         )
         .is_some();
 
-        let doc_path_normalized = normalize_path(&path.to_string_lossy())
-            .to_string_lossy()
-            .to_string();
-
+        let produced_before = chunks.len();
+        let mut truncated = text_truncated || document_cut;
+        if truncated {
+            text_cap_hit = true;
+        }
         if is_code {
             // AST-aware chunking: produces semantic chunks (functions, classes, imports)
-            let semantic_chunks = code_intel::analyze_file(&path, &text, &rel, AST_CHUNK_SIZE);
+            let semantic_chunks =
+                code_intel::analyze_file(&cand.fs_path, &text, &rel, AST_CHUNK_SIZE);
             for (chunk_index, sc) in semantic_chunks.into_iter().enumerate() {
-                if chunks.len() >= MAX_CHUNKS_PER_PROJECT {
+                if carried_chunks + chunks.len() >= caps.max_chunks_per_project {
+                    chunk_cap_hit = true;
+                    truncated = true;
                     break;
                 }
-                if chunk_index >= MAX_CHUNKS_PER_FILE {
+                if chunk_index >= caps.max_chunks_per_file {
+                    file_chunk_cap_hit = true;
+                    truncated = true;
                     break;
                 }
                 let token_count = word_tokens(&sc.text).len() as i64;
@@ -24565,7 +26800,7 @@ fn collect_project_corpus(
                     code_intel::ChunkKind::TextWindow => "text_window",
                 };
                 chunks.push(ProjectChunk {
-                    doc_path: doc_path_normalized.clone(),
+                    doc_path: doc_path.clone(),
                     doc_rel_path: rel.clone(),
                     doc_mtime,
                     chunk_index: chunk_index as i64,
@@ -24581,17 +26816,26 @@ fn collect_project_corpus(
                 });
             }
         } else {
-            // Fallback: character-window chunking for prose/non-code files
-            for (chunk_index, chunk_text) in chunk_text(
+            // Fallback: character-window chunking for prose/non-code files. `chunk_text`
+            // stops at the per-file cap itself; ask for one more to learn whether it did.
+            let windows = chunk_text(
                 &text,
                 CHUNK_SIZE_CHARS,
                 CHUNK_OVERLAP_CHARS,
-                MAX_CHUNKS_PER_FILE,
-            )
-            .into_iter()
-            .enumerate()
+                caps.max_chunks_per_file + 1,
+            );
+            if windows.len() > caps.max_chunks_per_file {
+                file_chunk_cap_hit = true;
+                truncated = true;
+            }
+            for (chunk_index, chunk_text) in windows
+                .into_iter()
+                .take(caps.max_chunks_per_file)
+                .enumerate()
             {
-                if chunks.len() >= MAX_CHUNKS_PER_PROJECT {
+                if carried_chunks + chunks.len() >= caps.max_chunks_per_project {
+                    chunk_cap_hit = true;
+                    truncated = true;
                     break;
                 }
                 let token_count = word_tokens(&chunk_text).len() as i64;
@@ -24602,7 +26846,7 @@ fn collect_project_corpus(
                 hasher.update(chunk_text.as_bytes());
                 let text_hash = format!("{:x}", hasher.finalize());
                 chunks.push(ProjectChunk {
-                    doc_path: doc_path_normalized.clone(),
+                    doc_path: doc_path.clone(),
                     doc_rel_path: rel.clone(),
                     doc_mtime,
                     chunk_index: chunk_index as i64,
@@ -24618,29 +26862,76 @@ fn collect_project_corpus(
                 });
             }
         }
-        if chunks.len() >= MAX_CHUNKS_PER_PROJECT {
-            break;
+        if truncated {
+            files_truncated += 1;
         }
+        files.push(ScannedFile {
+            rel_path: rel,
+            doc_path,
+            size: size_i64,
+            mtime: doc_mtime,
+            content_hash,
+            chunk_count: (chunks.len() - produced_before) as i64,
+            rechunked: true,
+            stat_changed: false,
+        });
+    }
+    // Selected files the project chunk cap kept the loop from reaching at all.
+    let evicted_by_chunk_cap = scan.selected.len().saturating_sub(visited);
+
+    let mut caps_hit: Vec<String> = Vec::new();
+    if scan.evicted_by_file_cap > 0 {
+        caps_hit.push(format!(
+            "{} files not indexed (max_files_per_project={})",
+            scan.evicted_by_file_cap, caps.max_files_per_project
+        ));
+    }
+    if evicted_by_chunk_cap > 0 || chunk_cap_hit {
+        caps_hit.push(format!(
+            "{} files not indexed (max_chunks_per_project={})",
+            evicted_by_chunk_cap, caps.max_chunks_per_project
+        ));
+    }
+    if file_chunk_cap_hit {
+        caps_hit.push(format!(
+            "chunks cut by max_chunks_per_file={}",
+            caps.max_chunks_per_file
+        ));
+    }
+    if text_cap_hit {
+        caps_hit.push(format!(
+            "text cut by max_file_chars={}",
+            caps.max_file_chars
+        ));
     }
 
-    let names_section = file_names
-        .into_iter()
+    // The summary's file list is sorted (the walk is), so the summary text is byte-identical
+    // between runs when nothing changed and the project vector is reused. `indexed_files` is
+    // the number of selected files holding at least one chunk, computed the same way for
+    // re-chunked, touched and untouched files, so a touch or a zero-chunk file never moves it.
+    let indexed_files = files.iter().filter(|f| f.chunk_count > 0).count();
+    let names_section = scan
+        .listing
+        .file_names
+        .iter()
         .take(500)
+        .cloned()
         .collect::<Vec<_>>()
         .join(" ");
-    let snippet_section = snippets.join("\n\n");
-    let title = project_dir
+    let snippet_section = snippets.into_values().collect::<Vec<_>>().join("\n\n");
+    let base_name = project_dir
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("project")
-        .replace('-', " ")
-        .replace('_', " ");
+        .to_string();
+    let mut title = base_name.replace('-', " ").replace('_', " ");
+    if scan.shallow {
+        title = format!("{} (root files)", title);
+    }
     let mut summary = format!(
-        "project {}\nindexed_files {}\nfiles {}\n\n{}",
-        project_dir
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("project"),
+        "project {}{}\nindexed_files {}\nfiles {}\n\n{}",
+        base_name,
+        if scan.shallow { " (root files)" } else { "" },
         indexed_files,
         names_section,
         snippet_section
@@ -24649,22 +26940,47 @@ fn collect_project_corpus(
         summary = summary.chars().take(max_chars).collect();
     }
 
-    Ok(ProjectCorpus {
+    ProjectCorpus {
         doc: ProjectDoc {
-            path: normalize_path(&project_dir.to_string_lossy()),
+            path: project_path,
             title,
             summary,
-            mtime: newest_mtime,
+            mtime: scan.latest_mtime(),
         },
         chunks,
-    })
+        files,
+        scan_signature: scan.signature.clone(),
+        complete: scan.complete() && read_failures == 0,
+        files_unreadable: (scan.listing.unreadable + read_failures) as i64,
+        files_evicted_by_cap: (scan.evicted_by_file_cap + evicted_by_chunk_cap) as i64,
+        files_truncated_by_cap: files_truncated as i64,
+        caps_note: caps_hit.join("; "),
+        documents_extracted: documents_extracted as i64,
+        documents_failed: document_failures.len() as i64,
+        document_failures,
+    }
 }
 
-fn read_for_index(path: &Path) -> Option<String> {
+/// `.docx` for `a/b.DOCX`; empty when the path has no extension.
+fn suffix_with_dot(path: &Path) -> String {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| format!(".{}", e.to_ascii_lowercase()))
+        .unwrap_or_default()
+}
+
+/// Read a file the way the indexer does (see [`index_text_from_bytes`]); `None` when it is
+/// unreadable or has no indexable text. The flag is true when the text was cut at `max_chars`.
+fn read_for_index(path: &Path, max_chars: usize) -> Option<(String, bool)> {
     let raw = fs::read(path).ok()?;
-    let text = String::from_utf8_lossy(&raw);
-    // Preserve whitespace for code files (indentation conveys scope structure).
-    // Only collapse whitespace for prose files where it's noise.
+    index_text_from_bytes(path, &raw, max_chars)
+}
+
+/// The text the indexer works on for a file's raw bytes: whitespace is preserved for code
+/// (indentation conveys scope) and collapsed for prose; empty results are `None`; cut at
+/// `max_chars` characters (the `max_file_chars` cap), with the flag telling when that bit.
+fn index_text_from_bytes(path: &Path, raw: &[u8], max_chars: usize) -> Option<(String, bool)> {
+    let text = String::from_utf8_lossy(raw);
     let is_code = path
         .extension()
         .and_then(|e| e.to_str())
@@ -24675,10 +26991,22 @@ fn read_for_index(path: &Path) -> Option<String> {
     } else {
         collapse_whitespace(&text)
     };
+    cap_indexed_text(&cleaned, max_chars)
+}
+
+/// Cut already-cleaned text at `max_chars` characters; `None` when it is blank. The flag is
+/// true when something was cut.
+fn cap_indexed_text(cleaned: &str, max_chars: usize) -> Option<(String, bool)> {
     if cleaned.trim().is_empty() {
         return None;
     }
-    Some(cleaned.chars().take(80_000).collect())
+    let mut out = String::with_capacity(cleaned.len().min(max_chars.saturating_mul(4)));
+    let mut iter = cleaned.chars();
+    for ch in iter.by_ref().take(max_chars) {
+        out.push(ch);
+    }
+    let truncated = iter.next().is_some();
+    Some((out, truncated))
 }
 
 /// Compute xxhash64 of file contents. Very fast (~2GB/s).
@@ -24686,30 +27014,40 @@ fn content_hash_xxh64(content: &[u8]) -> String {
     format!("{:016x}", xxh64::xxh64(content, 0))
 }
 
+/// One row of the per-project file manifest (`project_files`).
+#[derive(Clone, Debug, PartialEq)]
+struct FileManifestEntry {
+    size: i64,
+    mtime: f64,
+    content_hash: String,
+    chunk_count: i64,
+}
+
+/// rel_path -> manifest entry for one project.
+type FileManifest = HashMap<String, FileManifestEntry>;
+
 /// Load the existing file manifest for a project from SQLite.
-/// Returns rel_path -> (file_size, file_mtime, content_hash).
-fn load_file_manifest(
-    conn: &Connection,
-    project_id: i64,
-) -> Result<HashMap<String, (i64, f64, String)>, String> {
+fn load_file_manifest(conn: &Connection, project_id: i64) -> Result<FileManifest, String> {
     let mut stmt = conn
-        .prepare("SELECT rel_path, file_size, file_mtime, content_hash FROM project_files WHERE project_id = ?1")
+        .prepare("SELECT rel_path, file_size, file_mtime, content_hash, chunk_count FROM project_files WHERE project_id = ?1")
         .map_err(|e| format!("failed preparing file manifest query: {}", e))?;
     let rows = stmt
         .query_map(params![project_id], |row| {
             Ok((
                 row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, f64>(2)?,
-                row.get::<_, String>(3)?,
+                FileManifestEntry {
+                    size: row.get::<_, i64>(1)?,
+                    mtime: row.get::<_, f64>(2)?,
+                    content_hash: row.get::<_, String>(3)?,
+                    chunk_count: row.get::<_, i64>(4)?,
+                },
             ))
         })
         .map_err(|e| format!("failed querying file manifest: {}", e))?;
     let mut out = HashMap::new();
     for row in rows {
-        let (rel, size, mtime, hash) =
-            row.map_err(|e| format!("failed reading file manifest row: {}", e))?;
-        out.insert(rel, (size, mtime, hash));
+        let (rel, entry) = row.map_err(|e| format!("failed reading file manifest row: {}", e))?;
+        out.insert(rel, entry);
     }
     Ok(out)
 }
@@ -24744,51 +27082,42 @@ ON CONFLICT(project_id, rel_path) DO UPDATE SET
     Ok(())
 }
 
+/// The manifest fast path: the entry for `rel_path` when its recorded size and mtime equal the
+/// file's current ones, so the file can be treated as unchanged without reading it.
+fn manifest_stat_match<'a>(
+    manifest: &'a FileManifest,
+    rel_path: &str,
+    file_size: i64,
+    file_mtime: f64,
+) -> Option<&'a FileManifestEntry> {
+    manifest
+        .get(rel_path)
+        .filter(|e| e.size == file_size && (e.mtime - file_mtime).abs() < 0.001)
+}
+
 /// Check if a file has changed by comparing mtime+size, then verifying with content hash.
 /// Returns (changed: bool, content_hash: String).
 fn file_has_changed(
-    manifest: &HashMap<String, (i64, f64, String)>,
+    manifest: &FileManifest,
     rel_path: &str,
     file_size: i64,
     file_mtime: f64,
     content: &[u8],
 ) -> (bool, String) {
+    if let Some(entry) = manifest_stat_match(manifest, rel_path, file_size, file_mtime) {
+        return (false, entry.content_hash.clone());
+    }
     let hash = content_hash_xxh64(content);
     match manifest.get(rel_path) {
         None => (true, hash), // New file
-        Some((old_size, old_mtime, old_hash)) => {
-            // Fast path: if mtime and size match, assume unchanged
-            if *old_size == file_size && (*old_mtime - file_mtime).abs() < 0.001 {
-                return (false, old_hash.clone());
-            }
-            // Verify with content hash (handles clock skew, touch without modification)
-            if *old_hash == hash {
+        Some(entry) => {
+            // Stat differs but the content is the same (touch, clock skew, restored copy).
+            if entry.content_hash == hash {
                 return (false, hash);
             }
             (true, hash)
         }
     }
-}
-
-/// Remove manifest entries for files that no longer exist.
-fn clean_file_manifest(
-    conn: &Connection,
-    project_id: i64,
-    current_rel_paths: &HashSet<String>,
-) -> Result<usize, String> {
-    let existing = load_file_manifest(conn, project_id)?;
-    let mut removed = 0;
-    for rel_path in existing.keys() {
-        if !current_rel_paths.contains(rel_path) {
-            conn.execute(
-                "DELETE FROM project_files WHERE project_id = ?1 AND rel_path = ?2",
-                params![project_id, rel_path],
-            )
-            .map_err(|e| format!("failed cleaning file manifest: {}", e))?;
-            removed += 1;
-        }
-    }
-    Ok(removed)
 }
 
 fn collapse_whitespace(s: &str) -> String {
@@ -24854,18 +27183,19 @@ fn is_under_any(path: &Path, candidates: &HashSet<PathBuf>) -> bool {
     if candidates.is_empty() {
         return false;
     }
-    let resolved = normalize_path(&path.to_string_lossy());
-    for candidate in candidates {
-        if resolved == *candidate || resolved.starts_with(candidate) {
-            return true;
-        }
-    }
-    false
+    path_is_under_any(&normalize_path(&path.to_string_lossy()), candidates)
+}
+
+/// [`is_under_any`] for a path that is already absolute and normalised (no canonicalise call).
+fn path_is_under_any(resolved: &Path, candidates: &HashSet<PathBuf>) -> bool {
+    candidates
+        .iter()
+        .any(|candidate| resolved == candidate || resolved.starts_with(candidate))
 }
 
 fn get_project_by_path(conn: &Connection, path: &str) -> Result<Option<ExistingProject>, String> {
     conn.query_row(
-        "SELECT id, path, title, summary, project_mtime FROM projects WHERE path = ?1",
+        "SELECT id, path, title, summary, project_mtime, scan_signature, index_in_progress FROM projects WHERE path = ?1",
         params![path],
         |row| {
             Ok(ExistingProject {
@@ -24874,6 +27204,8 @@ fn get_project_by_path(conn: &Connection, path: &str) -> Result<Option<ExistingP
                 title: row.get(2)?,
                 summary: row.get(3)?,
                 project_mtime: row.get(4)?,
+                scan_signature: row.get(5)?,
+                index_in_progress: row.get::<_, i64>(6)? != 0,
             })
         },
     )
@@ -24881,56 +27213,99 @@ fn get_project_by_path(conn: &Connection, path: &str) -> Result<Option<ExistingP
     .map_err(|e| format!("failed fetching project row: {}", e))
 }
 
-fn upsert_project(
-    conn: &Connection,
-    path: &str,
+/// Start writing a project: return its row id (inserting a placeholder for a new project) with
+/// `index_in_progress` set. Title, summary, mtime and the scan signature of an existing row are
+/// left as they were: a run that fails after this leaves the project looking exactly as
+/// before, plus the marker, so the next run rescans it.
+fn begin_project_update(conn: &Connection, path: &str, title: &str) -> Result<i64, String> {
+    conn.execute(
+        r#"
+INSERT INTO projects(path, title, summary, project_mtime, last_indexed, scan_signature, index_in_progress)
+VALUES (?1, ?2, '', 0, 0, '', 1)
+ON CONFLICT(path) DO UPDATE SET index_in_progress = 1
+"#,
+        params![path, title],
+    )
+    .map_err(|e| format!("failed starting project update: {}", e))?;
+    conn.query_row(
+        "SELECT id FROM projects WHERE path = ?1",
+        params![path],
+        |row| row.get(0),
+    )
+    .map_err(|e| format!("failed reading project id: {}", e))
+}
+
+/// Publish the project row after every step of its run succeeded, inside the caller's publish
+/// transaction (`tx`): the summary vector (when a new one was embedded), title, summary,
+/// mtime, `last_indexed`, the scan signature (only for a complete scan; an incomplete one
+/// keeps the old signature so the project is rescanned) and `index_in_progress = 0`.
+fn finalize_project_row_in(
+    tx: &Connection,
+    project_id: i64,
     title: &str,
     summary: &str,
     project_mtime: f64,
     last_indexed: f64,
-) -> Result<i64, String> {
-    let existing: Option<i64> = conn
-        .query_row(
-            "SELECT id FROM projects WHERE path = ?1",
-            params![path],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|e| format!("failed checking existing project: {}", e))?;
-    if let Some(id) = existing {
-        conn.execute(
+    scan_signature: Option<&str>,
+    summary_vector: Option<(&EmbedIdentity, &[f32])>,
+) -> Result<(), String> {
+    if let Some((identity, vector)) = summary_vector {
+        set_project_vector(tx, project_id, identity, vector)?;
+    }
+    match scan_signature {
+        Some(signature) => tx.execute(
             r#"
 UPDATE projects
-SET title = ?1, summary = ?2, project_mtime = ?3, last_indexed = ?4
+SET title = ?1, summary = ?2, project_mtime = ?3, last_indexed = ?4, scan_signature = ?5,
+    index_in_progress = 0
+WHERE id = ?6
+"#,
+            params![
+                title,
+                summary,
+                project_mtime,
+                last_indexed,
+                signature,
+                project_id
+            ],
+        ),
+        None => tx.execute(
+            r#"
+UPDATE projects
+SET title = ?1, summary = ?2, project_mtime = ?3, last_indexed = ?4, index_in_progress = 0
 WHERE id = ?5
 "#,
-            params![title, summary, project_mtime, last_indexed, id],
-        )
-        .map_err(|e| format!("failed updating project row: {}", e))?;
-        Ok(id)
-    } else {
-        conn.execute(
-            r#"
-INSERT INTO projects(path, title, summary, project_mtime, last_indexed)
-VALUES (?1, ?2, ?3, ?4, ?5)
-"#,
-            params![path, title, summary, project_mtime, last_indexed],
-        )
-        .map_err(|e| format!("failed inserting project row: {}", e))?;
-        Ok(conn.last_insert_rowid())
+            params![title, summary, project_mtime, last_indexed, project_id],
+        ),
     }
+    .map_err(|e| format!("failed publishing project row: {}", e))?;
+    Ok(())
 }
 
-fn has_project_vector(conn: &Connection, project_id: i64, model: &str) -> Result<bool, String> {
-    let row: Option<i64> = conn
+/// True when the project's summary vector exists and was produced under exactly `identity`
+/// (model, dimension, normalisation, pipeline version).
+fn project_vector_matches(
+    conn: &Connection,
+    project_id: i64,
+    identity: &EmbedIdentity,
+) -> Result<bool, String> {
+    let row: Option<(String, i64, i64, i64)> = conn
         .query_row(
-            "SELECT 1 FROM project_vectors WHERE project_id = ?1 AND model = ?2 LIMIT 1",
-            params![project_id, model],
-            |row| row.get(0),
+            "SELECT model, dim, normalized, pipeline_version FROM project_vectors WHERE project_id = ?1",
+            params![project_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()
         .map_err(|e| format!("failed checking project vector: {}", e))?;
-    Ok(row.is_some())
+    Ok(match row {
+        Some((model, dim, normalized, pipeline_version)) => {
+            model == identity.model
+                && identity.dim == Some(dim)
+                && (normalized != 0) == identity.normalized
+                && pipeline_version == identity.pipeline_version
+        }
+        None => false,
+    })
 }
 
 fn has_project_chunks(conn: &Connection, project_id: i64) -> Result<bool, String> {
@@ -24976,19 +27351,31 @@ fn count_project_chunks(conn: &Connection, project_id: i64) -> Result<i64, Strin
     .map_err(|e| format!("failed counting project chunks: {}", e))
 }
 
+/// Chunk vectors of the project that match `identity` exactly. With no known dimension (no
+/// vectors for the model yet) nothing can match.
 fn count_project_chunk_vectors(
     conn: &Connection,
     project_id: i64,
-    model: &str,
+    identity: &EmbedIdentity,
 ) -> Result<i64, String> {
+    let Some(dim) = identity.dim else {
+        return Ok(0);
+    };
     conn.query_row(
         r#"
 SELECT COUNT(*)
 FROM project_chunks pc
 JOIN project_chunk_vectors pcv ON pcv.chunk_id = pc.id
-WHERE pc.project_id = ?1 AND pcv.model = ?2
+WHERE pc.project_id = ?1 AND pcv.model = ?2 AND pcv.dim = ?3
+  AND pcv.normalized = ?4 AND pcv.pipeline_version = ?5
 "#,
-        params![project_id, model],
+        params![
+            project_id,
+            identity.model,
+            dim,
+            identity.normalized as i64,
+            identity.pipeline_version
+        ],
         |row| row.get(0),
     )
     .map_err(|e| format!("failed counting chunk vectors: {}", e))
@@ -25037,22 +27424,32 @@ HAVING chunk_count > 0 AND vec_count < chunk_count
 fn set_project_vector(
     conn: &Connection,
     project_id: i64,
-    model: &str,
+    identity: &EmbedIdentity,
     vector: &[f32],
 ) -> Result<(), String> {
     let norm = vector_norm(vector);
     let blob = f32_blob(vector);
     conn.execute(
         r#"
-INSERT INTO project_vectors(project_id, model, dim, norm, vector)
-VALUES (?1, ?2, ?3, ?4, ?5)
+INSERT INTO project_vectors(project_id, model, dim, norm, vector, normalized, pipeline_version)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
 ON CONFLICT(project_id) DO UPDATE SET
     model = excluded.model,
     dim = excluded.dim,
     norm = excluded.norm,
-    vector = excluded.vector
+    vector = excluded.vector,
+    normalized = excluded.normalized,
+    pipeline_version = excluded.pipeline_version
 "#,
-        params![project_id, model, vector.len() as i64, norm, blob],
+        params![
+            project_id,
+            identity.model,
+            vector.len() as i64,
+            norm,
+            blob,
+            identity.normalized as i64,
+            identity.pipeline_version
+        ],
     )
     .map_err(|e| format!("failed upserting project vector: {}", e))?;
     Ok(())
@@ -25342,41 +27739,190 @@ INSERT INTO project_chunks(
     }
 }
 
+// ── Embedding identity ────────────────────────────────────────────────────────
+//
+// A stored chunk vector is reused instead of re-embedded only when everything that shaped it
+// still holds: the exact embedder input (context header + text), the model, the vector
+// dimension, the normalisation setting and the chunking pipeline version. Text hash alone is
+// not enough: the same text under a different header, model or pipeline is a different vector.
+
+/// The exact string handed to the embedder for a chunk: context header, newline, chunk text;
+/// the bare text when there is no header.
+fn embed_input_for(context_header: &str, text: &str) -> String {
+    if context_header.is_empty() {
+        text.to_string()
+    } else {
+        format!("{}\n{}", context_header, text)
+    }
+}
+
+/// SHA-1 hex digest of an embedder input string.
+fn embed_input_hash(input: &str) -> String {
+    let mut hasher = Sha1::new();
+    hasher.update(input.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+/// What the current run writes on every new vector and requires of a stored one to reuse it.
+#[derive(Clone, Debug, PartialEq)]
+struct EmbedIdentity {
+    model: String,
+    /// Dimension of this model's stored vectors. `None` when none exist yet, in which case
+    /// nothing can be reused and the first embedded batch fixes the dimension.
+    dim: Option<i64>,
+    normalized: bool,
+    pipeline_version: i64,
+}
+
+impl EmbedIdentity {
+    fn for_run(conn: &Connection, embedder: &dyn Embedder) -> Self {
+        let model = embedder.model_key();
+        let dim = vector_dim_from_sqlite(conn, &model).map(|d| d as i64);
+        EmbedIdentity {
+            model,
+            dim,
+            normalized: embedder.normalizes_output(),
+            pipeline_version: EMBEDDING_PIPELINE_VERSION,
+        }
+    }
+
+    /// True when `stored` was produced from `input_hash` under exactly this identity.
+    fn reuses(&self, stored: &StoredVectorIdentity, input_hash: &str) -> bool {
+        !input_hash.is_empty()
+            && stored.embed_input_hash == input_hash
+            && stored.model == self.model
+            && self.dim == Some(stored.dim)
+            && stored.normalized == self.normalized
+            && stored.pipeline_version == self.pipeline_version
+    }
+
+    /// `model|dim|normalized|pipeline_version`, the store-wide fingerprint kept in app_state.
+    /// `None` until the dimension is known (no vectors for the model yet).
+    fn fingerprint(&self) -> Option<String> {
+        self.dim.map(|dim| {
+            format!(
+                "{}|{}|{}|{}",
+                self.model, dim, self.normalized as u8, self.pipeline_version
+            )
+        })
+    }
+}
+
+/// The identity columns of one `project_chunk_vectors` row.
+#[derive(Clone, Debug, PartialEq)]
+struct StoredVectorIdentity {
+    embed_input_hash: String,
+    model: String,
+    dim: i64,
+    normalized: bool,
+    pipeline_version: i64,
+}
+
+/// Identity of every stored vector of one project, keyed by chunk id.
+#[cfg(test)]
+fn load_project_vector_identities(
+    conn: &Connection,
+    project_id: i64,
+) -> Result<HashMap<i64, StoredVectorIdentity>, String> {
+    let rows = load_project_vector_identity_rows(conn, project_id)?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, _, _, identity)| (id, identity))
+        .collect())
+}
+
+/// Identity of every stored vector of one project, keyed by the chunk row's position
+/// (`doc_path`, `chunk_index`), the key an upsert of the same chunk resolves to.
+fn load_project_vector_identities_by_position(
+    conn: &Connection,
+    project_id: i64,
+) -> Result<HashMap<(String, i64), StoredVectorIdentity>, String> {
+    let rows = load_project_vector_identity_rows(conn, project_id)?;
+    Ok(rows
+        .into_iter()
+        .map(|(_, doc_path, chunk_index, identity)| ((doc_path, chunk_index), identity))
+        .collect())
+}
+
+fn load_project_vector_identity_rows(
+    conn: &Connection,
+    project_id: i64,
+) -> Result<Vec<(i64, String, i64, StoredVectorIdentity)>, String> {
+    let mut stmt = conn
+        .prepare(
+            r#"
+SELECT v.chunk_id, c.doc_path, c.chunk_index, v.embed_input_hash, v.model, v.dim, v.normalized, v.pipeline_version
+FROM project_chunk_vectors v
+JOIN project_chunks c ON c.id = v.chunk_id
+WHERE c.project_id = ?1
+"#,
+        )
+        .map_err(|e| format!("failed preparing vector identity query: {}", e))?;
+    let rows = stmt
+        .query_map(params![project_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                StoredVectorIdentity {
+                    embed_input_hash: row.get::<_, String>(3)?,
+                    model: row.get::<_, String>(4)?,
+                    dim: row.get::<_, i64>(5)?,
+                    normalized: row.get::<_, i64>(6)? != 0,
+                    pipeline_version: row.get::<_, i64>(7)?,
+                },
+            ))
+        })
+        .map_err(|e| format!("failed querying vector identities: {}", e))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| format!("failed reading vector identity: {}", e))?);
+    }
+    Ok(out)
+}
+
 fn set_project_chunk_vector(
     conn: &Connection,
     chunk_id: i64,
-    model: &str,
+    identity: &EmbedIdentity,
+    embed_input_hash: &str,
     vector: &[f32],
 ) -> Result<(), String> {
     let norm = vector_norm(vector);
     let blob = f32_blob(vector);
     conn.execute(
         r#"
-INSERT INTO project_chunk_vectors(chunk_id, model, dim, norm, vector)
-VALUES (?1, ?2, ?3, ?4, ?5)
+INSERT INTO project_chunk_vectors(chunk_id, model, dim, norm, vector, embed_input_hash, normalized, pipeline_version)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
 ON CONFLICT(chunk_id) DO UPDATE SET
     model = excluded.model,
     dim = excluded.dim,
     norm = excluded.norm,
-    vector = excluded.vector
+    vector = excluded.vector,
+    embed_input_hash = excluded.embed_input_hash,
+    normalized = excluded.normalized,
+    pipeline_version = excluded.pipeline_version
 "#,
-        params![chunk_id, model, vector.len() as i64, norm, blob],
+        params![
+            chunk_id,
+            identity.model,
+            vector.len() as i64,
+            norm,
+            blob,
+            embed_input_hash,
+            identity.normalized as i64,
+            identity.pipeline_version
+        ],
     )
     .map_err(|e| format!("failed upserting chunk vector: {}", e))?;
     Ok(())
 }
 
-fn embed_and_store_chunk_batch(
-    cwd: &Path,
-    conn: &Connection,
-    model_key: &str,
+/// Embed `texts` with retries; the vectors come back in order, all of one non-zero width.
+fn embed_batch_with_retry(
     embedder: &dyn Embedder,
-    batch_ids: &[i64],
-    batch_texts: &[String],
-) -> Result<i64, String> {
-    if batch_ids.is_empty() {
-        return Ok(0);
-    }
+    texts: &[String],
+) -> Result<Vec<Vec<f32>>, String> {
     const BATCH_MAX_RETRIES: usize = 3;
     let mut last_err = String::new();
     for attempt in 0..=BATCH_MAX_RETRIES {
@@ -25384,13 +27930,13 @@ fn embed_and_store_chunk_batch(
             let backoff_ms = 500u64 * 2u64.pow((attempt - 1) as u32);
             thread::sleep(Duration::from_millis(backoff_ms));
         }
-        match embedder.embed_many(batch_texts) {
+        match embedder.embed_many(texts) {
             Ok(vectors) => {
-                if vectors.len() != batch_ids.len() {
+                if vectors.len() != texts.len() {
                     last_err = format!(
                         "embed_many returned {} vectors for {} chunks",
                         vectors.len(),
-                        batch_ids.len()
+                        texts.len()
                     );
                     continue;
                 }
@@ -25405,48 +27951,7 @@ fn embed_and_store_chunk_batch(
                         batch_dim
                     ));
                 }
-                if let Err(e) = get_or_open_lance(cwd, batch_dim) {
-                    eprintln!(
-                        "warning: LanceDB open failed (vectors still written to sqlite): {}",
-                        e
-                    );
-                }
-
-                let mut lance_batch: Vec<(i64, Vec<f32>)> = Vec::with_capacity(batch_ids.len());
-                conn.execute_batch("BEGIN TRANSACTION;")
-                    .map_err(|e| format!("failed starting chunk vector transaction: {}", e))?;
-                for (chunk_id, vector) in batch_ids.iter().zip(vectors.into_iter()) {
-                    if let Err(e) = set_project_chunk_vector(conn, *chunk_id, model_key, &vector) {
-                        let _ = conn.execute_batch("ROLLBACK;");
-                        return Err(e);
-                    }
-                    lance_batch.push((*chunk_id, vector));
-                }
-                conn.execute_batch("COMMIT;")
-                    .map_err(|e| format!("failed committing chunk vector transaction: {}", e))?;
-                if let Err(e) =
-                    with_lance_store(|store| lance_store::upsert_chunks(store, &lance_batch))
-                {
-                    eprintln!(
-                        "warning: LanceDB upsert failed ({}); attempting rebuild from sqlite",
-                        e
-                    );
-                    let lance_path = data_dir(cwd).join("lance");
-                    match lance_store::rebuild_from_sqlite(conn, model_key, &lance_path) {
-                        Ok(rebuilt_store) => {
-                            let lock = LANCE_STORE.get_or_init(|| Mutex::new(None));
-                            let mut guard = lock.lock().unwrap_or_else(|p| p.into_inner());
-                            *guard = Some(rebuilt_store);
-                        }
-                        Err(rebuild_err) => {
-                            eprintln!(
-                                "warning: LanceDB rebuild failed (sqlite vectors remain intact): {}",
-                                rebuild_err
-                            );
-                        }
-                    }
-                }
-                return Ok(batch_ids.len() as i64);
+                return Ok(vectors);
             }
             Err(e) => {
                 last_err = e;
@@ -25459,114 +27964,627 @@ fn embed_and_store_chunk_batch(
     ))
 }
 
-fn reindex_project_chunks(
-    cwd: &Path,
+/// Which of a project's chunks keep their stored vector and which are embedded (with the
+/// exact embedder input), decided before anything is written. A chunk whose stored vector
+/// still matches the exact embedder input is reused (its row is rewritten with the same
+/// text); every other chunk is embedded. `reembed` is the force path: it ignores stored
+/// identities and embeds every chunk of the work set.
+struct ChunkPlan<'a> {
+    reuse: Vec<&'a ProjectChunk>,
+    embed: Vec<(&'a ProjectChunk, String)>,
+}
+
+fn plan_chunk_reuse<'a>(
     conn: &Connection,
     project_id: i64,
-    model_key: &str,
-    embedder: &dyn Embedder,
-    chunks: &[ProjectChunk],
-    now: f64,
-    live_progress: Option<&Arc<LiveIndexProgress>>,
-) -> Result<ReindexOutcome, String> {
-    const CHUNK_EMBED_BATCH: usize = 512;
-    let mut vectorized = 0i64;
-    let mut batch_ids: Vec<i64> = Vec::with_capacity(CHUNK_EMBED_BATCH);
-    let mut batch_texts: Vec<String> = Vec::with_capacity(CHUNK_EMBED_BATCH);
-    let mut batch_token_total: u64 = 0;
-    let mut tx_open = false;
-
-    for chunk in chunks {
-        if !tx_open {
-            conn.execute_batch("BEGIN TRANSACTION;")
-                .map_err(|e| format!("failed starting project chunk transaction: {}", e))?;
-            tx_open = true;
-        }
-
-        let chunk_id = match upsert_project_chunk(conn, project_id, chunk, now) {
-            Ok(id) => id,
-            Err(e) => {
-                if tx_open {
-                    let _ = conn.execute_batch("ROLLBACK;");
-                }
-                return Err(e);
-            }
-        };
-        batch_ids.push(chunk_id);
-
-        // Use context_header + text for embedding when a header exists.
-        // The header provides structural context (file path, parent type, symbol name)
-        // that dramatically improves embedding quality for code chunks.
-        let embed_text = if chunk.context_header.is_empty() {
-            chunk.text.clone()
+    identity: &EmbedIdentity,
+    corpus: &'a ProjectCorpus,
+    force_embed: bool,
+) -> Result<ChunkPlan<'a>, String> {
+    let stored: HashMap<(String, i64), StoredVectorIdentity> = if force_embed {
+        HashMap::new()
+    } else {
+        load_project_vector_identities_by_position(conn, project_id)?
+    };
+    let mut plan = ChunkPlan {
+        reuse: Vec::new(),
+        embed: Vec::new(),
+    };
+    for chunk in &corpus.chunks {
+        // The embedder sees the context header (file path, parent type, symbol name) above
+        // the chunk text; that exact string is what the stored identity hashes.
+        let embed_text = embed_input_for(&chunk.context_header, &chunk.text);
+        let reusable = stored
+            .get(&(chunk.doc_path.clone(), chunk.chunk_index))
+            .map(|existing| identity.reuses(existing, &embed_input_hash(&embed_text)))
+            .unwrap_or(false);
+        if reusable {
+            plan.reuse.push(chunk);
         } else {
-            format!("{}\n{}", chunk.context_header, chunk.text)
-        };
-        batch_texts.push(embed_text);
-        batch_token_total = batch_token_total.saturating_add(chunk.token_count.max(0) as u64);
-
-        if batch_ids.len() >= CHUNK_EMBED_BATCH {
-            conn.execute_batch("COMMIT;")
-                .map_err(|e| format!("failed committing project chunk transaction: {}", e))?;
-            tx_open = false;
-            let stored = embed_and_store_chunk_batch(
-                cwd,
-                conn,
-                model_key,
-                embedder,
-                &batch_ids,
-                &batch_texts,
-            )?;
-            vectorized += stored;
-            if let Some(lp) = live_progress {
-                lp.add_chunks_done(stored as usize);
-                lp.add_tokens_done(batch_token_total);
-            }
-            batch_ids.clear();
-            batch_texts.clear();
-            batch_token_total = 0;
+            plan.embed.push((chunk, embed_text));
         }
     }
+    Ok(plan)
+}
 
-    if tx_open {
-        conn.execute_batch("COMMIT;")
-            .map_err(|e| format!("failed committing project chunk transaction: {}", e))?;
-    }
-    if !batch_ids.is_empty() {
-        let stored =
-            embed_and_store_chunk_batch(cwd, conn, model_key, embedder, &batch_ids, &batch_texts)?;
-        vectorized += stored;
+/// A chunk embedded this run, held in memory until the project is published: the chunk, the
+/// exact input its identity hashes, the vector (about 4 KB at 1024 dimensions; a project holds
+/// at most `max_chunks_per_project` of them).
+struct EmbeddedChunk<'a> {
+    chunk: &'a ProjectChunk,
+    input: String,
+    vector: Vec<f32>,
+}
+
+/// Embed the plan's chunks in batches of 512 with no sqlite transaction open. All or nothing
+/// for the project: a failed batch fails the project before anything is written.
+fn embed_planned_chunks<'a>(
+    embedder: &dyn Embedder,
+    to_embed: &[(&'a ProjectChunk, String)],
+    live_progress: Option<&Arc<LiveIndexProgress>>,
+) -> Result<Vec<EmbeddedChunk<'a>>, String> {
+    const CHUNK_EMBED_BATCH: usize = 512;
+    let mut out: Vec<EmbeddedChunk<'a>> = Vec::with_capacity(to_embed.len());
+    for batch in to_embed.chunks(CHUNK_EMBED_BATCH) {
+        let texts: Vec<String> = batch.iter().map(|(_, text)| text.clone()).collect();
+        let vectors = embed_batch_with_retry(embedder, &texts)?;
+        for (((chunk, input), vector), _) in batch.iter().zip(vectors.into_iter()).zip(0..) {
+            out.push(EmbeddedChunk {
+                chunk,
+                input: input.clone(),
+                vector,
+            });
+        }
         if let Some(lp) = live_progress {
-            lp.add_chunks_done(stored as usize);
-            lp.add_tokens_done(batch_token_total);
+            lp.add_chunks_done(batch.len());
+            lp.add_tokens_done(batch.iter().map(|(c, _)| c.token_count.max(0) as u64).sum());
+        }
+    }
+    Ok(out)
+}
+
+/// Symbols and imports of one re-chunked code file, extracted (tree-sitter) before the
+/// publish transaction so the write lock is never held while parsing.
+struct CodeIntelExtraction {
+    lang: code_intel::LanguageId,
+    doc_path: String,
+    rel_path: String,
+    symbols: Vec<code_intel::ExtractedSymbol>,
+    imports: Vec<code_intel::RawImport>,
+}
+
+/// Extract symbols and imports for every code file re-chunked this run. Replaced
+/// unconditionally at publish time, so a file edited down to zero symbols or imports loses
+/// its stale rows; unchanged files keep theirs. A file with no indexable text (whitespace
+/// only) yields the empty extraction. Files are read through the project directory (follows
+/// symlinks) and keyed by their derived doc_path.
+fn extract_project_code_intel(
+    project_dir: &Path,
+    corpus: &ProjectCorpus,
+    caps: &ScanCaps,
+) -> Vec<CodeIntelExtraction> {
+    let mut out = Vec::new();
+    for file in corpus.files.iter().filter(|f| f.rechunked) {
+        let path = Path::new(&file.doc_path);
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        let Some(lang) = code_intel::language_for_extension(&ext) else {
+            continue;
+        };
+        let source = read_for_index(&project_dir.join(&file.rel_path), caps.max_file_chars)
+            .map(|(s, _)| s)
+            .unwrap_or_default();
+        out.push(extract_code_intel(
+            lang,
+            &file.doc_path,
+            &file.rel_path,
+            &source,
+        ));
+    }
+    out
+}
+
+/// The parse half of a code file's code-intelligence refresh: symbols and imports of
+/// `source`, keyed by the file's derived doc_path.
+fn extract_code_intel(
+    lang: code_intel::LanguageId,
+    doc_path: &str,
+    rel_path: &str,
+    source: &str,
+) -> CodeIntelExtraction {
+    let path = Path::new(doc_path);
+    CodeIntelExtraction {
+        lang,
+        doc_path: doc_path.to_string(),
+        rel_path: rel_path.to_string(),
+        symbols: code_intel::extract_symbols(path, source),
+        imports: code_intel::extract_imports(path, source),
+    }
+}
+
+/// The store half: replace the file's symbol, import and dependency-edge rows with the
+/// extraction, unconditionally, so an extraction that came back empty removes the stale rows
+/// a previous version of the file left behind. Returns (symbols, imports) stored.
+fn store_code_intel_extraction(
+    conn: &Connection,
+    project_id: i64,
+    x: &CodeIntelExtraction,
+    project_root: &Path,
+    project_files: &[String],
+) -> Result<(usize, usize), String> {
+    let stored_symbols =
+        store_project_symbols(conn, project_id, &x.symbols, &x.doc_path, &x.rel_path)?;
+    let stored_imports = store_file_imports(
+        conn,
+        project_id,
+        &x.doc_path,
+        x.lang,
+        Path::new(&x.doc_path),
+        project_root,
+        &x.imports,
+        project_files,
+    )?;
+    Ok((stored_symbols, stored_imports))
+}
+
+/// The project row's published state, written in the publish transaction.
+struct ProjectPublication<'a> {
+    title: &'a str,
+    summary: &'a str,
+    project_mtime: f64,
+    /// The scan signature to store; `None` for an incomplete scan (the old one stays).
+    scan_signature: Option<&'a str>,
+    /// A freshly embedded summary vector, or `None` when the stored one is reused.
+    summary_vector: Option<&'a [f32]>,
+}
+
+/// What [`publish_project`] committed, for the LanceDB write that follows.
+struct Published {
+    /// Chunk ids of the rows embedded this run, in `lance_batch` order.
+    embedded_ids: Vec<i64>,
+    lance_batch: Vec<(i64, Vec<f32>)>,
+    pruned: PruneOutcome,
+}
+
+/// Publish one project in ONE sqlite transaction: the rows of reused chunks, the rows and
+/// vectors of embedded chunks (identity hashed from the very input sent), the Lance dirty
+/// marker and pending ids for those vectors, the prune of rows the scan no longer covers
+/// (complete scans only; the FULL keep set, so unchanged files never lose anything), the
+/// manifest rows of re-chunked and touched files, the symbols and imports of re-chunked code
+/// files, and (when `publication` is given) the project row itself: title, summary, mtime,
+/// signature, summary vector and the cleared in-progress marker.
+///
+/// A reader therefore sees the project either exactly as it was or exactly as it is now; a
+/// failure anywhere rolls everything back and the previous state stands. No embedding and no
+/// parsing happens inside: the write lock is held for the writes alone.
+fn publish_project(
+    conn: &Connection,
+    project_id: i64,
+    identity: &EmbedIdentity,
+    corpus: &ProjectCorpus,
+    reuse: &[&ProjectChunk],
+    embedded: Vec<EmbeddedChunk<'_>>,
+    code_intel: &[CodeIntelExtraction],
+    publication: Option<ProjectPublication<'_>>,
+    now: f64,
+) -> Result<Published, String> {
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| format!("failed starting project publish transaction: {}", e))?;
+
+    for chunk in reuse {
+        upsert_project_chunk(&tx, project_id, chunk, now)?;
+    }
+    let mut embedded_ids: Vec<i64> = Vec::with_capacity(embedded.len());
+    let mut lance_batch: Vec<(i64, Vec<f32>)> = Vec::with_capacity(embedded.len());
+    for item in embedded {
+        let chunk_id = upsert_project_chunk(&tx, project_id, item.chunk, now)?;
+        set_project_chunk_vector(
+            &tx,
+            chunk_id,
+            identity,
+            &embed_input_hash(&item.input),
+            &item.vector,
+        )?;
+        embedded_ids.push(chunk_id);
+        lance_batch.push((chunk_id, item.vector));
+    }
+    if !embedded_ids.is_empty() {
+        // The marker and the pending ids commit with the rows and vectors: a crash or a
+        // failed LanceDB write leaves both, and the repair step rewrites exactly these rows
+        // (a stale same-id row in LanceDB is not "present", it is pending).
+        lance_mark_dirty(&tx)?;
+        lance_pending_add(&tx, &embedded_ids)?;
+    }
+
+    // Drop rows the scan no longer accounts for (deleted files, newly excluded or skipped
+    // directories, files past the caps, chunk indices past the end of a file that shrank).
+    // Only for a complete scan: whatever an unreadable directory hid is not deleted. The
+    // marker is set inside this transaction when LanceDB rows are affected.
+    let pruned = if corpus.complete {
+        let keep = PruneKeepSet::from_corpus(corpus);
+        prune_stale_project_rows_in(&tx, project_id, &keep, false)?
+    } else {
+        PruneOutcome::default()
+    };
+
+    // Manifest rows for the files re-chunked this run and for touched-but-identical files
+    // (new stat, same content); unchanged and failed-document files keep theirs.
+    for file in corpus
+        .files
+        .iter()
+        .filter(|f| f.rechunked || f.stat_changed)
+    {
+        upsert_file_manifest(
+            &tx,
+            project_id,
+            &file.rel_path,
+            &file.doc_path,
+            file.size,
+            file.mtime,
+            &file.content_hash,
+            file.chunk_count,
+        )?;
+    }
+
+    // Symbols and imports. Import resolution sees every selected file, unchanged included.
+    if !code_intel.is_empty() {
+        let project_file_list: Vec<String> =
+            corpus.files.iter().map(|f| f.rel_path.clone()).collect();
+        for x in code_intel {
+            store_code_intel_extraction(&tx, project_id, x, &corpus.doc.path, &project_file_list)?;
         }
     }
 
-    // Drop rows the freshly collected corpus no longer contains (deleted files, newly
-    // excluded or skipped directories, files past the caps, chunk indices past the end of a
-    // file that shrank). Runs after every upsert and embedding succeeded, so a failed run
-    // leaves the previous rows in place. Surviving chunks keep their ids, so their LanceDB
-    // rows are updated in place; only the pruned ids need a LanceDB delete.
-    let keep = PruneKeepSet::from_chunks(chunks);
-    let pruned = prune_stale_project_rows(conn, project_id, &keep, false)?;
-    if !pruned.chunk_ids.is_empty() && lance_store_is_open() {
-        if let Err(e) = delete_lance_vectors_for_chunks(&pruned.chunk_ids) {
-            eprintln!(
-                "warning: LanceDB delete of {} stale vectors failed ({}); run `retrivio prune` to retry",
-                pruned.chunk_ids.len(),
-                e
-            );
-        }
+    if let Some(p) = publication {
+        finalize_project_row_in(
+            &tx,
+            project_id,
+            p.title,
+            p.summary,
+            p.project_mtime,
+            now,
+            p.scan_signature,
+            p.summary_vector.map(|v| (identity, v)),
+        )?;
     }
-    Ok(ReindexOutcome {
-        rows: chunks.len() as i64,
-        vectors: vectorized,
-        failures: 0,
+    tx.commit()
+        .map_err(|e| format!("failed committing project publish: {}", e))?;
+    Ok(Published {
+        embedded_ids,
+        lance_batch,
         pruned,
     })
 }
 
-fn remove_projects_not_in(conn: &Connection, keep_paths: &[String]) -> Result<i64, String> {
+/// Why one project's run failed.
+enum ProjectFailure {
+    /// The embedding backend failed (after retries): the run stops, every later project would
+    /// fail the same way. The project keeps its previous state and is retried next run.
+    Embedding(String),
+    /// Anything else (sqlite, code intelligence, an injected test failure): this project only;
+    /// it keeps its previous state and the run goes on.
+    Project(String),
+}
+
+/// What one successfully published project reports.
+struct ProjectOutcome {
+    project_id: i64,
+    /// Chunks the project holds after the run: re-chunked files' chunks plus the stored
+    /// chunks of unchanged files.
+    rows: i64,
+    /// Chunks embedded this run.
+    vectors: i64,
+    /// Chunks whose stored vector matched the identity and was kept.
+    reused: i64,
+    pruned: PruneOutcome,
+    summary_embedded: bool,
+    title: String,
+    summary: String,
+}
+
+#[cfg(test)]
+static INJECT_FAIL_BEFORE_PUBLISH: AtomicBool = AtomicBool::new(false);
+
+/// Test hook: the next collector run for a project directory with this basename panics.
+#[cfg(test)]
+static INJECT_COLLECTOR_PANIC: Mutex<Option<String>> = Mutex::new(None);
+
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".to_string()
+    }
+}
+
+fn record_project_failure(
+    stats: &mut IndexStats,
+    idx: usize,
+    total: usize,
+    project_name: &str,
+    message: &str,
+    emit_progress: bool,
+) {
+    stats.projects_failed += 1;
+    stats
+        .failures
+        .push(format!("{}: {}", project_name, message));
+    if emit_progress {
+        progress_clear_line();
+        println!(
+            "[{}/{}] error: {}: {} (the project keeps its previous state and is retried next run)",
+            idx + 1,
+            total,
+            project_name,
+            message
+        );
+    }
+}
+
+/// Embed a project summary with retries.
+fn embed_summary_with_retry(
+    embedder: &dyn Embedder,
+    title: &str,
+    summary: &str,
+    project_dir: &Path,
+) -> Result<Vec<f32>, String> {
+    let summary_text = format!("{}\n{}", title, summary);
+    let mut last_err = String::new();
+    for attempt in 0..=3usize {
+        if attempt > 0 {
+            thread::sleep(Duration::from_millis(500 * 2u64.pow((attempt - 1) as u32)));
+        }
+        match embedder.embed_one(&summary_text) {
+            Ok(vector) => return Ok(vector),
+            Err(e) => last_err = e,
+        }
+    }
+    Err(format!(
+        "failed embedding project summary for '{}' after retries: {}",
+        project_dir.display(),
+        last_err
+    ))
+}
+
+/// One project's write pipeline after its corpus is collected: mark the row in progress; plan
+/// vector reuse; embed the rest (no transaction open); parse code intelligence; embed the
+/// summary when it changed; then publish everything in one transaction and write LanceDB.
+/// A failure before the publish leaves the project exactly as it was (plus the in-progress
+/// marker, so the next run rescans it); the publish itself is atomic.
+fn index_one_project(
+    cwd: &Path,
+    conn: &Connection,
+    caps: &ScanCaps,
+    identity: &EmbedIdentity,
+    embedder: &dyn Embedder,
+    corpus: &ProjectCorpus,
+    project_dir: &Path,
+    project_path: &str,
+    existing: Option<&ExistingProject>,
+    now: f64,
+    live_progress: Option<&Arc<LiveIndexProgress>>,
+    force_embed: bool,
+) -> Result<ProjectOutcome, ProjectFailure> {
+    // 1. The row, marked in progress; an existing row keeps its title, summary and signature
+    //    until the publish.
+    let project_id = begin_project_update(conn, project_path, &corpus.doc.title)
+        .map_err(ProjectFailure::Project)?;
+
+    // 2. Chunks: decide reuse, embed the rest into memory.
+    let plan = plan_chunk_reuse(conn, project_id, identity, corpus, force_embed)
+        .map_err(ProjectFailure::Project)?;
+    let reused = plan.reuse.len() as i64;
+    if let Some(lp) = live_progress {
+        lp.add_chunks_done(plan.reuse.len());
+        lp.add_tokens_done(plan.reuse.iter().map(|c| c.token_count.max(0) as u64).sum());
+    }
+    let embedded = embed_planned_chunks(embedder, &plan.embed, live_progress)
+        .map_err(ProjectFailure::Embedding)?;
+    let vectors = embedded.len() as i64;
+
+    // 3. Symbols and imports of the re-chunked code files, parsed outside any transaction.
+    if let Some(lp) = live_progress {
+        lp.set_phase("code-intel");
+    }
+    let code_intel = extract_project_code_intel(project_dir, corpus, caps);
+
+    // 4. The project summary and its vector. An incomplete scan of a known project keeps the
+    //    stored summary (it would list fewer files than exist), so nothing is re-embedded for
+    //    a directory that is merely unreadable right now. The vector is reused when the
+    //    summary text is unchanged and the stored vector matches the current identity;
+    //    `reembed` always regenerates it.
+    let keep_stored_summary = !corpus.complete && existing.is_some();
+    let (title, summary) = match (existing, keep_stored_summary) {
+        (Some(row), true) => (row.title.clone(), row.summary.clone()),
+        _ => (corpus.doc.title.clone(), corpus.doc.summary.clone()),
+    };
+    let summary_reusable = !force_embed
+        && existing.map(|r| r.summary.as_str()) == Some(summary.as_str())
+        && project_vector_matches(conn, project_id, identity).map_err(ProjectFailure::Project)?;
+    let summary_vector = if summary_reusable {
+        None
+    } else {
+        Some(
+            embed_summary_with_retry(embedder, &title, &summary, project_dir)
+                .map_err(ProjectFailure::Embedding)?,
+        )
+    };
+
+    #[cfg(test)]
+    if INJECT_FAIL_BEFORE_PUBLISH.swap(false, Ordering::SeqCst) {
+        return Err(ProjectFailure::Project(
+            "injected failure between embedding and publish".to_string(),
+        ));
+    }
+
+    // 5. Publish: everything of this project succeeded. The signature moves only for a
+    //    complete scan; an incomplete one keeps the old signature and is rescanned.
+    ensure_lance_open_for(cwd, &embedded);
+    if let Some(lp) = live_progress {
+        lp.set_phase("publish");
+    }
+    let signature = corpus.complete.then_some(corpus.scan_signature.as_str());
+    let published = publish_project(
+        conn,
+        project_id,
+        identity,
+        corpus,
+        &plan.reuse,
+        embedded,
+        &code_intel,
+        Some(ProjectPublication {
+            title: &title,
+            summary: &summary,
+            project_mtime: corpus.doc.mtime,
+            scan_signature: signature,
+            summary_vector: summary_vector.as_deref(),
+        }),
+        now,
+    )
+    .map_err(ProjectFailure::Project)?;
+    sync_lance_after_publish(conn, &published).map_err(ProjectFailure::Project)?;
+
+    let carried: i64 = corpus
+        .files
+        .iter()
+        .filter(|f| !f.rechunked)
+        .map(|f| f.chunk_count.max(0))
+        .sum();
+    Ok(ProjectOutcome {
+        project_id,
+        rows: corpus.chunks.len() as i64 + carried,
+        vectors,
+        reused,
+        pruned: published.pruned,
+        summary_embedded: summary_vector.is_some(),
+        title,
+        summary,
+    })
+}
+
+/// Open LanceDB at the dimension of the vectors about to be written, when it is not open yet
+/// (the first embedded batch of a fresh store fixes the dimension). A failure is reported
+/// once and leaves the marker for the repair step.
+fn ensure_lance_open_for(cwd: &Path, embedded: &[EmbeddedChunk<'_>]) {
+    let Some(dim) = embedded.first().map(|e| e.vector.len()) else {
+        return;
+    };
+    if let Err(e) = get_or_open_lance(cwd, dim) {
+        LANCE_WRITE_FAILED.store(true, Ordering::SeqCst);
+        eprintln!(
+            "error: LanceDB open failed ({}); vectors are written to sqlite only and the next index run repairs LanceDB",
+            e
+        );
+    }
+}
+
+/// Bring LanceDB in line with what [`publish_project`] committed: upsert the embedded
+/// vectors (then clear their pending ids and, if nothing else failed in this process, the
+/// marker) and delete the pruned rows. Failures are reported and left for the repair step;
+/// sqlite already holds the truth.
+fn sync_lance_after_publish(conn: &Connection, published: &Published) -> Result<(), String> {
+    if !published.lance_batch.is_empty() {
+        match with_lance_store(|store| lance_store::upsert_chunks(store, &published.lance_batch)) {
+            Ok(()) => {
+                lance_pending_remove(conn, &published.embedded_ids)?;
+                lance_mark_clean(conn)?;
+            }
+            Err(e) => {
+                LANCE_WRITE_FAILED.store(true, Ordering::SeqCst);
+                eprintln!(
+                    "warning: LanceDB upsert of {} vectors failed ({}); sqlite has them and the next index run repairs LanceDB",
+                    published.lance_batch.len(),
+                    e
+                );
+            }
+        }
+    }
+    if !published.pruned.chunk_ids.is_empty() && lance_store_is_open() {
+        if let Err(e) = lance_delete_marked(conn, &published.pruned.chunk_ids) {
+            eprintln!(
+                "warning: LanceDB delete of {} stale vectors failed ({}); the next index run repairs it",
+                published.pruned.chunk_ids.len(),
+                e
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The chunk part of a project's run, without the project row: plan, embed, publish in one
+/// transaction, then write LanceDB. `run_native_index` goes through [`publish_project`] with
+/// the project row included; this entry point serves the chunk-level tests and mirrors it.
+#[cfg(test)]
+fn reindex_project_chunks(
+    cwd: &Path,
+    conn: &Connection,
+    project_id: i64,
+    identity: &EmbedIdentity,
+    embedder: &dyn Embedder,
+    corpus: &ProjectCorpus,
+    now: f64,
+    live_progress: Option<&Arc<LiveIndexProgress>>,
+    force_embed: bool,
+) -> Result<ReindexOutcome, String> {
+    let plan = plan_chunk_reuse(conn, project_id, identity, corpus, force_embed)?;
+    let reused = plan.reuse.len() as i64;
+    if let Some(lp) = live_progress {
+        lp.add_chunks_done(plan.reuse.len());
+        lp.add_tokens_done(plan.reuse.iter().map(|c| c.token_count.max(0) as u64).sum());
+    }
+    let embedded = embed_planned_chunks(embedder, &plan.embed, live_progress)?;
+    let vectors = embedded.len() as i64;
+    ensure_lance_open_for(cwd, &embedded);
+    let published = publish_project(
+        conn,
+        project_id,
+        identity,
+        corpus,
+        &plan.reuse,
+        embedded,
+        &[],
+        None,
+        now,
+    )?;
+    sync_lance_after_publish(conn, &published)?;
+    let carried: i64 = corpus
+        .files
+        .iter()
+        .filter(|f| !f.rechunked)
+        .map(|f| f.chunk_count.max(0))
+        .sum();
+    Ok(ReindexOutcome {
+        rows: corpus.chunks.len() as i64 + carried,
+        vectors,
+        reused,
+        failures: 0,
+        pruned: published.pruned,
+    })
+}
+
+/// Tracked roots whose directory cannot be listed right now (unmounted volume, permissions,
+/// gone). Their projects are never removed: index and prune both leave them alone.
+fn unavailable_roots(roots: &[TrackedRoot]) -> HashSet<PathBuf> {
+    roots
+        .iter()
+        .filter(|r| fs::read_dir(&r.path).is_err())
+        .map(|r| r.path.clone())
+        .collect()
+}
+
+/// Delete every project row whose path is not in `keep_paths`, except rows under a protected
+/// (unavailable) root. Returns (projects removed, chunks removed with them).
+fn remove_projects_not_in(
+    conn: &Connection,
+    keep_paths: &[String],
+    protected_roots: &HashSet<PathBuf>,
+) -> Result<(i64, i64), String> {
     let keep_set: HashSet<String> = keep_paths.iter().cloned().collect();
     let delete_ids: Vec<i64> = {
         let mut stmt = conn
@@ -25581,32 +28599,45 @@ fn remove_projects_not_in(conn: &Connection, keep_paths: &[String]) -> Result<i6
         for row in rows {
             let (id, path) =
                 row.map_err(|e| format!("failed reading existing project row: {}", e))?;
-            if !keep_set.contains(&path) {
-                out.push(id);
+            if keep_set.contains(&path) || is_under_any(Path::new(&path), protected_roots) {
+                continue;
             }
+            out.push(id);
         }
         out
     };
     let mut removed = 0i64;
     let mut stale_chunk_ids: Vec<i64> = Vec::new();
-    for id in delete_ids {
+    for id in &delete_ids {
         // sqlite cascades the project row to its chunks and vectors; LanceDB needs the ids.
-        stale_chunk_ids.extend(project_chunk_ids(conn, id)?);
-        removed += conn
-            .execute("DELETE FROM projects WHERE id = ?1", params![id])
-            .map_err(|e| format!("failed deleting stale project row: {}", e))?
-            as i64;
+        stale_chunk_ids.extend(project_chunk_ids(conn, *id)?);
+    }
+    if !delete_ids.is_empty() {
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| format!("failed starting project removal transaction: {}", e))?;
+        if !stale_chunk_ids.is_empty() {
+            lance_mark_dirty(&tx)?;
+        }
+        for id in &delete_ids {
+            removed += tx
+                .execute("DELETE FROM projects WHERE id = ?1", params![id])
+                .map_err(|e| format!("failed deleting stale project row: {}", e))?
+                as i64;
+        }
+        tx.commit()
+            .map_err(|e| format!("failed committing project removal: {}", e))?;
     }
     if !stale_chunk_ids.is_empty() && lance_store_is_open() {
-        if let Err(e) = delete_lance_vectors_for_chunks(&stale_chunk_ids) {
+        if let Err(e) = lance_delete_marked(conn, &stale_chunk_ids) {
             eprintln!(
-                "warning: LanceDB delete of {} vectors from removed projects failed ({}); run `retrivio prune` to retry",
+                "warning: LanceDB delete of {} vectors from removed projects failed ({}); the next index run repairs it",
                 stale_chunk_ids.len(),
                 e
             );
         }
     }
-    Ok(removed)
+    Ok((removed, stale_chunk_ids.len() as i64))
 }
 
 // ── Stale-row pruning ─────────────────────────────────────────────────────────
@@ -25622,13 +28653,16 @@ fn remove_projects_not_in(conn: &Connection, keep_paths: &[String]) -> Result<i6
 /// The rows a freshly collected corpus says should survive a prune pass.
 #[derive(Debug, Default, Clone)]
 struct PruneKeepSet {
-    /// doc_path -> chunk indices present in the corpus.
+    /// doc_path -> chunk indices present in the corpus (re-chunked files).
     by_doc: HashMap<String, HashSet<i64>>,
+    /// doc_paths kept whole: files the scan found unchanged, whose stored chunks all survive.
+    whole_docs: HashSet<String>,
     /// doc_rel_path values present in the corpus (the `project_files` manifest key).
     rel_paths: HashSet<String>,
 }
 
 impl PruneKeepSet {
+    /// Keep exactly these chunks (a fully re-chunked corpus, as `prune` collects it).
     fn from_chunks(chunks: &[ProjectChunk]) -> Self {
         let mut keep = PruneKeepSet::default();
         for chunk in chunks {
@@ -25641,14 +28675,32 @@ impl PruneKeepSet {
         keep
     }
 
+    /// The full keep set of a scan: every chunk of the re-chunked files plus every stored
+    /// chunk of the unchanged ones. A re-chunked file that produced no chunks still keeps its
+    /// manifest row and per-file rows.
+    fn from_corpus(corpus: &ProjectCorpus) -> Self {
+        let mut keep = PruneKeepSet::from_chunks(&corpus.chunks);
+        for file in &corpus.files {
+            keep.rel_paths.insert(file.rel_path.clone());
+            if file.rechunked {
+                keep.by_doc.entry(file.doc_path.clone()).or_default();
+            } else {
+                keep.whole_docs.insert(file.doc_path.clone());
+            }
+        }
+        keep
+    }
+
     fn keeps_chunk(&self, doc_path: &str, chunk_index: i64) -> bool {
-        self.by_doc
-            .get(doc_path)
-            .map_or(false, |idx| idx.contains(&chunk_index))
+        self.whole_docs.contains(doc_path)
+            || self
+                .by_doc
+                .get(doc_path)
+                .map_or(false, |idx| idx.contains(&chunk_index))
     }
 
     fn keeps_doc(&self, doc_path: &str) -> bool {
-        self.by_doc.contains_key(doc_path)
+        self.whole_docs.contains(doc_path) || self.by_doc.contains_key(doc_path)
     }
 }
 
@@ -25665,7 +28717,7 @@ struct PruneOutcome {
     symbol_rows: usize,
     /// `file_imports` rows.
     import_rows: usize,
-    /// `file_dependency_edges` rows (matched by source file).
+    /// `file_dependency_edges` rows whose source or target file is gone.
     edge_rows: usize,
     /// Ids of the removed chunks, for the LanceDB delete.
     chunk_ids: Vec<i64>,
@@ -25693,8 +28745,13 @@ impl PruneOutcome {
 
 /// Result of re-indexing one project: row/vector counts plus what was pruned.
 struct ReindexOutcome {
+    /// Chunks the project holds after the run: re-chunked files' chunks plus the stored
+    /// chunks of unchanged files.
     rows: i64,
+    /// Chunks embedded this run.
     vectors: i64,
+    /// Chunks whose stored vector matched the current embedding identity and was kept.
+    reused: i64,
     failures: i64,
     pruned: PruneOutcome,
 }
@@ -25793,6 +28850,24 @@ fn prune_stale_project_rows(
     keep: &PruneKeepSet,
     dry_run: bool,
 ) -> Result<PruneOutcome, String> {
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| format!("failed starting prune transaction: {}", e))?;
+    let out = prune_stale_project_rows_in(&tx, project_id, keep, dry_run)?;
+    tx.commit()
+        .map_err(|e| format!("failed committing prune transaction: {}", e))?;
+    Ok(out)
+}
+
+/// [`prune_stale_project_rows`] inside the caller's transaction (`conn` is the transaction):
+/// no BEGIN or COMMIT of its own, so a project's publish can include it.
+fn prune_stale_project_rows_in(
+    tx: &Connection,
+    project_id: i64,
+    keep: &PruneKeepSet,
+    dry_run: bool,
+) -> Result<PruneOutcome, String> {
+    let conn = tx;
     let mut out = PruneOutcome::default();
 
     // Chunks the corpus no longer produces.
@@ -25825,8 +28900,6 @@ fn prune_stale_project_rows(
 
     // Per-file rows for doc_paths that are gone entirely (not merely shorter). These tables
     // are refreshed per file during indexing, so nothing else deletes rows for vanished files.
-    // Dependency edges are matched by source only: `target_doc_path` holds the resolver's
-    // relative form, not a doc_path, and edges are rebuilt when their source is re-indexed.
     let stale_docs = |paths: Vec<String>| -> Vec<String> {
         paths.into_iter().filter(|p| !keep.keeps_doc(p)).collect()
     };
@@ -25839,21 +28912,46 @@ fn prune_stale_project_rows(
         "source_doc_path",
         project_id,
     )?);
-    let stale_edge_docs = stale_docs(project_distinct_paths(
-        conn,
-        "file_dependency_edges",
-        "source_doc_path",
-        project_id,
-    )?);
+    // Dependency edges go when either end is gone: `helper.py -> util.py` must not outlive
+    // util.py. Sources are doc_paths; targets are the resolver's project-relative form (older
+    // rows may hold absolute doc_paths, matched against the doc set).
+    let stale_edges: Vec<(String, String)> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT source_doc_path, target_doc_path FROM file_dependency_edges WHERE project_id = ?1",
+            )
+            .map_err(|e| format!("failed preparing dependency edge query: {}", e))?;
+        let rows = stmt
+            .query_map(params![project_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| format!("failed querying dependency edges: {}", e))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (source, target) =
+                row.map_err(|e| format!("failed reading dependency edge: {}", e))?;
+            let target_kept = if target.starts_with('/') {
+                keep.keeps_doc(&target)
+            } else {
+                keep.rel_paths.contains(&target)
+            };
+            if !keep.keeps_doc(&source) || !target_kept {
+                out.push((source, target));
+            }
+        }
+        out
+    };
     let stale_manifest: Vec<String> =
         project_distinct_paths(conn, "project_files", "rel_path", project_id)?
             .into_iter()
             .filter(|rel| !keep.rel_paths.contains(rel))
             .collect();
 
-    let tx = conn
-        .unchecked_transaction()
-        .map_err(|e| format!("failed starting prune transaction: {}", e))?;
+    if !dry_run && !out.chunk_ids.is_empty() {
+        // LanceDB still holds these rows until the caller deletes them: committed with the
+        // sqlite deletes, so a crash in between leaves the marker set for the repair step.
+        lance_mark_dirty(tx)?;
+    }
     if !dry_run {
         for batch in out.chunk_ids.chunks(500) {
             let placeholders = vec!["?"; batch.len()].join(", ");
@@ -25863,7 +28961,7 @@ fn prune_stale_project_rows(
         }
     }
     out.symbol_rows = delete_project_rows_by_path(
-        &tx,
+        tx,
         "symbols",
         "doc_path",
         project_id,
@@ -25871,61 +28969,282 @@ fn prune_stale_project_rows(
         dry_run,
     )?;
     out.import_rows = delete_project_rows_by_path(
-        &tx,
+        tx,
         "file_imports",
         "source_doc_path",
         project_id,
         &stale_import_docs,
         dry_run,
     )?;
-    out.edge_rows = delete_project_rows_by_path(
-        &tx,
-        "file_dependency_edges",
-        "source_doc_path",
-        project_id,
-        &stale_edge_docs,
-        dry_run,
-    )?;
+    out.edge_rows = stale_edges.len();
+    if !dry_run {
+        for (source, target) in &stale_edges {
+            tx.execute(
+                "DELETE FROM file_dependency_edges WHERE project_id = ?1 AND source_doc_path = ?2 AND target_doc_path = ?3",
+                params![project_id, source, target],
+            )
+            .map_err(|e| format!("failed pruning file_dependency_edges rows: {}", e))?;
+        }
+    }
     out.manifest_rows = delete_project_rows_by_path(
-        &tx,
+        tx,
         "project_files",
         "rel_path",
         project_id,
         &stale_manifest,
         dry_run,
     )?;
-    tx.commit()
-        .map_err(|e| format!("failed committing prune transaction: {}", e))?;
     Ok(out)
 }
 
-/// Drop the LanceDB vectors of pruned chunks. Needs an open store (`get_or_open_lance`).
-fn delete_lance_vectors_for_chunks(chunk_ids: &[i64]) -> Result<usize, String> {
+/// Set the Lance dirty marker inside the caller's sqlite transaction, right before the rows it
+/// covers are committed. Cleared by [`lance_mark_clean`] once the LanceDB write succeeded.
+fn lance_mark_dirty(conn: &Connection) -> Result<(), String> {
+    app_state_set(conn, APP_STATE_LANCE_DIRTY, "1")
+}
+
+/// Clear the dirty marker after a successful LanceDB write, unless an earlier write in this
+/// process failed (its rows are still missing; the next writer run repairs them).
+fn lance_mark_clean(conn: &Connection) -> Result<(), String> {
+    if LANCE_WRITE_FAILED.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+    app_state_set(conn, APP_STATE_LANCE_DIRTY, "0")
+}
+
+/// Record chunk ids whose sqlite vector is about to be written to LanceDB (same transaction
+/// as the vectors). Removed once the LanceDB write succeeded; whatever remains is rewritten
+/// by the repair step even when LanceDB already holds a (stale) row for the id.
+fn lance_pending_add(conn: &Connection, chunk_ids: &[i64]) -> Result<(), String> {
+    let mut stmt = conn
+        .prepare("INSERT OR REPLACE INTO lance_pending(chunk_id) VALUES (?1)")
+        .map_err(|e| format!("failed preparing lance_pending insert: {}", e))?;
+    for id in chunk_ids {
+        stmt.execute(params![id])
+            .map_err(|e| format!("failed recording pending lance row: {}", e))?;
+    }
+    Ok(())
+}
+
+fn lance_pending_remove(conn: &Connection, chunk_ids: &[i64]) -> Result<(), String> {
+    for batch in chunk_ids.chunks(500) {
+        let placeholders = vec!["?"; batch.len()].join(", ");
+        conn.execute(
+            &format!(
+                "DELETE FROM lance_pending WHERE chunk_id IN ({})",
+                placeholders
+            ),
+            params_from_iter(batch.iter()),
+        )
+        .map_err(|e| format!("failed clearing pending lance rows: {}", e))?;
+    }
+    Ok(())
+}
+
+fn lance_pending_ids(conn: &Connection) -> Result<Vec<i64>, String> {
+    let mut stmt = conn
+        .prepare("SELECT chunk_id FROM lance_pending ORDER BY chunk_id")
+        .map_err(|e| format!("failed preparing lance_pending query: {}", e))?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, i64>(0))
+        .map_err(|e| format!("failed querying pending lance rows: {}", e))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| format!("failed reading pending lance row: {}", e))?);
+    }
+    Ok(out)
+}
+
+/// Delete LanceDB rows with the dirty marker around the write: set before, cleared after
+/// success, left set (and the process flagged) on failure.
+fn lance_delete_marked(conn: &Connection, chunk_ids: &[i64]) -> Result<usize, String> {
     if chunk_ids.is_empty() {
         return Ok(0);
     }
-    with_lance_store(|store| lance_store::delete_chunks(store, chunk_ids))?;
-    Ok(chunk_ids.len())
+    lance_mark_dirty(conn)?;
+    match with_lance_store(|store| lance_store::delete_chunks(store, chunk_ids)) {
+        Ok(()) => {
+            lance_mark_clean(conn)?;
+            Ok(chunk_ids.len())
+        }
+        Err(e) => {
+            LANCE_WRITE_FAILED.store(true, Ordering::SeqCst);
+            Err(e)
+        }
+    }
 }
 
-/// LanceDB rows whose chunk id has no vector row in sqlite: left behind by builds that
-/// re-created chunk ids on every refresh, or by an inline delete that failed.
-fn lance_orphan_chunk_ids(conn: &Connection) -> Result<Vec<i64>, String> {
-    let lance_ids = with_lance_store(|store| lance_store::list_chunk_ids(store))?;
+/// The counts [`repair_lance_from_sqlite`] would act on, without writing: (rows missing from
+/// LanceDB, LanceDB rows with no sqlite vector). For `prune --dry-run`.
+fn lance_reconcile_preview(conn: &Connection, model_key: &str) -> Result<(usize, usize), String> {
+    let (lance_ids, dim) = with_lance_store(|store| {
+        Ok((lance_store::list_chunk_ids(store)?, lance_store::dim(store)))
+    })?;
+    let lance_set: HashSet<i64> = lance_ids.into_iter().collect();
     let mut stmt = conn
-        .prepare("SELECT chunk_id FROM project_chunk_vectors")
+        .prepare("SELECT chunk_id FROM project_chunk_vectors WHERE model = ?1 AND dim = ?2")
         .map_err(|e| format!("failed preparing chunk vector id query: {}", e))?;
     let rows = stmt
-        .query_map([], |row| row.get::<_, i64>(0))
+        .query_map(params![model_key, dim as i64], |row| row.get::<_, i64>(0))
         .map_err(|e| format!("failed querying chunk vector ids: {}", e))?;
-    let mut known: HashSet<i64> = HashSet::with_capacity(lance_ids.len());
+    let mut sqlite_set: HashSet<i64> = HashSet::new();
     for row in rows {
-        known.insert(row.map_err(|e| format!("failed reading chunk vector id: {}", e))?);
+        sqlite_set.insert(row.map_err(|e| format!("failed reading chunk vector id: {}", e))?);
     }
-    Ok(lance_ids
-        .into_iter()
-        .filter(|id| !known.contains(id))
-        .collect())
+    let pending: HashSet<i64> = lance_pending_ids(conn)?.into_iter().collect();
+    let missing = sqlite_set
+        .iter()
+        .filter(|id| !lance_set.contains(id) || pending.contains(id))
+        .count();
+    let orphans = lance_set.difference(&sqlite_set).count();
+    Ok((missing, orphans))
+}
+
+/// What [`repair_lance_from_sqlite`] did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct LanceRepairReport {
+    /// Rows written to LanceDB from the sqlite blobs: ids LanceDB lacked plus ids whose write
+    /// was pending (a stale same-id row may have been there).
+    rebuilt: usize,
+    /// LanceDB rows with no sqlite vector, deleted.
+    orphans_removed: usize,
+    /// True when the marker said clean and nothing was compared.
+    skipped: bool,
+}
+
+/// Bring LanceDB back in line with sqlite without embedding anything: diff the chunk ids in
+/// LanceDB against `project_chunk_vectors` for the active model at the store's dimension,
+/// rebuild the missing rows from the sqlite blobs and delete the orphans. Runs at the start of
+/// index and refresh when the dirty marker is set or absent (`force` false), and always in
+/// `prune` (`force` true). Requires the store to be open ([`get_or_open_lance`]); with no
+/// vectors for the model yet there is nothing to reconcile and the marker is cleared.
+fn repair_lance_from_sqlite(
+    conn: &Connection,
+    model_key: &str,
+    force: bool,
+) -> Result<LanceRepairReport, String> {
+    let marker = app_state_get(conn, APP_STATE_LANCE_DIRTY)?;
+    if !force && marker.as_deref() == Some("0") {
+        return Ok(LanceRepairReport {
+            skipped: true,
+            ..LanceRepairReport::default()
+        });
+    }
+    if !lance_store_is_open() {
+        if vector_dim_from_sqlite(conn, model_key).is_none() {
+            app_state_set(conn, APP_STATE_LANCE_DIRTY, "0")?;
+            return Ok(LanceRepairReport::default());
+        }
+        return Err("LanceDB is not open".to_string());
+    }
+    // A crash mid-repair must leave the marker set.
+    lance_mark_dirty(conn)?;
+    let pending: HashSet<i64> = lance_pending_ids(conn)?.into_iter().collect();
+    let (lance_ids, dim) = with_lance_store(|store| {
+        Ok((lance_store::list_chunk_ids(store)?, lance_store::dim(store)))
+    })?;
+    let lance_set: HashSet<i64> = lance_ids.into_iter().collect();
+    let sqlite_ids: Vec<i64> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT chunk_id FROM project_chunk_vectors WHERE model = ?1 AND dim = ?2 ORDER BY chunk_id",
+            )
+            .map_err(|e| format!("failed preparing chunk vector id query: {}", e))?;
+        let rows = stmt
+            .query_map(params![model_key, dim as i64], |row| row.get::<_, i64>(0))
+            .map_err(|e| format!("failed querying chunk vector ids: {}", e))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| format!("failed reading chunk vector id: {}", e))?);
+        }
+        out
+    };
+    let sqlite_set: HashSet<i64> = sqlite_ids.iter().copied().collect();
+    // Rows to write: absent from LanceDB, or pending (their last write did not complete, so
+    // whatever LanceDB holds under that id may be stale).
+    let missing: Vec<i64> = sqlite_ids
+        .iter()
+        .copied()
+        .filter(|id| !lance_set.contains(id) || pending.contains(id))
+        .collect();
+    let mut orphans: Vec<i64> = lance_set
+        .iter()
+        .copied()
+        .filter(|id| !sqlite_set.contains(id))
+        .collect();
+    orphans.sort();
+
+    let mut report = LanceRepairReport::default();
+    for batch in missing.chunks(500) {
+        let placeholders = vec!["?"; batch.len()].join(", ");
+        let sql = format!(
+            "SELECT chunk_id, vector FROM project_chunk_vectors WHERE chunk_id IN ({})",
+            placeholders
+        );
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| format!("failed preparing vector rebuild query: {}", e))?;
+        let rows = stmt
+            .query_map(params_from_iter(batch.iter()), |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(|e| format!("failed querying vectors for rebuild: {}", e))?;
+        let mut lance_batch: Vec<(i64, Vec<f32>)> = Vec::with_capacity(batch.len());
+        for row in rows {
+            let (chunk_id, blob) =
+                row.map_err(|e| format!("failed reading vector for rebuild: {}", e))?;
+            let vector = blob_to_f32_vec(&blob);
+            if vector.len() != dim {
+                // Fail closed: a malformed vector is not skipped over. The marker stays set,
+                // the pending ids stay, and the run reports the failure.
+                LANCE_WRITE_FAILED.store(true, Ordering::SeqCst);
+                return Err(format!(
+                    "sqlite vector for chunk {} holds {} floats ({} bytes) but LanceDB stores {}-dimensional vectors; repair refused, dirty marker and pending ids kept",
+                    chunk_id,
+                    vector.len(),
+                    blob.len(),
+                    dim
+                ));
+            }
+            lance_batch.push((chunk_id, vector));
+        }
+        if lance_batch.len() != batch.len() {
+            LANCE_WRITE_FAILED.store(true, Ordering::SeqCst);
+            return Err(format!(
+                "{} of {} required sqlite vectors are missing; repair refused, dirty marker and pending ids kept",
+                batch.len() - lance_batch.len(),
+                batch.len()
+            ));
+        }
+        with_lance_store(|store| lance_store::upsert_chunks(store, &lance_batch)).map_err(|e| {
+            LANCE_WRITE_FAILED.store(true, Ordering::SeqCst);
+            format!(
+                "LanceDB rebuild of {} rows failed: {}",
+                lance_batch.len(),
+                e
+            )
+        })?;
+        report.rebuilt += lance_batch.len();
+    }
+    if !orphans.is_empty() {
+        with_lance_store(|store| lance_store::delete_chunks(store, &orphans)).map_err(|e| {
+            LANCE_WRITE_FAILED.store(true, Ordering::SeqCst);
+            format!(
+                "LanceDB orphan delete of {} rows failed: {}",
+                orphans.len(),
+                e
+            )
+        })?;
+        report.orphans_removed = orphans.len();
+    }
+    // Every pending id was either rewritten above or no longer has a sqlite vector (its
+    // LanceDB row, if any, was an orphan and is gone).
+    conn.execute("DELETE FROM lance_pending", [])
+        .map_err(|e| format!("failed clearing pending lance rows: {}", e))?;
+    app_state_set(conn, APP_STATE_LANCE_DIRTY, "0")?;
+    // LanceDB now matches sqlite: later successful writes may clear the marker again.
+    LANCE_WRITE_FAILED.store(false, Ordering::SeqCst);
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -26019,9 +29338,9 @@ VALUES (12, 10, 'related', 'active', 0, 0);
         assert_eq!(out.manifest_rows, 1);
         assert_eq!(out.symbol_rows, 1);
         assert_eq!(out.import_rows, 1);
-        // Only the edge whose source vanished; the surviving file's edge to it stays until
-        // that file is re-indexed (targets are stored in the resolver's relative form).
-        assert_eq!(out.edge_rows, 1);
+        // Both edges touching the vanished file: the one it imported with and the one that
+        // pointed at it (`keep.rs -> stale.md` must not outlive stale.md).
+        assert_eq!(out.edge_rows, 2);
 
         // Survivors are untouched, with their original ids.
         let survivors: Vec<i64> = {
@@ -26055,11 +29374,12 @@ VALUES (12, 10, 'related', 'active', 0, 0);
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM file_imports"), 0);
         assert_eq!(
             count(&conn, "SELECT COUNT(*) FROM file_dependency_edges WHERE source_doc_path = '/p/alpha/src/keep.rs'"),
-            1
+            0,
+            "the edge into the vanished file is gone too"
         );
         assert_eq!(
             count(&conn, "SELECT COUNT(*) FROM file_dependency_edges"),
-            1
+            0
         );
         // FK cascade dropped the vector and the feedback row of chunk 12.
         assert_eq!(
@@ -26134,7 +29454,7 @@ VALUES (12, 10, 'related', 'active', 0, 0);
         assert_eq!(out.manifest_rows, 1);
         assert_eq!(out.symbol_rows, 1);
         assert_eq!(out.import_rows, 1);
-        assert_eq!(out.edge_rows, 1);
+        assert_eq!(out.edge_rows, 2);
         assert!(!out.is_empty());
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM project_chunks"), 4);
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM project_files"), 2);
@@ -26223,9 +29543,11 @@ VALUES (12, 10, 'related', 'active', 0, 0);
     #[test]
     fn remove_projects_not_in_cascades_chunks_and_vectors() {
         let conn = seeded_conn();
-        let removed =
-            remove_projects_not_in(&conn, &["/p/alpha".to_string()]).expect("remove stale");
+        let (removed, removed_chunks) =
+            remove_projects_not_in(&conn, &["/p/alpha".to_string()], &HashSet::new())
+                .expect("remove stale");
         assert_eq!(removed, 1);
+        assert_eq!(removed_chunks, 1);
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM projects"), 1);
         assert_eq!(
             count(
@@ -26242,6 +29564,1148 @@ VALUES (12, 10, 'related', 'active', 0, 0);
             0
         );
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM project_chunks"), 3);
+    }
+}
+
+#[cfg(test)]
+mod incremental_index_tests {
+    use super::*;
+
+    const BEDROCK_MODEL: &str = "bedrock:amazon.titan-embed-text-v2:0";
+
+    fn conn() -> Connection {
+        let conn = Connection::open_in_memory().expect("open in-memory sqlite");
+        conn.execute_batch("PRAGMA foreign_keys = ON;")
+            .expect("enable foreign keys");
+        init_schema(&conn).expect("init schema");
+        conn
+    }
+
+    fn count(conn: &Connection, sql: &str) -> i64 {
+        conn.query_row(sql, [], |row| row.get(0)).expect(sql)
+    }
+
+    fn scanned(rel: &str, doc_path: &str, rechunked: bool, chunk_count: i64) -> ScannedFile {
+        ScannedFile {
+            rel_path: rel.to_string(),
+            doc_path: doc_path.to_string(),
+            size: 1,
+            mtime: 0.0,
+            content_hash: "h".to_string(),
+            chunk_count,
+            rechunked,
+            stat_changed: false,
+        }
+    }
+
+    fn corpus(chunks: Vec<ProjectChunk>, files: Vec<ScannedFile>) -> ProjectCorpus {
+        ProjectCorpus {
+            doc: ProjectDoc {
+                path: PathBuf::from("/p/alpha"),
+                title: "alpha".to_string(),
+                summary: "alpha".to_string(),
+                mtime: 0.0,
+            },
+            chunks,
+            files,
+            scan_signature: String::new(),
+            complete: true,
+            files_unreadable: 0,
+            files_evicted_by_cap: 0,
+            files_truncated_by_cap: 0,
+            caps_note: String::new(),
+            documents_extracted: 0,
+            documents_failed: 0,
+            document_failures: Vec::new(),
+        }
+    }
+
+    fn scan_of(root: &Path) -> ProjectScan {
+        project_scan(root, &HashSet::new(), &ScanCaps::default(), false)
+    }
+
+    fn collect(root: &Path, manifest: &FileManifest, rechunk_all: bool) -> ProjectCorpus {
+        let scan = scan_of(root);
+        collect_project_corpus(
+            root,
+            &scan,
+            &ScanCaps::default(),
+            100_000,
+            manifest,
+            rechunk_all,
+        )
+    }
+
+    fn identity(dim: Option<i64>) -> EmbedIdentity {
+        EmbedIdentity {
+            model: BEDROCK_MODEL.to_string(),
+            dim,
+            normalized: true,
+            pipeline_version: EMBEDDING_PIPELINE_VERSION,
+        }
+    }
+
+    fn stored(hash: &str) -> StoredVectorIdentity {
+        StoredVectorIdentity {
+            embed_input_hash: hash.to_string(),
+            model: BEDROCK_MODEL.to_string(),
+            dim: 1024,
+            normalized: true,
+            pipeline_version: EMBEDDING_PIPELINE_VERSION,
+        }
+    }
+
+    #[test]
+    fn embed_input_hash_is_stable_and_hashes_the_exact_embedder_input() {
+        // SHA-1 of "hello": the value must never drift, or every stored vector is orphaned.
+        assert_eq!(
+            embed_input_hash("hello"),
+            "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d"
+        );
+        assert_eq!(embed_input_for("", "body"), "body");
+        assert_eq!(
+            embed_input_for("// File: a.rs", "body"),
+            "// File: a.rs\nbody"
+        );
+        assert_eq!(
+            embed_input_hash(&embed_input_for("h", "t")),
+            embed_input_hash("h\nt")
+        );
+        assert_ne!(
+            embed_input_hash(&embed_input_for("", "t")),
+            embed_input_hash(&embed_input_for("h", "t")),
+            "the header is part of the embedder input, so it is part of the identity"
+        );
+    }
+
+    #[test]
+    fn a_stored_vector_is_reused_only_when_every_identity_field_matches() {
+        let current = identity(Some(1024));
+        let hash = embed_input_hash("x");
+        let same = stored(&hash);
+        assert!(current.reuses(&same, &hash));
+        assert!(!current.reuses(&stored(&embed_input_hash("y")), &hash));
+        assert!(!current.reuses(
+            &StoredVectorIdentity {
+                model: "ollama:qwen3-embedding".to_string(),
+                ..same.clone()
+            },
+            &hash
+        ));
+        assert!(!current.reuses(
+            &StoredVectorIdentity {
+                dim: 512,
+                ..same.clone()
+            },
+            &hash
+        ));
+        assert!(!current.reuses(
+            &StoredVectorIdentity {
+                normalized: false,
+                ..same.clone()
+            },
+            &hash
+        ));
+        assert!(!current.reuses(
+            &StoredVectorIdentity {
+                pipeline_version: EMBEDDING_PIPELINE_VERSION + 1,
+                ..same.clone()
+            },
+            &hash
+        ));
+        // No vectors exist for the model yet: nothing can be reused.
+        assert!(!identity(None).reuses(&same, &hash));
+        // A row that never got an identity is never reused.
+        assert!(!current.reuses(&stored(""), ""));
+    }
+
+    #[test]
+    fn migration_backfills_identity_from_stored_text_without_reembedding() {
+        let conn = conn();
+        // Roll the vectors table back to its 0.1.x shape and seed it the old way.
+        for column in ["embed_input_hash", "normalized", "pipeline_version"] {
+            conn.execute(
+                &format!("ALTER TABLE project_chunk_vectors DROP COLUMN {}", column),
+                [],
+            )
+            .expect("drop identity column");
+        }
+        conn.execute_batch(
+            r#"
+INSERT INTO projects(id, path, title, summary, project_mtime, last_indexed)
+VALUES (1, '/p/alpha', 'alpha', 'alpha', 0, 0);
+INSERT INTO project_chunks(id, project_id, doc_path, doc_rel_path, doc_mtime, chunk_index, token_count, text_hash, text, updated_at, context_header)
+VALUES (10, 1, '/p/alpha/a.md', 'a.md', 0, 0, 1, 'h', 'prose body', 0, ''),
+       (11, 1, '/p/alpha/b.rs', 'b.rs', 0, 0, 1, 'h', 'fn b() {}', 0, '// File: b.rs'),
+       (12, 1, '/p/alpha/c.md', 'c.md', 0, 0, 1, 'h', 'local body', 0, '');
+INSERT INTO project_chunk_vectors(chunk_id, model, dim, norm, vector)
+VALUES (10, 'bedrock:amazon.titan-embed-text-v2:0', 1024, 1.0, x'00000000'),
+       (11, 'bedrock:amazon.titan-embed-text-v2:0', 1024, 1.0, x'00000000'),
+       (12, 'ollama:qwen3-embedding', 1024, 1.0, x'00000000');
+"#,
+        )
+        .expect("seed 0.1.x rows");
+        assert!(!table_has_column(&conn, "project_chunk_vectors", "embed_input_hash").unwrap());
+
+        init_schema(&conn).expect("open migrates");
+
+        assert!(table_has_column(&conn, "project_chunk_vectors", "embed_input_hash").unwrap());
+        let ids = load_project_vector_identities(&conn, 1).expect("identities");
+        assert_eq!(ids.len(), 3);
+        let bedrock_normalized = bool_env("RETRIVIO_BEDROCK_NORMALIZE", true);
+        assert_eq!(
+            ids[&10],
+            StoredVectorIdentity {
+                embed_input_hash: embed_input_hash("prose body"),
+                model: BEDROCK_MODEL.to_string(),
+                dim: 1024,
+                normalized: bedrock_normalized,
+                pipeline_version: 1,
+            }
+        );
+        assert_eq!(
+            ids[&11].embed_input_hash,
+            embed_input_hash("// File: b.rs\nfn b() {}"),
+            "the header the embedder saw is part of the backfilled hash"
+        );
+        assert!(
+            !ids[&12].normalized,
+            "only bedrock rows carry the bedrock normalisation flag"
+        );
+        assert_eq!(ids[&12].pipeline_version, 1);
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM project_chunk_vectors WHERE embed_input_hash = '' OR pipeline_version = 0"
+            ),
+            0
+        );
+
+        // Opening again is a no-op.
+        init_schema(&conn).expect("second open");
+        assert_eq!(load_project_vector_identities(&conn, 1).unwrap(), ids);
+
+        // The upgrade rule: the current identity reuses every backfilled bedrock row for the
+        // exact input the run would build from the stored chunk.
+        let current = EmbedIdentity {
+            normalized: bedrock_normalized,
+            ..identity(Some(1024))
+        };
+        assert!(current.reuses(
+            &ids[&10],
+            &embed_input_hash(&embed_input_for("", "prose body"))
+        ));
+        assert!(current.reuses(
+            &ids[&11],
+            &embed_input_hash(&embed_input_for("// File: b.rs", "fn b() {}"))
+        ));
+    }
+
+    #[test]
+    fn work_set_classifies_unchanged_touched_changed_and_new_files() {
+        let mut manifest = FileManifest::new();
+        manifest.insert(
+            "a.md".to_string(),
+            FileManifestEntry {
+                size: 5,
+                mtime: 100.0,
+                content_hash: content_hash_xxh64(b"hello"),
+                chunk_count: 2,
+            },
+        );
+        // Same size and mtime: unchanged on the fast path, without reading the file.
+        assert_eq!(
+            manifest_stat_match(&manifest, "a.md", 5, 100.0).map(|e| e.chunk_count),
+            Some(2)
+        );
+        assert!(manifest_stat_match(&manifest, "a.md", 5, 101.0).is_none());
+        assert!(manifest_stat_match(&manifest, "a.md", 6, 100.0).is_none());
+        assert!(manifest_stat_match(&manifest, "b.md", 5, 100.0).is_none());
+        // Touched: the mtime moved but the bytes did not. Unchanged, hash kept.
+        assert_eq!(
+            file_has_changed(&manifest, "a.md", 5, 101.0, b"hello"),
+            (false, content_hash_xxh64(b"hello"))
+        );
+        // Edited in place, same size: changed.
+        assert_eq!(
+            file_has_changed(&manifest, "a.md", 5, 101.0, b"hellp"),
+            (true, content_hash_xxh64(b"hellp"))
+        );
+        // New file: changed.
+        assert_eq!(
+            file_has_changed(&manifest, "b.md", 5, 100.0, b"hello"),
+            (true, content_hash_xxh64(b"hello"))
+        );
+    }
+
+    #[test]
+    fn collect_reads_and_chunks_only_the_changed_work_set() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tmp")
+            .join(format!("incremental-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("docs")).expect("mk docs");
+        fs::write(root.join("docs").join("keep.md"), "keep me exactly as I am").expect("keep");
+        fs::write(root.join("docs").join("edit.md"), "first version").expect("edit v1");
+
+        // First run: no manifest, everything is read and chunked.
+        let full = collect(&root, &FileManifest::new(), false);
+        assert_eq!(full.files.len(), 2);
+        assert!(full.files.iter().all(|f| f.rechunked));
+        assert_eq!(full.chunks.len(), 2);
+        assert_eq!(full.files_rechunked(), 2);
+        assert_eq!(full.files_unchanged(), 0);
+        assert!(full.complete);
+        assert!(full.scan_signature.starts_with("2:"));
+
+        // The manifest the run stores; then edit one file and add another.
+        let manifest: FileManifest = full
+            .files
+            .iter()
+            .map(|f| {
+                (
+                    f.rel_path.clone(),
+                    FileManifestEntry {
+                        size: f.size,
+                        mtime: f.mtime,
+                        content_hash: f.content_hash.clone(),
+                        chunk_count: f.chunk_count,
+                    },
+                )
+            })
+            .collect();
+        fs::write(
+            root.join("docs").join("edit.md"),
+            "second version, longer than before",
+        )
+        .expect("edit v2");
+        fs::write(root.join("docs").join("new.md"), "brand new").expect("new");
+
+        let incremental = collect(&root, &manifest, false);
+        let by_rel: HashMap<&str, &ScannedFile> = incremental
+            .files
+            .iter()
+            .map(|f| (f.rel_path.as_str(), f))
+            .collect();
+        assert_eq!(incremental.files.len(), 3);
+        assert!(!by_rel["docs/keep.md"].rechunked);
+        assert!(!by_rel["docs/keep.md"].stat_changed);
+        assert_eq!(by_rel["docs/keep.md"].chunk_count, 1);
+        assert!(by_rel["docs/edit.md"].rechunked);
+        assert!(by_rel["docs/new.md"].rechunked);
+        let chunked: HashSet<&str> = incremental
+            .chunks
+            .iter()
+            .map(|c| c.doc_rel_path.as_str())
+            .collect();
+        assert_eq!(chunked, HashSet::from(["docs/edit.md", "docs/new.md"]));
+        assert_ne!(
+            incremental.scan_signature, full.scan_signature,
+            "a new file changes the signature"
+        );
+        assert!(incremental.scan_signature.starts_with("3:"));
+        assert_eq!(
+            incremental.doc.summary.matches("indexed_files 3").count(),
+            1,
+            "unchanged files still count as indexed in the summary"
+        );
+        // doc_path is the canonical project path joined with rel_path, for every file.
+        let project_path = normalize_path(&root.to_string_lossy());
+        for f in &incremental.files {
+            assert_eq!(f.doc_path, project_path.join(&f.rel_path).to_string_lossy());
+        }
+        for c in &incremental.chunks {
+            assert_eq!(
+                c.doc_path,
+                project_path.join(&c.doc_rel_path).to_string_lossy()
+            );
+        }
+
+        // `rechunk_all` (refresh, reembed, incomplete vectors) ignores the manifest.
+        let forced = collect(&root, &manifest, true);
+        assert_eq!(forced.files_rechunked(), 3);
+        assert_eq!(forced.chunks.len(), 3);
+
+        // The full keep set: the unchanged file is kept whole, re-chunked ones by index.
+        let keep = PruneKeepSet::from_corpus(&incremental);
+        assert!(keep.keeps_chunk(&by_rel["docs/keep.md"].doc_path, 7));
+        assert!(keep.keeps_doc(&by_rel["docs/keep.md"].doc_path));
+        assert!(keep.keeps_chunk(&by_rel["docs/edit.md"].doc_path, 0));
+        assert!(!keep.keeps_chunk(&by_rel["docs/edit.md"].doc_path, 1));
+        assert!(keep.rel_paths.contains("docs/keep.md"));
+        assert!(keep.rel_paths.contains("docs/new.md"));
+
+        // Deleting a file changes the signature even when no surviving file's mtime moved.
+        let before = scan_of(&root);
+        fs::remove_file(root.join("docs").join("new.md")).expect("delete");
+        let after = scan_of(&root);
+        assert_ne!(before.signature, after.signature);
+        assert!(after.signature.starts_with("2:"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn candidate(rel: &str, size: u64, mtime_ns: i128) -> CandidateFile {
+        let suffix = Path::new(rel)
+            .extension()
+            .map(|e| format!(".{}", e.to_string_lossy().to_lowercase()))
+            .unwrap_or_default();
+        CandidateFile {
+            rel_path: rel.to_string(),
+            fs_path: PathBuf::from("/p").join(rel),
+            size,
+            mtime: mtime_ns as f64 / 1e9,
+            mtime_ns,
+            tier: selection_tier(&suffix),
+        }
+    }
+
+    #[test]
+    fn selection_tiers_put_notes_before_code_before_config_newest_first_within_a_tier() {
+        let listing = ProjectListing {
+            candidates: vec![
+                candidate("ci/pipeline.yml", 1, 900),
+                candidate("src/app.py", 1, 800),
+                candidate("README.md", 1, 100),
+                candidate("data/config.json", 1, 950),
+                candidate("docs/plan.docx", 1, 50),
+                candidate("src/lib.rs", 1, 800),
+                candidate("notes/old.txt", 1, 20),
+            ],
+            ..ProjectListing::default()
+        };
+        let (selected, evicted) = select_scan_files(&listing, &ScanCaps::default());
+        let order: Vec<&str> = selected.iter().map(|c| c.rel_path.as_str()).collect();
+        assert_eq!(
+            order,
+            vec![
+                "README.md",
+                "docs/plan.docx",
+                "notes/old.txt",
+                "src/app.py",
+                "src/lib.rs",
+                "data/config.json",
+                "ci/pipeline.yml",
+            ]
+        );
+        assert_eq!(evicted, 0);
+        assert_eq!(selection_tier(".sql"), 3);
+        assert_eq!(selection_tier(".sh"), 2);
+        assert_eq!(selection_tier(".pdf"), 1);
+        assert_eq!(selection_tier(".htm"), 1);
+    }
+
+    #[test]
+    fn scan_signature_ignores_order_and_tracks_membership_size_and_mtime() {
+        let a = scan_signature_for(&[candidate("b.md", 5, 100), candidate("a.md", 7, 200)]);
+        let b = scan_signature_for(&[candidate("a.md", 7, 200), candidate("b.md", 5, 100)]);
+        assert_eq!(a, b, "order of discovery does not matter");
+        assert!(a.starts_with("2:"));
+        assert_ne!(a, scan_signature_for(&[candidate("a.md", 7, 200)]));
+        assert_ne!(
+            a,
+            scan_signature_for(&[candidate("b.md", 5, 100), candidate("a.md", 8, 200)]),
+            "a size change with the same mtime is a change"
+        );
+        assert_ne!(
+            a,
+            scan_signature_for(&[candidate("b.md", 5, 100), candidate("a.md", 7, 201)]),
+            "an mtime change with the same size is a change"
+        );
+        assert_ne!(
+            a,
+            scan_signature_for(&[candidate("b.md", 5, 100), candidate("c.md", 7, 200)]),
+            "a rename is a change"
+        );
+    }
+
+    #[test]
+    fn selection_is_deterministic_docs_first_newest_first_then_path() {
+        let listing = ProjectListing {
+            candidates: vec![
+                candidate("z.rs", 1, 300),
+                candidate("b.md", 1, 100),
+                candidate("a.md", 1, 100),
+                candidate("c.md", 1, 200),
+            ],
+            ..ProjectListing::default()
+        };
+        let caps = ScanCaps {
+            max_files_per_project: 3,
+            ..ScanCaps::default()
+        };
+        let (selected, evicted) = select_scan_files(&listing, &caps);
+        let order: Vec<&str> = selected.iter().map(|c| c.rel_path.as_str()).collect();
+        assert_eq!(order, vec!["c.md", "a.md", "b.md"]);
+        assert_eq!(evicted, 1, "the code file is newest but docs come first");
+        let (again, _) = select_scan_files(&listing, &caps);
+        assert_eq!(again, selected, "same input, same selection");
+    }
+
+    fn tmp_root(name: &str) -> PathBuf {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tmp")
+            .join(format!("{}-{}", name, std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("mk root");
+        root
+    }
+
+    fn write_file(path: &Path, text: &str) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("mkdir");
+        }
+        fs::write(path, text).expect("write");
+    }
+
+    fn selected_rels(scan: &ProjectScan) -> Vec<String> {
+        let mut rels: Vec<String> = scan.selected.iter().map(|c| c.rel_path.clone()).collect();
+        rels.sort();
+        rels
+    }
+
+    #[test]
+    fn built_in_skip_dirs_cover_worktrees_and_app_bundles_and_shallow_scans_stay_at_the_top() {
+        assert!(is_skip_dir("worktrees"));
+        assert!(is_skip_dir(".worktrees"));
+        assert!(is_skip_dir("Amazon Quick 1.0.3377.app"));
+        assert!(is_skip_dir("Foo.app"));
+        assert!(!is_skip_dir("app"));
+        assert!(!is_skip_dir("myapp"));
+        assert!(!is_skip_dir("application"));
+        assert!(is_skip_dir("node_modules"), "the old built-ins stay");
+
+        let root = tmp_root("skipdirs-walk");
+        write_file(&root.join("notes.md"), "notes at the top");
+        write_file(&root.join("src").join("main.rs"), "fn main() {}");
+        write_file(
+            &root.join("worktrees").join("x").join("ci.yml"),
+            "stages: []",
+        );
+        write_file(
+            &root.join(".worktrees").join("y").join("a.md"),
+            "hidden worktree",
+        );
+        write_file(
+            &root
+                .join("Foo.app")
+                .join("Contents")
+                .join("Resources")
+                .join("readme.md"),
+            "bundle text",
+        );
+        // An Office owner file is neither a document nor worth a line in the summary.
+        write_file(&root.join("~$deck.pptx"), "estouff");
+        let full = project_scan(&root, &HashSet::new(), &ScanCaps::default(), false);
+        assert_eq!(selected_rels(&full), vec!["notes.md", "src/main.rs"]);
+        assert_eq!(full.listing.file_names, vec!["notes.md", "src/main.rs"]);
+        assert!(!full.shallow);
+
+        // A root-files project: the directory's own files, no subdirectories at all.
+        let shallow = project_scan(&root, &HashSet::new(), &ScanCaps::default(), true);
+        assert_eq!(selected_rels(&shallow), vec!["notes.md"]);
+        assert_eq!(shallow.listing.file_names, vec!["notes.md"]);
+        assert!(shallow.shallow);
+        assert_ne!(shallow.signature, full.signature);
+        let corpus = collect_project_corpus(
+            &root,
+            &shallow,
+            &ScanCaps::default(),
+            100_000,
+            &FileManifest::new(),
+            true,
+        );
+        let base = root.file_name().unwrap().to_string_lossy().to_string();
+        assert_eq!(
+            corpus.doc.title,
+            format!("{} (root files)", base.replace('-', " "))
+        );
+        assert!(
+            corpus
+                .doc
+                .summary
+                .starts_with(&format!("project {} (root files)\nindexed_files 1\n", base)),
+            "{}",
+            corpus.doc.summary
+        );
+        assert_eq!(corpus.files.len(), 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_project_summary_quotes_files_in_path_order_and_ignores_touches() {
+        let root = tmp_root("summary-order");
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        write_file(&root.join("a.md"), "alpha text about otters");
+        write_file(&root.join("b.md"), "beta text about zebras");
+        super::test_support::set_mtime(&root.join("a.md"), t0);
+        super::test_support::set_mtime(&root.join("b.md"), t0 + Duration::from_secs(60));
+        let collect = || {
+            let scan = scan_of(&root);
+            collect_project_corpus(
+                &root,
+                &scan,
+                &ScanCaps::default(),
+                100_000,
+                &FileManifest::new(),
+                true,
+            )
+        };
+        let before = collect();
+        // Selection order is newest first (b.md), the summary is path order (a.md first).
+        assert!(
+            before.doc.summary.find("a.md\nalpha").unwrap()
+                < before.doc.summary.find("b.md\nbeta").unwrap(),
+            "{}",
+            before.doc.summary
+        );
+        // Touching a.md makes it the newest selected file; the summary text does not move.
+        super::test_support::set_mtime(&root.join("a.md"), t0 + Duration::from_secs(600));
+        let after = collect();
+        assert_eq!(after.doc.summary, before.doc.summary);
+        assert_ne!(
+            after.scan_signature, before.scan_signature,
+            "the gate still sees the touch"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn excludes_apply_when_the_project_is_reached_through_a_symlinked_parent() {
+        let base = tmp_root("excl-symlink");
+        let real = base.join("real");
+        write_file(&real.join("proj").join("src").join("a.md"), "kept");
+        write_file(&real.join("proj").join("scratch").join("b.md"), "excluded");
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        let mut excludes: HashSet<PathBuf> = HashSet::new();
+        excludes.insert(normalize_path(
+            &real.join("proj").join("scratch").to_string_lossy(),
+        ));
+        let via_link = project_scan(&link.join("proj"), &excludes, &ScanCaps::default(), false);
+        assert_eq!(selected_rels(&via_link), vec!["src/a.md"]);
+        let direct = project_scan(&real.join("proj"), &excludes, &ScanCaps::default(), false);
+        assert_eq!(direct.signature, via_link.signature);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn on_disk_signature_catches_preserved_timestamps_and_ignores_non_indexable_files() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tmp")
+            .join(format!("signature-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("mk root");
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let set = |name: &str, text: &str, when: SystemTime| {
+            fs::write(root.join(name), text).expect("write");
+            super::test_support::set_mtime(&root.join(name), when);
+        };
+        set("a.md", "four", t0);
+        set("b.md", "beta", t0);
+        let base = scan_of(&root);
+
+        // An edit whose timestamp was preserved (size changed): detected.
+        set("a.md", "four plus more", t0);
+        let preserved = scan_of(&root);
+        assert_ne!(preserved.signature, base.signature);
+
+        // A future-dated file does not mask a later edit to another file.
+        set(
+            "future.md",
+            "from the future",
+            t0 + Duration::from_secs(10 * 365 * 86_400),
+        );
+        let with_future = scan_of(&root);
+        set("b.md", "beta edited", t0 + Duration::from_secs(60));
+        let edited_under_future = scan_of(&root);
+        assert_ne!(edited_under_future.signature, with_future.signature);
+        assert_eq!(
+            edited_under_future.latest_mtime(),
+            with_future.latest_mtime(),
+            "the old max-mtime gate would have seen nothing"
+        );
+
+        // A non-indexable file appearing or changing does not trigger a scan.
+        fs::write(root.join("image.png"), b"\x89PNG not text").expect("png");
+        let with_png = scan_of(&root);
+        assert_eq!(with_png.signature, edited_under_future.signature);
+        assert!(with_png
+            .listing
+            .file_names
+            .contains(&"image.png".to_string()));
+        assert_eq!(with_png.selected.len(), 3);
+        assert!(with_png.complete());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn doc_paths_come_from_the_canonical_project_path_even_through_symlinks() {
+        let base = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tmp")
+            .join(format!("symlink-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let real = base.join("real").join("proj");
+        let elsewhere = base.join("elsewhere");
+        fs::create_dir_all(&real).expect("real");
+        fs::create_dir_all(&elsewhere).expect("elsewhere");
+        fs::write(real.join("f.md"), "a regular file in the project").expect("f");
+        fs::write(elsewhere.join("target.md"), "the linked file's content").expect("target");
+        std::os::unix::fs::symlink(elsewhere.join("target.md"), real.join("link.md"))
+            .expect("file symlink");
+        std::os::unix::fs::symlink(base.join("real"), base.join("link-dir")).expect("dir symlink");
+
+        // The project is reached through a symlinked parent directory. The symlinked file
+        // inside it is not indexed (regular files only, as before), so nothing outside the
+        // project tree can enter it.
+        let via_link = base.join("link-dir").join("proj");
+        let corpus = collect(&via_link, &FileManifest::new(), true);
+        let canonical = normalize_path(&real.to_string_lossy());
+        assert_eq!(corpus.doc.path, canonical);
+        assert_eq!(corpus.files.len(), 1);
+        assert_eq!(corpus.files[0].rel_path, "f.md");
+        for f in &corpus.files {
+            assert_eq!(f.doc_path, canonical.join(&f.rel_path).to_string_lossy());
+            assert!(!f.doc_path.contains("link-dir"));
+        }
+        for c in &corpus.chunks {
+            assert_eq!(
+                c.doc_path,
+                canonical.join(&c.doc_rel_path).to_string_lossy()
+            );
+        }
+        // The same project collected through its real path yields the same keys, so rows
+        // written one way are kept by a scan done the other way.
+        let direct = collect(&real, &FileManifest::new(), true);
+        let mut a: Vec<&str> = corpus.files.iter().map(|f| f.doc_path.as_str()).collect();
+        let mut b: Vec<&str> = direct.files.iter().map(|f| f.doc_path.as_str()).collect();
+        a.sort();
+        b.sort();
+        assert_eq!(a, b);
+        assert_eq!(corpus.scan_signature, direct.scan_signature);
+        let keep = PruneKeepSet::from_corpus(&corpus);
+        for f in &direct.files {
+            assert!(keep.keeps_doc(&f.doc_path));
+        }
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_selected_file_that_cannot_be_read_makes_the_scan_incomplete() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tmp")
+            .join(format!("readfail-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("mk root");
+        fs::write(root.join("a.md"), "readable file").expect("a");
+        fs::write(root.join("b.md"), "this one will be unreadable").expect("b");
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(root.join("b.md"), fs::Permissions::from_mode(0o000)).expect("chmod");
+        if fs::read(root.join("b.md")).is_ok() {
+            // Running as root: permissions do not bite; nothing to test here.
+            let _ = fs::remove_dir_all(&root);
+            return;
+        }
+        let scan = scan_of(&root);
+        assert!(scan.complete(), "the walk itself saw both files");
+        assert_eq!(scan.selected.len(), 2);
+        let corpus = collect_project_corpus(
+            &root,
+            &scan,
+            &ScanCaps::default(),
+            100_000,
+            &FileManifest::new(),
+            true,
+        );
+        fs::set_permissions(root.join("b.md"), fs::Permissions::from_mode(0o644)).expect("restore");
+        assert!(
+            !corpus.complete,
+            "a read failure after the walk is an incomplete scan"
+        );
+        assert_eq!(corpus.files_unreadable, 1);
+        assert_eq!(corpus.files.len(), 1);
+        assert_eq!(corpus.files[0].rel_path, "a.md");
+        // Nothing of b.md would be pruned: reindex skips prune for incomplete corpora and the
+        // signature is not published (see run_native_index_with_embedder).
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_whitespace_only_file_is_selected_with_zero_chunks_by_the_real_collector() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tmp")
+            .join(format!("blank-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("mk root");
+        fs::write(root.join("notes.md"), "some notes").expect("notes");
+        fs::write(root.join("blank.py"), "   \n\t\n\n").expect("blank");
+        let corpus = collect(&root, &FileManifest::new(), true);
+        assert!(corpus.complete);
+        assert_eq!(corpus.files.len(), 2);
+        let blank = corpus
+            .files
+            .iter()
+            .find(|f| f.rel_path == "blank.py")
+            .expect("blank.py is a selected file");
+        assert!(blank.rechunked);
+        assert_eq!(blank.chunk_count, 0);
+        assert!(corpus.chunks.iter().all(|c| c.doc_rel_path != "blank.py"));
+        let keep = PruneKeepSet::from_corpus(&corpus);
+        assert!(keep.keeps_doc(&blank.doc_path));
+        assert!(keep.rel_paths.contains("blank.py"));
+        assert!(!keep.keeps_chunk(&blank.doc_path, 0), "its old chunks go");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn prune_deletes_commit_the_lance_dirty_marker_with_them() {
+        let conn = conn();
+        seed_two_file_project(&conn);
+        assert_eq!(app_state_get(&conn, APP_STATE_LANCE_DIRTY).unwrap(), None);
+        let scan = corpus(Vec::new(), vec![scanned("a.md", "/p/alpha/a.md", false, 1)]);
+        let keep = PruneKeepSet::from_corpus(&scan);
+        let dry = prune_stale_project_rows(&conn, 1, &keep, true).expect("dry run");
+        assert_eq!(dry.chunks, 2);
+        assert_eq!(
+            app_state_get(&conn, APP_STATE_LANCE_DIRTY).unwrap(),
+            None,
+            "a dry run marks nothing"
+        );
+        let out = prune_stale_project_rows(&conn, 1, &keep, false).expect("prune");
+        assert_eq!(out.chunks, 2);
+        assert_eq!(
+            app_state_get(&conn, APP_STATE_LANCE_DIRTY).unwrap(),
+            Some("1".to_string()),
+            "the marker is set in the same transaction as the sqlite deletes"
+        );
+        // Removing a project sets it too.
+        conn.execute_batch(
+            "INSERT INTO projects(id, path, title, summary, project_mtime, last_indexed) VALUES (2, '/p/beta', 'beta', 'beta', 0, 0);
+             INSERT INTO project_chunks(id, project_id, doc_path, doc_rel_path, doc_mtime, chunk_index, token_count, text_hash, text, updated_at)
+             VALUES (20, 2, '/p/beta/x.md', 'x.md', 0, 0, 1, 'h', 'x', 0);",
+        )
+        .unwrap();
+        app_state_set(&conn, APP_STATE_LANCE_DIRTY, "0").unwrap();
+        let (removed, chunks) =
+            remove_projects_not_in(&conn, &["/p/alpha".to_string()], &HashSet::new()).unwrap();
+        assert_eq!((removed, chunks), (1, 1));
+        assert_eq!(
+            app_state_get(&conn, APP_STATE_LANCE_DIRTY).unwrap(),
+            Some("1".to_string())
+        );
+    }
+
+    #[test]
+    fn a_rechunked_file_with_zero_chunks_keeps_its_manifest_row_and_code_intel() {
+        let conn = conn();
+        seed_two_file_project(&conn);
+        // tools/b.py was re-read and produced no chunks (nothing embeddable), but it is still a
+        // selected file: its manifest row, symbols and imports come from the file, not from
+        // chunks, and stay. Only its stored chunks go.
+        let scan = corpus(
+            Vec::new(),
+            vec![
+                scanned("a.md", "/p/alpha/a.md", false, 1),
+                scanned("tools/b.py", "/p/alpha/tools/b.py", true, 0),
+            ],
+        );
+        let keep = PruneKeepSet::from_corpus(&scan);
+        let out = prune_stale_project_rows(&conn, 1, &keep, false).expect("prune");
+        let mut removed = out.chunk_ids.clone();
+        removed.sort();
+        assert_eq!(removed, vec![11, 12]);
+        assert_eq!(out.manifest_rows, 0);
+        assert_eq!(out.symbol_rows, 0);
+        assert_eq!(out.import_rows, 0);
+        assert_eq!(out.edge_rows, 0);
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM project_files WHERE rel_path = 'tools/b.py'"
+            ),
+            1
+        );
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM symbols"), 2);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM file_imports"), 1);
+        // A file that is not selected at all loses everything (the deletion case).
+        let gone = corpus(Vec::new(), vec![scanned("a.md", "/p/alpha/a.md", false, 1)]);
+        let out = prune_stale_project_rows(&conn, 1, &PruneKeepSet::from_corpus(&gone), false)
+            .expect("prune gone");
+        assert_eq!(out.manifest_rows, 1);
+        assert_eq!(out.symbol_rows, 2);
+        assert_eq!(out.import_rows, 1);
+    }
+
+    #[test]
+    fn a_touched_identical_file_is_marked_stat_changed_and_its_manifest_row_is_refreshed() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tmp")
+            .join(format!("restat-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("mk root");
+        fs::write(root.join("a.md"), "same content before and after").expect("a");
+        let full = collect(&root, &FileManifest::new(), false);
+        let manifest: FileManifest = full
+            .files
+            .iter()
+            .map(|f| {
+                (
+                    f.rel_path.clone(),
+                    FileManifestEntry {
+                        size: f.size,
+                        mtime: f.mtime,
+                        content_hash: f.content_hash.clone(),
+                        chunk_count: f.chunk_count,
+                    },
+                )
+            })
+            .collect();
+        let later = SystemTime::now() + Duration::from_secs(300);
+        super::test_support::set_mtime(&root.join("a.md"), later);
+        let touched = collect(&root, &manifest, false);
+        let f = &touched.files[0];
+        assert!(!f.rechunked);
+        assert!(f.stat_changed);
+        assert!(touched.chunks.is_empty());
+        assert!(f.mtime > manifest["a.md"].mtime);
+        assert_eq!(f.content_hash, manifest["a.md"].content_hash);
+        assert_eq!(f.chunk_count, 1);
+
+        // Through reindex: no embedder call, no prune, the manifest row carries the new stat.
+        let conn = conn();
+        conn.execute_batch(
+            "INSERT INTO projects(id, path, title, summary, project_mtime, last_indexed) VALUES (1, '/p/x', 'x', 'x', 0, 0);",
+        )
+        .unwrap();
+        let cfg = ConfigValues::from_map(HashMap::new());
+        let embedder = super::test_support::TestEmbedder::new(&cfg, false);
+        upsert_file_manifest(
+            &conn,
+            1,
+            "a.md",
+            &f.doc_path,
+            f.size,
+            manifest["a.md"].mtime,
+            &f.content_hash,
+            1,
+        )
+        .unwrap();
+        let out = reindex_project_chunks(
+            &root,
+            &conn,
+            1,
+            &identity(Some(64)),
+            &embedder,
+            &touched,
+            now_ts(),
+            None,
+            false,
+        )
+        .expect("reindex");
+        assert_eq!(out.vectors, 0);
+        assert_eq!(out.rows, 1);
+        assert!(embedder.embedded_texts().is_empty());
+        let stored: f64 = conn
+            .query_row(
+                "SELECT file_mtime FROM project_files WHERE rel_path = 'a.md'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!((stored - f.mtime).abs() < 0.001);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn seed_two_file_project(conn: &Connection) {
+        conn.execute_batch(
+            r#"
+INSERT INTO projects(id, path, title, summary, project_mtime, last_indexed)
+VALUES (1, '/p/alpha', 'alpha', 'alpha', 0, 0);
+INSERT INTO project_chunks(id, project_id, doc_path, doc_rel_path, doc_mtime, chunk_index, token_count, text_hash, text, updated_at)
+VALUES (10, 1, '/p/alpha/a.md', 'a.md', 0, 0, 5, 'h10', 'a zero', 0),
+       (11, 1, '/p/alpha/tools/b.py', 'tools/b.py', 0, 0, 5, 'h11', 'b zero', 0),
+       (12, 1, '/p/alpha/tools/b.py', 'tools/b.py', 0, 1, 5, 'h12', 'b one', 0);
+INSERT INTO project_chunk_vectors(chunk_id, model, dim, norm, vector, embed_input_hash, normalized, pipeline_version)
+VALUES (10, 'm', 1, 1.0, x'00000000', 'i10', 1, 1),
+       (11, 'm', 1, 1.0, x'00000000', 'i11', 1, 1),
+       (12, 'm', 1, 1.0, x'00000000', 'i12', 1, 1);
+INSERT INTO project_files(project_id, rel_path, abs_path, file_size, file_mtime, content_hash, chunk_count, last_indexed)
+VALUES (1, 'a.md', '/p/alpha/a.md', 1, 0, 'x', 1, 0),
+       (1, 'tools/b.py', '/p/alpha/tools/b.py', 1, 0, 'y', 2, 0);
+INSERT INTO symbols(project_id, doc_path, doc_rel_path, name, kind, line_start, line_end, updated_at)
+VALUES (1, '/p/alpha/tools/b.py', 'tools/b.py', 'load', 'function', 1, 2, 0),
+       (1, '/p/alpha/tools/b.py', 'tools/b.py', 'Config', 'class', 4, 9, 0);
+INSERT INTO file_imports(project_id, source_doc_path, import_kind, raw_specifier, updated_at)
+VALUES (1, '/p/alpha/tools/b.py', 'import', 'os', 0);
+INSERT INTO file_dependency_edges(project_id, source_doc_path, target_doc_path, edge_kind, updated_at)
+VALUES (1, '/p/alpha/tools/b.py', 'a.md', 'imports', 0);
+"#,
+        )
+        .expect("seed two-file project");
+    }
+
+    #[test]
+    fn a_vanished_file_loses_every_row_and_unchanged_files_keep_theirs() {
+        let conn = conn();
+        seed_two_file_project(&conn);
+        // The scan lists a.md as unchanged and no longer sees tools/b.py.
+        let scan = corpus(Vec::new(), vec![scanned("a.md", "/p/alpha/a.md", false, 1)]);
+        let keep = PruneKeepSet::from_corpus(&scan);
+        let out = prune_stale_project_rows(&conn, 1, &keep, false).expect("prune");
+
+        let mut removed = out.chunk_ids.clone();
+        removed.sort();
+        assert_eq!(removed, vec![11, 12]);
+        assert_eq!(out.files, 1);
+        assert_eq!(out.manifest_rows, 1);
+        assert_eq!(out.symbol_rows, 2);
+        assert_eq!(out.import_rows, 1);
+        assert_eq!(out.edge_rows, 1);
+
+        // Everything of tools/b.py is gone ...
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM project_chunks WHERE doc_rel_path = 'tools/b.py'"
+            ),
+            0
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM project_chunk_vectors WHERE chunk_id IN (11, 12)"
+            ),
+            0
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM project_files WHERE rel_path = 'tools/b.py'"
+            ),
+            0
+        );
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM symbols"), 0);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM file_imports"), 0);
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM file_dependency_edges"),
+            0
+        );
+        // ... and the unchanged file, which the scan never re-chunked, is untouched.
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM project_chunks WHERE id = 10"),
+            1
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM project_chunk_vectors WHERE chunk_id = 10"
+            ),
+            1
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM project_files WHERE rel_path = 'a.md'"
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn an_unchanged_file_is_never_pruned_when_only_another_file_was_rechunked() {
+        let conn = conn();
+        seed_two_file_project(&conn);
+        // a.md was edited (its chunk 0 re-produced); tools/b.py is unchanged and kept whole.
+        let edited = ProjectChunk {
+            doc_path: "/p/alpha/a.md".to_string(),
+            doc_rel_path: "a.md".to_string(),
+            doc_mtime: 0.0,
+            chunk_index: 0,
+            token_count: 1,
+            text_hash: "h10b".to_string(),
+            text: "a zero edited".to_string(),
+            chunk_kind: "text_window".to_string(),
+            symbol_name: String::new(),
+            parent_context: String::new(),
+            line_start: 0,
+            line_end: 0,
+            context_header: String::new(),
+        };
+        let scan = corpus(
+            vec![edited],
+            vec![
+                scanned("a.md", "/p/alpha/a.md", true, 1),
+                scanned("tools/b.py", "/p/alpha/tools/b.py", false, 2),
+            ],
+        );
+        let keep = PruneKeepSet::from_corpus(&scan);
+        let out = prune_stale_project_rows(&conn, 1, &keep, false).expect("prune");
+        assert!(out.is_empty(), "{:?}", out);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM project_chunks"), 3);
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM project_chunk_vectors"),
+            3
+        );
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM symbols"), 2);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM file_imports"), 1);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM project_files"), 2);
+    }
+
+    #[test]
+    fn code_intel_refresh_replaces_rows_even_when_the_extraction_is_empty() {
+        let conn = conn();
+        seed_two_file_project(&conn);
+        let path = Path::new("/p/alpha/tools/b.py");
+        let files = vec!["a.md".to_string(), "tools/b.py".to_string()];
+
+        // Edited down to a docstring: no symbols, no imports. The stale rows must go.
+        let empty = extract_code_intel(
+            code_intel::LanguageId::Python,
+            &path.to_string_lossy(),
+            "tools/b.py",
+            "\"\"\"Kept for old notebooks; defines nothing.\"\"\"\n",
+        );
+        let (symbols, imports) =
+            store_code_intel_extraction(&conn, 1, &empty, Path::new("/p/alpha"), &files)
+                .expect("refresh empty");
+        assert_eq!((symbols, imports), (0, 0));
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM symbols WHERE doc_path = '/p/alpha/tools/b.py'"
+            ),
+            0
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM file_imports WHERE source_doc_path = '/p/alpha/tools/b.py'"
+            ),
+            0
+        );
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM file_dependency_edges WHERE source_doc_path = '/p/alpha/tools/b.py'"),
+            0
+        );
+
+        // Real code populates them again.
+        let real = extract_code_intel(
+            code_intel::LanguageId::Python,
+            &path.to_string_lossy(),
+            "tools/b.py",
+            "import os\n\ndef load(path):\n    return os.path.exists(path)\n",
+        );
+        let (symbols, imports) =
+            store_code_intel_extraction(&conn, 1, &real, Path::new("/p/alpha"), &files)
+                .expect("refresh populated");
+        assert!(symbols >= 1, "symbols={}", symbols);
+        assert!(imports >= 1, "imports={}", imports);
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM symbols WHERE doc_path = '/p/alpha/tools/b.py'"
+            ),
+            symbols as i64
+        );
     }
 }
 
@@ -26402,20 +30866,29 @@ fn load_project_vectors(conn: &Connection) -> Result<HashMap<i64, (Vec<f32>, f64
 /// Load cross-project import relationships from file_dependency_edges.
 /// Returns src_project_id -> { dst_project_id -> import_count }.
 /// This finds cases where files in one project import files in another project.
+///
+/// The target is resolved to an absolute path before the join: a relative target (the
+/// resolver's form) is the source project's path plus that relative path, an absolute one is
+/// taken as is. Joining on the bare relative path matched any project with a file of the
+/// same relative name (`src/util.py` in two unrelated projects) and produced `imports_from`
+/// edges that were not there. The count is edges, not the target's chunk rows.
 fn load_import_cross_project_edges(
     conn: &Connection,
 ) -> Result<HashMap<i64, HashMap<i64, usize>>, String> {
-    // Join file_dependency_edges with project_chunks to find which project
-    // each target file belongs to.
     let mut stmt = conn
         .prepare(
             r#"
-SELECT DISTINCT
+SELECT
     e.project_id AS src_project_id,
     pc.project_id AS dst_project_id,
-    COUNT(*) AS edge_count
+    COUNT(DISTINCT e.source_doc_path || char(10) || e.target_doc_path) AS edge_count
 FROM file_dependency_edges e
-JOIN project_chunks pc ON pc.doc_rel_path = e.target_doc_path
+JOIN projects p ON p.id = e.project_id
+JOIN project_chunks pc
+    ON pc.doc_path = CASE
+        WHEN substr(e.target_doc_path, 1, 1) = '/' THEN e.target_doc_path
+        ELSE p.path || '/' || e.target_doc_path
+    END
     AND pc.project_id != e.project_id
 GROUP BY e.project_id, pc.project_id
 "#,
@@ -26468,6 +30941,16 @@ fn metadata_mtime(meta: &fs::Metadata) -> f64 {
         .unwrap_or(0.0)
 }
 
+/// Modification time as whole nanoseconds since the epoch (0 when unavailable), the exact
+/// value the scan signature hashes.
+fn metadata_mtime_ns(meta: &fs::Metadata) -> i128 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as i128)
+        .unwrap_or(0)
+}
+
 fn file_mtime(path: &Path) -> Option<f64> {
     let meta = fs::metadata(path).ok()?;
     Some(metadata_mtime(&meta))
@@ -26477,12 +30960,25 @@ fn file_mtime(path: &Path) -> Option<f64> {
 /// [`set_extra_skip_dirs`] before any discovery or corpus walk runs.
 static EXTRA_SKIP_DIRS: OnceLock<HashSet<String>> = OnceLock::new();
 
-/// Install the configured `skip_dir_names` so [`is_skip_dir`] honours them everywhere
-/// (add/index/refresh/reembed/watch, API and MCP refresh). The first call in a process wins;
-/// a later call with a different set is ignored, so long-running servers pick up config
-/// changes only on restart.
+/// Install the configured scan hygiene: `skip_dir_names` so [`is_skip_dir`] honours them
+/// everywhere (add/index/refresh/reembed/watch, API and MCP refresh), and `index_documents`
+/// so [`is_indexable_suffix`] admits the document formats. The skip set is first-call-wins in
+/// a process; a later call with a different set is ignored, so long-running servers pick up
+/// config changes only on restart.
 pub(crate) fn set_extra_skip_dirs(cfg: &ConfigValues) {
     let _ = EXTRA_SKIP_DIRS.set(cfg.skip_dir_name_set());
+    set_index_documents(cfg.index_documents);
+}
+
+/// Whether document formats (see [`documents`]) are indexable; `index_documents`, default on.
+static INDEX_DOCUMENTS: AtomicBool = AtomicBool::new(true);
+
+fn set_index_documents(on: bool) {
+    INDEX_DOCUMENTS.store(on, Ordering::SeqCst);
+}
+
+fn index_documents_enabled() -> bool {
+    INDEX_DOCUMENTS.load(Ordering::SeqCst)
 }
 
 fn is_extra_skip_dir(name: &str) -> bool {
@@ -26516,10 +31012,20 @@ fn is_builtin_skip_dir(name: &str) -> bool {
             | "dist"
             | "build"
             | "target"
-    )
+            | "worktrees"
+            | ".worktrees"
+    ) || name.ends_with(".app")
 }
 
+/// Suffixes the indexer reads: the text and code formats always, the document formats when
+/// `index_documents` is on. Lower-case with the dot.
 fn is_indexable_suffix(suffix: &str) -> bool {
+    is_text_indexable_suffix(suffix)
+        || (index_documents_enabled() && documents::is_document_suffix(suffix))
+}
+
+/// Suffixes read as text (or code) without any extraction step.
+fn is_text_indexable_suffix(suffix: &str) -> bool {
     matches!(
         suffix,
         ".md"
@@ -26553,23 +31059,16 @@ fn is_indexable_suffix(suffix: &str) -> bool {
     )
 }
 
-fn is_doc_extension(path: &Path) -> bool {
-    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
-    matches!(
-        ext.to_ascii_lowercase().as_str(),
-        "md" | "markdown"
-            | "txt"
-            | "rst"
-            | "adoc"
-            | "html"
-            | "htm"
-            | "json"
-            | "yaml"
-            | "yml"
-            | "toml"
-            | "cfg"
-            | "ini"
-    )
+/// The order in which a project's files are selected when a cap bites: 1 human documents
+/// (notes and extracted document formats), 2 code, 3 config and data. `suffix` is lower-case
+/// with its dot.
+fn selection_tier(suffix: &str) -> u8 {
+    match suffix {
+        ".md" | ".markdown" | ".txt" | ".rst" | ".adoc" | ".html" | ".htm" => 1,
+        s if documents::is_document_suffix(s) => 1,
+        ".json" | ".yaml" | ".yml" | ".toml" | ".cfg" | ".ini" | ".sql" => 3,
+        _ => 2,
+    }
 }
 
 fn is_graph_stopword(tok: &str) -> bool {
@@ -26612,12 +31111,22 @@ fn jaccard(a: &HashSet<String>, b: &HashSet<String>) -> f64 {
 
 trait Embedder {
     fn model_key(&self) -> String;
+    /// True when the backend is asked to return unit-length vectors. Part of the stored
+    /// embedding identity: a vector produced under one setting is not reused under the other.
+    fn normalizes_output(&self) -> bool {
+        false
+    }
     fn embed_many(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String>;
     fn embed_one(&self, text: &str) -> Result<Vec<f32>, String> {
         let rows = self.embed_many(&[text.to_string()])?;
         rows.into_iter()
             .next()
             .ok_or_else(|| "No embedding returned.".to_string())
+    }
+    /// Embed a search query. Models with asymmetric input types (Cohere) send `search_query`
+    /// here and `search_document` for indexed text; every other model embeds both the same way.
+    fn embed_query(&self, text: &str) -> Result<Vec<f32>, String> {
+        self.embed_one(text)
     }
 }
 
@@ -26950,9 +31459,15 @@ fn build_embedder(cfg: &ConfigValues) -> Result<Box<dyn Embedder>, String> {
             &cfg.embed_model,
             Some(cfg),
         ))),
+        // Offline feature hashing: deterministic, no network, not semantic. For tests and
+        // smoke checks of the indexer, never for real retrieval quality.
+        "hash" => Ok(Box::new(LocalHashEmbedder::new(
+            cfg.local_embed_dim.max(0) as usize
+        ))),
         other => Err(format!(
-            "native index does not support backend '{}' yet; use ollama or bedrock",
-            other
+            "native index does not support backend '{}' yet; use one of {}",
+            other,
+            EMBED_BACKENDS.join(", ")
         )),
     }
 }
@@ -28093,9 +32608,15 @@ impl BedrockEmbedder {
     }
 
     fn request_payload_batch(&self, texts: &[String]) -> Value {
+        self.cohere_payload(texts, "search_document")
+    }
+
+    /// Cohere embed request; `input_type` is `search_document` for indexed text and
+    /// `search_query` for queries (the model embeds the two sides differently).
+    fn cohere_payload(&self, texts: &[String], input_type: &str) -> Value {
         serde_json::json!({
             "texts": texts,
-            "input_type": "search_document",
+            "input_type": input_type,
             "truncate": "END"
         })
     }
@@ -28191,6 +32712,26 @@ impl BedrockEmbedder {
 impl Embedder for BedrockEmbedder {
     fn model_key(&self) -> String {
         bedrock_embedding_space_key(&self.model)
+    }
+
+    fn normalizes_output(&self) -> bool {
+        self.normalize
+    }
+
+    fn embed_query(&self, text: &str) -> Result<Vec<f32>, String> {
+        if !self.is_cohere_model() {
+            return self.embed_one(text);
+        }
+        if let Some(cmd) = &self.refresh_cmd {
+            run_refresh_command_once(cmd)?;
+        }
+        let payload = self.cohere_payload(&[text.to_string()], "search_query");
+        let data = self.invoke_with_retry(&payload)?;
+        let rows = Self::parse_vectors(&data)?;
+        embed_metric_texts(1);
+        rows.into_iter()
+            .next()
+            .ok_or_else(|| "No embedding returned.".to_string())
     }
 
     fn embed_many(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
@@ -28377,8 +32918,13 @@ struct LocalHashEmbedder {
 }
 
 impl LocalHashEmbedder {
+    /// The dimension actually used for a requested one (never below 64).
+    fn effective_dim(dim: usize) -> usize {
+        dim.max(64)
+    }
+
     fn new(dim: usize) -> Self {
-        let use_dim = dim.max(64);
+        let use_dim = Self::effective_dim(dim);
         let groups: &[&[&str]] = &[
             &[
                 "semantic", "meaning", "ontology", "taxonomy", "model", "schema", "layer",
@@ -28407,8 +32953,10 @@ impl LocalHashEmbedder {
         }
     }
 
+    /// `hash:<dim>`, the key `embed_backend = "hash"` stores vectors under (see
+    /// [`hash_model_key`]).
     fn model_key_local(&self) -> String {
-        format!("local-hash-v1:{}", self.dim)
+        format!("hash:{}", self.dim)
     }
 
     fn embed_one_local(&self, text: &str) -> Vec<f32> {
@@ -28466,6 +33014,11 @@ impl Embedder for LocalHashEmbedder {
         self.model_key_local()
     }
 
+    /// Every vector is scaled to unit length before it is returned.
+    fn normalizes_output(&self) -> bool {
+        true
+    }
+
     fn embed_many(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
         let out: Vec<Vec<f32>> = texts.iter().map(|t| self.embed_one_local(t)).collect();
         embed_metric_texts(out.len());
@@ -28475,6 +33028,261 @@ impl Embedder for LocalHashEmbedder {
     fn embed_one(&self, text: &str) -> Result<Vec<f32>, String> {
         embed_metric_texts(1);
         Ok(self.embed_one_local(text))
+    }
+}
+
+#[cfg(test)]
+mod watcher_and_compaction_tests {
+    use super::*;
+
+    #[test]
+    fn watch_filter_drops_noise_before_any_scan() {
+        let is_skip = |name: &str| is_builtin_skip_dir(name) || name == "tmp";
+        let dropped = [
+            "/r/proj/tmp/scratch.md",
+            "/r/proj/.git/index",
+            "/r/proj/.git/refs/heads/main.md",
+            "/r/proj/node_modules/pkg/README.md",
+            "/r/proj/Foo.app/Contents/Resources/notes.md",
+            "/r/proj/worktrees/x/ci/pipeline.yml",
+            "/r/proj/.worktrees/y/a.md",
+            "/r/proj/docs/diagram.png",
+            "/r/proj/.hidden/notes.md",
+            "/r/proj/.DS_Store",
+            "/r/proj/build/out.md",
+            "/r/proj/target/debug/x.rs",
+        ];
+        for p in dropped {
+            assert!(
+                !watch_path_relevant_with(Path::new(p), &is_skip),
+                "{} must not trigger a scan",
+                p
+            );
+        }
+        let kept = [
+            "/r/proj/docs/notes.md",
+            "/r/proj/src/main.rs",
+            "/r/proj/report.docx",
+            "/r/proj/deck.pptx",
+            "/r/proj/newdir",
+            "/r/proj/Makefile",
+        ];
+        for p in kept {
+            assert!(
+                watch_path_relevant_with(Path::new(p), &is_skip),
+                "{} must trigger a scan",
+                p
+            );
+        }
+        // Without `tmp` in the skip set the scratch file is a normal note.
+        assert!(watch_path_relevant_with(
+            Path::new("/r/proj/tmp/scratch.md"),
+            &is_builtin_skip_dir
+        ));
+        let line = watch_scope_line(&IndexScope::Targets {
+            roots: vec![PathBuf::from("/r")],
+            projects: vec![PathBuf::from("/r/proj"), PathBuf::from("/r/other")],
+        });
+        assert!(
+            line.ends_with("watch: changes in r (discovery), proj, other"),
+            "{}",
+            line
+        );
+    }
+
+    #[test]
+    fn events_under_a_root_no_longer_tracked_map_to_nothing() {
+        let base = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tmp")
+            .join(format!("watch-roots-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let root_a = base.join("root-a");
+        let root_b = base.join("root-b");
+        fs::create_dir_all(root_a.join("proj")).unwrap();
+        fs::create_dir_all(root_b.join("other")).unwrap();
+        fs::write(root_a.join("proj").join("notes.md"), "a").unwrap();
+        fs::write(root_b.join("other").join("notes.md"), "b").unwrap();
+        let tracked = |paths: &[&Path]| -> Vec<TrackedRoot> {
+            paths
+                .iter()
+                .map(|p| TrackedRoot {
+                    path: normalize_path(&p.to_string_lossy()),
+                    exclude_patterns: Vec::new(),
+                })
+                .collect()
+        };
+        let mut pending: HashSet<PathBuf> = HashSet::new();
+        pending.insert(root_b.join("other").join("notes.md"));
+
+        // Both roots tracked: the event maps to root-b's project.
+        let (scope, force) = derive_watch_targets(&pending, &tracked(&[&root_a, &root_b]));
+        assert!(!scope.is_empty());
+        assert!(force.iter().any(|p| p.ends_with("other")), "{:?}", force);
+
+        // root-b removed since: the same event maps to nothing, so nothing is re-indexed.
+        let (scope, force) = derive_watch_targets(&pending, &tracked(&[&root_a]));
+        assert!(scope.is_empty(), "{:?}", scope);
+        assert!(force.is_empty());
+
+        // An event under the remaining root still scans its project.
+        pending.insert(root_a.join("proj").join("notes.md"));
+        let (scope, force) = derive_watch_targets(&pending, &tracked(&[&root_a]));
+        assert!(!scope.is_empty());
+        assert_eq!(force.len(), 1);
+        assert!(force.iter().any(|p| p.ends_with("proj")), "{:?}", force);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn compaction_is_due_only_above_the_threshold() {
+        assert!(!lance_compaction_due(0, 200));
+        assert!(!lance_compaction_due(200, 200));
+        assert!(lance_compaction_due(201, 200));
+        assert!(lance_compaction_due(5_000, 200));
+        assert!(!lance_compaction_due(5_000, 0), "0 disables");
+        let mut cfg = ConfigValues::from_map(HashMap::new());
+        assert_eq!(cfg.lance_compact_versions, 200);
+        config_set_value(&mut cfg, "lance_compact_versions", "50").unwrap();
+        assert_eq!(cfg.lance_compact_versions, 50);
+        config_set_value(&mut cfg, "lance_compact_versions", "-4").unwrap();
+        assert_eq!(cfg.lance_compact_versions, 0);
+        assert!(config_set_value(&mut cfg, "lance_compact_versions", "many").is_err());
+    }
+}
+
+#[cfg(test)]
+mod small_fix_tests {
+    use super::*;
+
+    fn conn() -> Connection {
+        let conn = Connection::open_in_memory().expect("open in-memory sqlite");
+        conn.execute_batch("PRAGMA foreign_keys = ON;")
+            .expect("enable foreign keys");
+        init_schema(&conn).expect("init schema");
+        conn
+    }
+
+    #[test]
+    fn cross_project_import_edges_join_on_absolute_paths_not_relative_names() {
+        let conn = conn();
+        conn.execute_batch(
+            r#"
+INSERT INTO projects(id, path, title, summary, project_mtime, last_indexed)
+VALUES (1, '/p/alpha', 'alpha', 'a', 0, 0), (2, '/p/beta', 'beta', 'b', 0, 0);
+INSERT INTO project_chunks(id, project_id, doc_path, doc_rel_path, doc_mtime, chunk_index, token_count, text_hash, text, updated_at)
+VALUES (10, 1, '/p/alpha/main.py', 'main.py', 0, 0, 5, 'h10', 'alpha main', 0),
+       (11, 1, '/p/alpha/src/util.py', 'src/util.py', 0, 0, 5, 'h11', 'alpha util', 0),
+       (20, 2, '/p/beta/src/util.py', 'src/util.py', 0, 0, 5, 'h20', 'beta util zero', 0),
+       (21, 2, '/p/beta/src/util.py', 'src/util.py', 0, 1, 5, 'h21', 'beta util one', 0);
+INSERT INTO file_dependency_edges(project_id, source_doc_path, target_doc_path, edge_kind, updated_at)
+VALUES (1, '/p/alpha/main.py', 'src/util.py', 'imports', 0);
+"#,
+        )
+        .expect("seed");
+        // alpha's main.py imports alpha's own src/util.py: the same relative name exists in
+        // beta, which used to produce a spurious alpha -> beta edge.
+        let edges = load_import_cross_project_edges(&conn).expect("edges");
+        assert!(edges.is_empty(), "{:?}", edges);
+
+        // A target that really lives in another project (absolute form) still counts, once
+        // per edge rather than once per chunk of the target file.
+        conn.execute(
+            "INSERT INTO file_dependency_edges(project_id, source_doc_path, target_doc_path, edge_kind, updated_at) VALUES (1, '/p/alpha/main.py', '/p/beta/src/util.py', 'imports', 0)",
+            [],
+        )
+        .unwrap();
+        let edges = load_import_cross_project_edges(&conn).expect("edges");
+        assert_eq!(
+            edges.get(&1).and_then(|m| m.get(&2)),
+            Some(&1),
+            "{:?}",
+            edges
+        );
+        assert!(edges.get(&2).is_none());
+    }
+
+    #[test]
+    fn cohere_queries_are_sent_as_search_query_and_documents_as_search_document() {
+        let cohere = BedrockEmbedder::new_with_config("cohere.embed-english-v3", None);
+        let docs = cohere.request_payload_batch(&["chunk text".to_string()]);
+        assert_eq!(docs["input_type"], "search_document");
+        let query = cohere.cohere_payload(&["what is the plan".to_string()], "search_query");
+        assert_eq!(query["input_type"], "search_query");
+        assert_eq!(query["texts"][0], "what is the plan");
+        let single = cohere.request_payload("chunk text");
+        assert_eq!(single["input_type"], "search_document");
+        let titan = BedrockEmbedder::new_with_config("amazon.titan-embed-text-v2:0", None);
+        assert!(titan.request_payload("x").get("inputText").is_some());
+        assert!(!titan.is_cohere_model() && cohere.is_cohere_model());
+        // Models without asymmetric inputs embed queries exactly like documents.
+        let hash = LocalHashEmbedder::new(64);
+        assert_eq!(
+            hash.embed_query("otters").unwrap(),
+            hash.embed_one("otters").unwrap()
+        );
+    }
+}
+
+#[cfg(test)]
+mod hash_backend_tests {
+    use super::*;
+
+    #[test]
+    fn hash_backend_is_accepted_offline_and_keyed_by_its_dimension() {
+        let mut map: HashMap<String, String> = HashMap::new();
+        map.insert("embed_backend".into(), "HASH".into());
+        map.insert("local_embed_dim".into(), "10".into());
+        let cfg = ConfigValues::from_map(map);
+        assert_eq!(cfg.embed_backend, "hash");
+        assert_eq!(cfg.embed_model, HASH_BACKEND_MODEL);
+        // The requested 10 dimensions are raised to the embedder's minimum of 64, and the
+        // config-derived key equals the key the embedder reports.
+        assert_eq!(model_key_for_cfg(&cfg), "hash:64");
+        let embedder = build_embedder(&cfg).expect("hash embedder needs no service");
+        assert_eq!(embedder.model_key(), "hash:64");
+        assert!(embedder.normalizes_output());
+        assert!(ensure_native_embed_backend(&cfg, "test").is_ok());
+
+        let a = embedder.embed_one("otter habitat budget").unwrap();
+        let b = embedder.embed_one("otter habitat budget").unwrap();
+        let c = embedder.embed_one("zebra migration checklist").unwrap();
+        assert_eq!(a, b, "deterministic");
+        assert_ne!(a, c);
+        assert_eq!(a.len(), 64);
+        assert!(
+            (vector_norm(&a) - 1.0).abs() < 1e-4,
+            "unit length: {}",
+            vector_norm(&a)
+        );
+        let many = embedder
+            .embed_many(&["x".to_string(), "otter habitat budget".to_string()])
+            .unwrap();
+        assert_eq!(many[1], a);
+
+        // Config plumbing: the setter accepts it, unknown names are rejected, an unknown
+        // backend in a config file falls back to ollama, and the option list shows it.
+        let mut cfg2 = cfg.clone();
+        assert!(config_set_value(&mut cfg2, "embed_backend", "falkor").is_err());
+        config_set_value(&mut cfg2, "embed_backend", "ollama").unwrap();
+        assert_eq!(
+            cfg2.embed_model, "qwen3-embedding",
+            "default model follows the backend"
+        );
+        config_set_value(&mut cfg2, "embed_backend", "Hash").unwrap();
+        assert_eq!(cfg2.embed_backend, "hash");
+        assert_eq!(cfg2.embed_model, HASH_BACKEND_MODEL);
+        let mut bad: HashMap<String, String> = HashMap::new();
+        bad.insert("embed_backend".into(), "falkor".into());
+        assert_eq!(ConfigValues::from_map(bad).embed_backend, "ollama");
+        assert!(config_enum_options("embed_backend")
+            .unwrap()
+            .contains(&"hash"));
+        assert_eq!(default_bench_model_key(&cfg), "hash:64");
+        // Its own embedding space: the same dimension under ollama is a different key.
+        let mut ollama = cfg.clone();
+        ollama.embed_backend = "ollama".into();
+        ollama.embed_model = "test-local".into();
+        assert_ne!(model_key_for_cfg(&ollama), model_key_for_cfg(&cfg));
     }
 }
 
@@ -28551,10 +33359,1598 @@ fn db_path(cwd: &Path) -> PathBuf {
 }
 
 fn data_dir(_cwd: &Path) -> PathBuf {
-    if let Some(path) = CLI_DATA_DIR_OVERRIDE.get() {
-        return path.clone();
+    // Tests never touch the real store: every test that needs a data directory installs one
+    // through `test_support::TestStore`; anything else reaching here is a bug in the test.
+    #[cfg(test)]
+    {
+        test_support::data_dir_for_test()
     }
-    expand_tilde("~/.retrivio")
+    #[cfg(not(test))]
+    {
+        if let Some(path) = CLI_DATA_DIR_OVERRIDE.get() {
+            return path.clone();
+        }
+        expand_tilde("~/.retrivio")
+    }
+}
+
+#[cfg(test)]
+mod test_support {
+    use super::*;
+    use std::cell::RefCell;
+    use std::sync::MutexGuard;
+
+    thread_local! {
+        static DATA_DIR: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+    /// The LanceDB handle is process-global, so tests that run the indexer take turns.
+    static STORE_LOCK: Mutex<()> = Mutex::new(());
+
+    pub(super) fn data_dir_for_test() -> PathBuf {
+        DATA_DIR.with(|d| d.borrow().clone()).unwrap_or_else(|| {
+            panic!(
+                "data_dir() used in a test without a TestStore; tests must never touch ~/.retrivio"
+            )
+        })
+    }
+
+    fn reset_lance_store() {
+        if let Some(lock) = LANCE_STORE.get() {
+            *lock.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        }
+    }
+
+    /// An isolated data directory under `repo/tmp` for one test, installed as this thread's
+    /// data dir for the store's lifetime.
+    pub(super) struct TestStore {
+        pub(super) dir: PathBuf,
+        _guard: MutexGuard<'static, ()>,
+    }
+
+    impl TestStore {
+        pub(super) fn new(name: &str) -> Self {
+            let guard = STORE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tmp")
+                .join(format!("it-{}-{}", name, process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).expect("test data dir");
+            DATA_DIR.with(|d| *d.borrow_mut() = Some(dir.clone()));
+            reset_lance_store();
+            LANCE_WRITE_FAILED.store(false, Ordering::SeqCst);
+            TestStore { dir, _guard: guard }
+        }
+
+        /// A corpus root directory inside the store dir (outside the data files).
+        pub(super) fn corpus_root(&self, name: &str) -> PathBuf {
+            let root = self.dir.join("corpus").join(name);
+            fs::create_dir_all(&root).expect("corpus root");
+            root
+        }
+
+        /// Config for a local, deterministic embedder; `extra` adds or overrides keys.
+        pub(super) fn cfg(&self, root: &Path, extra: &[(&str, &str)]) -> ConfigValues {
+            let mut map: HashMap<String, String> = HashMap::new();
+            map.insert("root".into(), root.to_string_lossy().to_string());
+            map.insert("embed_backend".into(), "ollama".into());
+            map.insert("embed_model".into(), "test-local".into());
+            map.insert("retrieval_backend".into(), "lancedb".into());
+            map.insert("local_embed_dim".into(), "64".into());
+            for (k, v) in extra {
+                map.insert((*k).to_string(), (*v).to_string());
+            }
+            ConfigValues::from_map(map)
+        }
+
+        pub(super) fn conn(&self) -> Connection {
+            open_db_rw(&db_path(&self.dir)).expect("open store")
+        }
+
+        pub(super) fn track(&self, root: &Path) {
+            let conn = self.conn();
+            ensure_tracked_root_conn(&conn, &normalize_path(&root.to_string_lossy()), now_ts())
+                .expect("track root");
+        }
+
+        /// One all-roots run with `remove_missing`, the way `retrivio index` / `refresh` run.
+        pub(super) fn index(
+            &self,
+            cfg: &ConfigValues,
+            embedder: &dyn Embedder,
+            force_all: bool,
+        ) -> Result<IndexStats, String> {
+            let writer = WriterLock::try_acquire(&self.dir).expect("writer lock");
+            run_native_index_with_embedder(
+                &self.dir,
+                cfg,
+                &writer,
+                embedder,
+                IndexScope::AllRoots,
+                force_all,
+                HashSet::new(),
+                true,
+                false,
+                if force_all { "refresh" } else { "index" },
+            )
+        }
+    }
+
+    impl Drop for TestStore {
+        fn drop(&mut self) {
+            reset_lance_store();
+            DATA_DIR.with(|d| *d.borrow_mut() = None);
+        }
+    }
+
+    /// Deterministic local embedder whose model key matches the test config, with a switchable
+    /// normalisation flag and an injectable failure (every call from `fail_from_now` on errors).
+    pub(super) struct TestEmbedder {
+        inner: LocalHashEmbedder,
+        key: String,
+        normalized: bool,
+        calls: AtomicUsize,
+        fail_from_call: AtomicUsize,
+        texts: Mutex<Vec<String>>,
+    }
+
+    impl TestEmbedder {
+        pub(super) fn new(cfg: &ConfigValues, normalized: bool) -> Self {
+            TestEmbedder {
+                inner: LocalHashEmbedder::new(cfg.local_embed_dim as usize),
+                key: model_key_for_cfg(cfg),
+                normalized,
+                calls: AtomicUsize::new(0),
+                fail_from_call: AtomicUsize::new(usize::MAX),
+                texts: Mutex::new(Vec::new()),
+            }
+        }
+
+        pub(super) fn fail_from_now(&self) {
+            self.fail_from_call
+                .store(self.calls.load(Ordering::SeqCst), Ordering::SeqCst);
+        }
+
+        pub(super) fn heal(&self) {
+            self.fail_from_call.store(usize::MAX, Ordering::SeqCst);
+        }
+
+        /// Every text embedded so far, in order.
+        pub(super) fn embedded_texts(&self) -> Vec<String> {
+            self.texts.lock().unwrap_or_else(|p| p.into_inner()).clone()
+        }
+
+        fn account(&self, texts: &[String]) -> Result<(), String> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if n >= self.fail_from_call.load(Ordering::SeqCst) {
+                return Err("injected embedder failure".to_string());
+            }
+            self.texts
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .extend(texts.iter().cloned());
+            Ok(())
+        }
+    }
+
+    impl Embedder for TestEmbedder {
+        fn model_key(&self) -> String {
+            self.key.clone()
+        }
+
+        fn normalizes_output(&self) -> bool {
+            self.normalized
+        }
+
+        fn embed_many(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+            self.account(texts)?;
+            Ok(texts
+                .iter()
+                .map(|t| self.inner.embed_one_local(t))
+                .collect())
+        }
+    }
+
+    pub(super) fn set_mtime(path: &Path, when: SystemTime) {
+        let f = OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("open for mtime");
+        f.set_modified(when).expect("set mtime");
+    }
+
+    pub(super) fn count(conn: &Connection, sql: &str) -> i64 {
+        conn.query_row(sql, [], |row| row.get(0)).expect(sql)
+    }
+
+    pub(super) fn project_row(conn: &Connection, path: &Path) -> ExistingProject {
+        get_project_by_path(
+            conn,
+            &normalize_path(&path.to_string_lossy()).to_string_lossy(),
+        )
+        .expect("project query")
+        .expect("project row")
+    }
+}
+
+#[cfg(test)]
+mod index_run_tests {
+    use super::test_support::*;
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn write(path: &Path, text: &str) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("mkdir");
+        }
+        fs::write(path, text).expect("write");
+    }
+
+    fn two_project_root(store: &TestStore, name: &str) -> PathBuf {
+        let root = store.corpus_root(name);
+        write(
+            &root.join("alpha").join("a.md"),
+            "alpha one talks about storage layers",
+        );
+        write(
+            &root.join("alpha").join("b.md"),
+            "alpha two talks about api endpoints",
+        );
+        write(
+            &root.join("beta").join("notes.md"),
+            "beta notes on authentication",
+        );
+        root
+    }
+
+    /// Every chunk row has a vector, and every vector's `embed_input_hash` is the hash of the
+    /// exact embedder input of the text the row holds now.
+    fn assert_vectors_match_their_chunk_text(conn: &Connection, expected_rows: usize) {
+        let without_vector = count(
+            conn,
+            "SELECT COUNT(*) FROM project_chunks c LEFT JOIN project_chunk_vectors v ON v.chunk_id = c.id WHERE v.chunk_id IS NULL",
+        );
+        assert_eq!(without_vector, 0, "every chunk has a vector");
+        let mut stmt = conn
+            .prepare("SELECT c.context_header, c.text, v.embed_input_hash FROM project_chunks c JOIN project_chunk_vectors v ON v.chunk_id = c.id")
+            .unwrap();
+        let rows: Vec<(String, String, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(rows.len(), expected_rows);
+        for (header, text, hash) in rows {
+            assert_eq!(hash, embed_input_hash(&embed_input_for(&header, &text)));
+        }
+    }
+
+    fn chunk_rows_for(conn: &Connection, rel: &str) -> (i64, i64) {
+        let chunks = count(
+            conn,
+            &format!(
+                "SELECT COUNT(*) FROM project_chunks WHERE doc_rel_path = '{}'",
+                rel
+            ),
+        );
+        let vectors = count(
+            conn,
+            &format!(
+                "SELECT COUNT(*) FROM project_chunk_vectors v JOIN project_chunks c ON c.id = v.chunk_id WHERE c.doc_rel_path = '{}'",
+                rel
+            ),
+        );
+        (chunks, vectors)
+    }
+
+    #[test]
+    fn a_failed_embedding_keeps_the_old_signature_deletes_nothing_and_is_retried_next_run() {
+        let store = TestStore::new("fail-embed");
+        let root = two_project_root(&store, "root");
+        store.track(&root);
+        let cfg = store.cfg(&root, &[]);
+        let embedder = TestEmbedder::new(&cfg, false);
+
+        let first = store.index(&cfg, &embedder, false).expect("first run");
+        assert_eq!(first.updated_projects, 2);
+        assert_eq!(first.chunks_embedded, 3);
+        let conn = store.conn();
+        let alpha_before = project_row(&conn, &root.join("alpha"));
+        assert!(alpha_before.scan_signature.starts_with("2:"));
+        assert!(!alpha_before.index_in_progress);
+
+        // Edit one file, add another, and make the embedder fail.
+        write(
+            &root.join("alpha").join("b.md"),
+            "alpha two rewritten about ui and frontend",
+        );
+        write(
+            &root.join("alpha").join("c.md"),
+            "alpha three brand new file",
+        );
+        embedder.fail_from_now();
+        // The run completes with the failure recorded (a non-zero exit for the CLI): alpha is
+        // counted failed, the embedding outage stops the run, nothing else is touched.
+        let failed_run = store
+            .index(&cfg, &embedder, false)
+            .expect("the run reports the failure instead of aborting");
+        assert_eq!(failed_run.projects_failed, 1);
+        assert_eq!(failed_run.updated_projects, 0);
+        assert!(
+            failed_run.failures[0].contains("injected embedder failure"),
+            "{:?}",
+            failed_run.failures
+        );
+        assert!(
+            failed_run.stopped.contains("embedding failed"),
+            "{}",
+            failed_run.stopped
+        );
+        let verdict = index_run_verdict(&failed_run).expect_err("non-zero exit");
+        assert!(verdict.contains("1 project(s) failed"), "{}", verdict);
+
+        // The project looks exactly as before to the gate, plus the in-progress marker; the
+        // unchanged file lost nothing. Chunk rows commit with their vectors, so the failed
+        // batch left no row at all: c.md has none, b.md still holds its old text with the
+        // vector made from that text, and no row anywhere lacks a matching vector.
+        let alpha_failed = project_row(&conn, &root.join("alpha"));
+        assert_eq!(alpha_failed.scan_signature, alpha_before.scan_signature);
+        assert_eq!(alpha_failed.summary, alpha_before.summary);
+        assert!(alpha_failed.index_in_progress);
+        assert_eq!(chunk_rows_for(&conn, "a.md"), (1, 1));
+        assert_eq!(chunk_rows_for(&conn, "notes.md"), (1, 1));
+        assert_eq!(chunk_rows_for(&conn, "b.md"), (1, 1));
+        assert_eq!(
+            chunk_rows_for(&conn, "c.md"),
+            (0, 0),
+            "no row without its vector"
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM project_chunks WHERE doc_rel_path = 'b.md' AND text LIKE '%api endpoints%'"
+            ),
+            1,
+            "the old text stays until its new vector exists"
+        );
+        assert_vectors_match_their_chunk_text(&conn, 3);
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM project_files"),
+            3,
+            "the manifest was not written for the failed project"
+        );
+
+        // Next run: the project is rescanned, only the two changed chunks are embedded, the
+        // unchanged one is reused, and the signature moves.
+        embedder.heal();
+        let third = store.index(&cfg, &embedder, false).expect("third run");
+        assert_eq!(third.updated_projects, 1, "alpha only; beta is skipped");
+        assert_eq!(third.skipped_projects, 1);
+        assert_eq!(third.chunks_embedded, 2);
+        assert_eq!(third.chunks_reused, 1);
+        assert_eq!(third.chunks_deleted, 0);
+        let alpha_after = project_row(&conn, &root.join("alpha"));
+        assert_ne!(alpha_after.scan_signature, alpha_before.scan_signature);
+        assert!(alpha_after.scan_signature.starts_with("3:"));
+        assert!(!alpha_after.index_in_progress);
+        assert_eq!(chunk_rows_for(&conn, "c.md"), (1, 1));
+        assert_vectors_match_their_chunk_text(&conn, 4);
+
+        let fourth = store.index(&cfg, &embedder, false).expect("steady state");
+        assert_eq!(fourth.skipped_projects, 2);
+        assert_eq!(fourth.chunks_embedded, 0);
+    }
+
+    #[test]
+    fn an_unreadable_subdirectory_prunes_nothing_and_is_counted() {
+        let store = TestStore::new("unreadable");
+        let root = store.corpus_root("root");
+        write(&root.join("alpha").join("a.md"), "alpha top level file");
+        write(
+            &root.join("alpha").join("sub").join("b.md"),
+            "alpha nested file",
+        );
+        write(&root.join("beta").join("notes.md"), "beta notes");
+        store.track(&root);
+        let cfg = store.cfg(&root, &[]);
+        let embedder = TestEmbedder::new(&cfg, false);
+        let first = store.index(&cfg, &embedder, false).expect("first run");
+        assert_eq!(first.chunks_embedded, 3);
+        assert_eq!(first.files_unreadable, 0);
+        let conn = store.conn();
+        let alpha_before = project_row(&conn, &root.join("alpha"));
+
+        let sub = root.join("alpha").join("sub");
+        fs::set_permissions(&sub, fs::Permissions::from_mode(0o000)).expect("chmod 000");
+        if fs::read_dir(&sub).is_ok() {
+            // Running as root: permissions do not bite; nothing to test here.
+            fs::set_permissions(&sub, fs::Permissions::from_mode(0o755)).expect("restore");
+            return;
+        }
+        let second = store.index(&cfg, &embedder, false);
+        fs::set_permissions(&sub, fs::Permissions::from_mode(0o755)).expect("restore");
+        let second = second.expect("second run");
+        assert_eq!(
+            second.updated_projects, 1,
+            "alpha's signature changed (sub/b.md unseen)"
+        );
+        assert_eq!(second.files_unreadable, 1);
+        assert_eq!(second.projects_incomplete, 1);
+        assert_eq!(second.files_selected, 1);
+        assert_eq!(second.chunks_deleted, 0);
+        assert_eq!(second.pruned_chunks, 0);
+        assert_eq!(
+            chunk_rows_for(&conn, "sub/b.md"),
+            (1, 1),
+            "the hidden file kept its rows"
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM project_files WHERE rel_path = 'sub/b.md'"
+            ),
+            1
+        );
+        let alpha_incomplete = project_row(&conn, &root.join("alpha"));
+        assert_eq!(
+            alpha_incomplete.scan_signature, alpha_before.scan_signature,
+            "an incomplete scan never advances the signature"
+        );
+        assert_eq!(
+            alpha_incomplete.summary, alpha_before.summary,
+            "and keeps the stored summary"
+        );
+        assert!(!alpha_incomplete.index_in_progress);
+
+        // Readable again: the on-disk signature equals the stored one, so nothing happens.
+        let third = store.index(&cfg, &embedder, false).expect("third run");
+        assert_eq!(third.skipped_projects, 2);
+        assert_eq!(third.files_unreadable, 0);
+    }
+
+    #[test]
+    fn projects_under_an_unavailable_root_survive_an_all_roots_index() {
+        let store = TestStore::new("root-gone");
+        let root_a = two_project_root(&store, "root-a");
+        let root_b = store.corpus_root("root-b");
+        write(
+            &root_b.join("gamma").join("g.md"),
+            "gamma on a volume that comes and goes",
+        );
+        write(
+            &root_b.join("delta").join("d.md"),
+            "delta on the same volume",
+        );
+        store.track(&root_a);
+        store.track(&root_b);
+        let cfg = store.cfg(&root_a, &[]);
+        let embedder = TestEmbedder::new(&cfg, false);
+        let first = store.index(&cfg, &embedder, false).expect("first run");
+        assert_eq!(first.tracked_roots, 2);
+        assert_eq!(first.updated_projects, 4);
+
+        // The whole root disappears (unmounted volume): its projects must not be removed.
+        fs::remove_dir_all(&root_b).expect("remove root b");
+        let second = store.index(&cfg, &embedder, false).expect("second run");
+        assert_eq!(second.removed_projects, 0);
+        assert_eq!(second.chunks_deleted, 0);
+        let conn = store.conn();
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM projects"), 4);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM project_chunks"), 5);
+
+        // A project directory that vanished under an available root is removed as before.
+        fs::remove_dir_all(root_a.join("beta")).expect("remove beta");
+        let third = store.index(&cfg, &embedder, false).expect("third run");
+        assert_eq!(third.removed_projects, 1);
+        assert_eq!(third.chunks_deleted, 1);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM projects"), 3);
+    }
+
+    #[test]
+    fn root_level_files_form_a_root_files_project_that_vanishes_with_them() {
+        let store = TestStore::new("rootfiles");
+        let root = two_project_root(&store, "root");
+        write(
+            &root.join("loose-notes.md"),
+            "loose notes about giraffe enclosure budgets",
+        );
+        write(&root.join("todo.txt"), "buy hay for the giraffes");
+        write(&root.join("logo.png"), "not indexable");
+        store.track(&root);
+        let cfg = store.cfg(&root, &[]);
+        let embedder = TestEmbedder::new(&cfg, false);
+        let root_norm = normalize_path(&root.to_string_lossy());
+        let base = root_norm.file_name().unwrap().to_string_lossy().to_string();
+
+        let first = store.index(&cfg, &embedder, false).expect("first run");
+        assert_eq!(
+            first.total_projects, 3,
+            "alpha, beta and the root's own files"
+        );
+        assert_eq!(first.files_selected, 5);
+        assert_eq!(first.chunks_embedded, 5);
+        let conn = store.conn();
+        let row = project_row(&conn, &root);
+        assert_eq!(
+            row.title,
+            format!("{} (root files)", base.replace('-', " "))
+        );
+        assert!(
+            row.summary
+                .starts_with(&format!("project {} (root files)\nindexed_files 2\n", base)),
+            "{}",
+            row.summary
+        );
+        let rels = |conn: &Connection, project_id: i64| -> Vec<String> {
+            let mut stmt = conn
+                .prepare("SELECT doc_rel_path FROM project_chunks WHERE project_id = ?1 ORDER BY doc_rel_path")
+                .unwrap();
+            stmt.query_map(params![project_id], |r| r.get::<_, String>(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(rels(&conn, row.id), vec!["loose-notes.md", "todo.txt"]);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM project_chunks"), 5);
+        let second = store.index(&cfg, &embedder, false).expect("second run");
+        assert_eq!(second.skipped_projects, 3);
+
+        // The watcher: a loose file maps to the root-files project; a file in a new directory
+        // under the root maps to root discovery.
+        let tracked = vec![TrackedRoot {
+            path: root_norm.clone(),
+            exclude_patterns: Vec::new(),
+        }];
+        let pending: HashSet<PathBuf> = [root_norm.join("loose-notes.md")].into_iter().collect();
+        let (scope, force) = derive_watch_targets(&pending, &tracked);
+        assert_eq!(scope, IndexScope::projects(vec![root_norm.clone()]));
+        assert!(force.contains(&root_norm));
+        let pending: HashSet<PathBuf> = [root_norm.join("gamma").join("new.md")]
+            .into_iter()
+            .collect();
+        let (scope, _) = derive_watch_targets(&pending, &tracked);
+        assert_eq!(scope, IndexScope::roots(vec![root_norm.clone()]));
+        let pending: HashSet<PathBuf> =
+            [root_norm.join("alpha").join("a.md")].into_iter().collect();
+        let (scope, _) = derive_watch_targets(&pending, &tracked);
+        assert_eq!(scope, IndexScope::projects(vec![root_norm.join("alpha")]));
+        // A scoped run naming the root-files project scans it shallow.
+        let targets =
+            resolve_index_targets(&conn, &cfg, &IndexScope::projects(vec![root_norm.clone()]))
+                .expect("resolve");
+        assert_eq!(targets.projects, vec![root_norm.clone()]);
+        assert!(targets.shallow.contains(&root_norm));
+        let targets = resolve_index_targets(&conn, &cfg, &IndexScope::AllRoots).expect("resolve");
+        assert_eq!(targets.projects.len(), 3);
+        assert!(targets.shallow.contains(&root_norm));
+        assert!(!targets.shallow.contains(&root_norm.join("alpha")));
+
+        // One loose file deleted: its rows go; the last one deleted: the project goes.
+        fs::remove_file(root.join("todo.txt")).expect("rm todo");
+        let third = store.index(&cfg, &embedder, false).expect("third run");
+        assert_eq!(third.updated_projects, 1);
+        assert_eq!(third.chunks_deleted, 1);
+        assert_eq!(third.removed_projects, 0);
+        assert_eq!(rels(&conn, row.id), vec!["loose-notes.md"]);
+        fs::remove_file(root.join("loose-notes.md")).expect("rm notes");
+        let fourth = store.index(&cfg, &embedder, false).expect("fourth run");
+        assert_eq!(fourth.total_projects, 2);
+        assert_eq!(fourth.removed_projects, 1);
+        assert_eq!(fourth.chunks_deleted, 1);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM projects"), 2);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM project_chunks"), 3);
+        assert!(get_project_by_path(&conn, &root_norm.to_string_lossy())
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn the_chunk_cap_evicts_config_and_data_files_before_code_and_notes() {
+        let store = TestStore::new("tiercap");
+        let root = store.corpus_root("root");
+        let project = root.join("orion");
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        write(
+            &project.join("HANDOFF-2026-06-01.md"),
+            "june handoff: the demo needs the bedrock region fixed",
+        );
+        write(
+            &project.join("tools").join("helper.py"),
+            "def helper():\n    return 1\n",
+        );
+        write(
+            &project.join("ci").join("pipeline.yml"),
+            "stages:\n  - build\n  - test\n",
+        );
+        write(
+            &project.join("ci").join("deploy.yml"),
+            "stages:\n  - deploy\n",
+        );
+        write(&root.join("beta").join("notes.md"), "beta notes");
+        // The config files are the newest: the old docs-first order counted .yml as documents
+        // and would have kept them over the handoff.
+        set_mtime(&project.join("HANDOFF-2026-06-01.md"), t0);
+        set_mtime(
+            &project.join("tools").join("helper.py"),
+            t0 + Duration::from_secs(10),
+        );
+        set_mtime(
+            &project.join("ci").join("pipeline.yml"),
+            t0 + Duration::from_secs(100),
+        );
+        set_mtime(
+            &project.join("ci").join("deploy.yml"),
+            t0 + Duration::from_secs(200),
+        );
+        store.track(&root);
+
+        // Learn how many chunks the notes and the code produce, then cap exactly there.
+        let wide = ScanCaps::default();
+        let full = collect_project_corpus(
+            &project,
+            &project_scan(&project, &HashSet::new(), &wide, false),
+            &wide,
+            100_000,
+            &FileManifest::new(),
+            true,
+        );
+        let kept: i64 = full
+            .files
+            .iter()
+            .filter(|f| !f.rel_path.ends_with(".yml"))
+            .map(|f| f.chunk_count)
+            .sum();
+        assert!(kept >= 2, "{:?}", full.files);
+        let cap = kept.to_string();
+        let cfg = store.cfg(&root, &[("max_chunks_per_project", cap.as_str())]);
+        let caps = ScanCaps::from_cfg(&cfg);
+        assert_eq!(caps.max_chunks_per_project as i64, kept);
+        let capped = collect_project_corpus(
+            &project,
+            &project_scan(&project, &HashSet::new(), &caps, false),
+            &caps,
+            100_000,
+            &FileManifest::new(),
+            true,
+        );
+        assert_eq!(
+            capped.caps_note,
+            format!("2 files not indexed (max_chunks_per_project={})", kept)
+        );
+        assert_eq!(capped.files_evicted_by_cap, 2);
+        let kept_rels: Vec<&str> = capped.files.iter().map(|f| f.rel_path.as_str()).collect();
+        assert!(
+            kept_rels.contains(&"HANDOFF-2026-06-01.md"),
+            "{:?}",
+            kept_rels
+        );
+        assert!(kept_rels.contains(&"tools/helper.py"), "{:?}", kept_rels);
+        assert!(
+            kept_rels.iter().all(|r| !r.ends_with(".yml")),
+            "{:?}",
+            kept_rels
+        );
+
+        // Index everything under the default caps first, then tighten: the cap change alone
+        // (no file changed) must make the next incremental run prune the config files.
+        let embedder = TestEmbedder::new(&cfg, false);
+        let uncapped = store.cfg(&root, &[]);
+        let zero = store
+            .index(&uncapped, &embedder, false)
+            .expect("uncapped run");
+        assert_eq!(zero.files_evicted_by_cap, 0);
+        let conn = store.conn();
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM project_chunks WHERE doc_rel_path LIKE '%.yml'"
+            ),
+            2
+        );
+        assert_eq!(
+            app_state_get(&conn, APP_STATE_SCAN_CAPS_FINGERPRINT).unwrap(),
+            Some(ScanCaps::default().fingerprint())
+        );
+        let first = store
+            .index(&cfg, &embedder, false)
+            .expect("first capped run");
+        assert_eq!(
+            first.skipped_projects, 0,
+            "a cap change revisits every project"
+        );
+        assert_eq!(first.files_evicted_by_cap, 2);
+        assert_eq!(first.files_truncated_by_cap, 0);
+        assert_eq!(first.chunks_deleted, 2, "the two .yml files' chunks");
+        assert_eq!(first.chunks_embedded, 0);
+        assert_eq!(
+            app_state_get(&conn, APP_STATE_SCAN_CAPS_FINGERPRINT).unwrap(),
+            Some(caps.fingerprint())
+        );
+        let manifest = |conn: &Connection| -> Vec<String> {
+            let mut stmt = conn
+                .prepare("SELECT rel_path FROM project_files WHERE project_id = (SELECT id FROM projects WHERE path LIKE '%/orion') ORDER BY rel_path")
+                .unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(
+            manifest(&conn),
+            vec!["HANDOFF-2026-06-01.md", "tools/helper.py"]
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM project_chunks WHERE doc_rel_path LIKE '%.yml'"
+            ),
+            0
+        );
+
+        // Same cap again: the gate skips, nothing is deleted; a forced run evicts the same two
+        // files and deletes and embeds nothing.
+        let second = store.index(&cfg, &embedder, false).expect("second run");
+        assert_eq!(second.skipped_projects, 2);
+        assert_eq!(second.chunks_deleted, 0);
+        assert_eq!(
+            second.files_evicted_by_cap, 0,
+            "a skipped project reports nothing"
+        );
+        let forced = store.index(&cfg, &embedder, true).expect("forced run");
+        assert_eq!(forced.files_evicted_by_cap, 2);
+        assert_eq!(forced.chunks_deleted, 0);
+        assert_eq!(forced.chunks_embedded, 0);
+        assert_eq!(
+            manifest(&conn),
+            vec!["HANDOFF-2026-06-01.md", "tools/helper.py"]
+        );
+    }
+
+    fn write_bytes(path: &Path, bytes: &[u8]) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("mkdir");
+        }
+        fs::write(path, bytes).expect("write bytes");
+    }
+
+    fn chunks_containing(conn: &Connection, needle: &str) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM project_chunks WHERE instr(text, ?1) > 0",
+            params![needle],
+            |r| r.get(0),
+        )
+        .expect("count chunks by text")
+    }
+
+    #[test]
+    fn documents_are_extracted_once_and_failures_are_counted_without_aborting_the_project() {
+        use super::documents::fixtures;
+        let store = TestStore::new("documents");
+        let root = store.corpus_root("root");
+        let project = root.join("docs");
+        write(
+            &project.join("readme.md"),
+            "plain notes about the giraffe project",
+        );
+        write_bytes(
+            &project.join("report.docx"),
+            &fixtures::docx(
+                &[
+                    "Giraffe enclosure budget approved by the board.",
+                    "Second paragraph.",
+                ],
+                Some("Budget Report"),
+            ),
+        );
+        write_bytes(
+            &project.join("deck.pptx"),
+            &fixtures::pptx(
+                &[&["Welcome slide"], &["Agenda slide"]],
+                &[Some("Speaker note about the okapi fence contractor"), None],
+            ),
+        );
+        write_bytes(
+            &project.join("book.xlsx"),
+            &fixtures::xlsx(&[("Costs", &[&["Item", "Cost"][..], &["Fence", "1200"][..]])]),
+        );
+        write_bytes(
+            &project.join("page.html"),
+            b"<html><head><title>Otter Page</title><style>p{color:red}</style>\
+<script>var hidden = 'scriptonly';</script></head>\
+<body><h1>Otter habitat plan</h1><p>The pond needs a filter.</p></body></html>",
+        );
+        write_bytes(
+            &project.join("notes.pdf"),
+            &fixtures::pdf(&[&["Pangolin transport checklist"]]),
+        );
+        write_bytes(
+            &project.join("corrupt.pptx"),
+            b"PK\x03\x04 definitely not a zip archive",
+        );
+        write_bytes(&project.join("big.docx"), &vec![b'x'; 60_000]);
+        write(&root.join("beta").join("notes.md"), "beta notes");
+        store.track(&root);
+        let cfg = store.cfg(&root, &[("max_document_bytes", "50000")]);
+        assert_eq!(ScanCaps::from_cfg(&cfg).max_document_bytes, 50_000);
+        let embedder = TestEmbedder::new(&cfg, false);
+
+        let first = store.index(&cfg, &embedder, false).expect("first run");
+        assert_eq!(first.updated_projects, 2);
+        assert_eq!(
+            first.files_selected, 7,
+            "6 in docs + beta; the two never-indexed documents that failed are absent"
+        );
+        assert_eq!(first.documents_extracted, 5, "docx, pptx, xlsx, html, pdf");
+        assert_eq!(
+            first.documents_failed, 2,
+            "corrupt zip and over the size cap"
+        );
+        assert_eq!(first.projects_failed, 0);
+        let conn = store.conn();
+        assert!(
+            chunks_containing(&conn, "okapi fence contractor") >= 1,
+            "pptx notes"
+        );
+        assert!(
+            chunks_containing(&conn, "Giraffe enclosure budget approved") >= 1,
+            "docx"
+        );
+        assert!(chunks_containing(&conn, "Budget Report") >= 1, "docx title");
+        assert!(
+            chunks_containing(&conn, "Otter habitat plan") >= 1,
+            "html as text"
+        );
+        assert_eq!(chunks_containing(&conn, "scriptonly"), 0, "script dropped");
+        assert_eq!(chunks_containing(&conn, "<style>"), 0, "markup dropped");
+        assert!(
+            chunks_containing(&conn, "Pangolin transport checklist") >= 1,
+            "pdf"
+        );
+        assert!(
+            chunks_containing(&conn, "Fence 1200") >= 1,
+            "xlsx row (the tab collapses to a space like all prose whitespace)"
+        );
+        let manifest = |rel: &str| -> Option<(i64, String, f64)> {
+            conn.query_row(
+                "SELECT chunk_count, content_hash, file_mtime FROM project_files WHERE rel_path = ?1",
+                params![rel],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()
+            .expect("manifest query")
+        };
+        // Never indexed and failed: absent (no manifest row, nothing to lose).
+        assert_eq!(manifest("corrupt.pptx"), None);
+        assert_eq!(manifest("big.docx"), None);
+        assert!(manifest("deck.pptx").expect("deck row").0 >= 1);
+        let row = project_row(&conn, &project);
+        assert!(
+            row.summary.contains("readme.md\nplain notes"),
+            "{}",
+            row.summary
+        );
+        assert!(
+            !row.summary.contains("PK"),
+            "no document bytes in the summary"
+        );
+
+        // Nothing changed: skipped, nothing extracted.
+        let second = store.index(&cfg, &embedder, false).expect("second run");
+        assert_eq!(second.skipped_projects, 2);
+        assert_eq!(second.documents_extracted, 0);
+        assert_eq!(second.documents_failed, 0);
+
+        // A touched document (new stat, same bytes) is neither re-extracted nor re-embedded.
+        set_mtime(
+            &project.join("report.docx"),
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_600_000_000),
+        );
+        let third = store.index(&cfg, &embedder, false).expect("third run");
+        assert_eq!(third.updated_projects, 1);
+        assert_eq!(third.files_rechunked, 0);
+        assert_eq!(third.documents_extracted, 0);
+        assert_eq!(third.chunks_embedded, 0);
+        assert_eq!(
+            third.vectorized_projects, 0,
+            "the summary does not quote documents"
+        );
+
+        // An edited document is extracted and embedded again; its old text is gone.
+        write_bytes(
+            &project.join("report.docx"),
+            &fixtures::docx(
+                &["Giraffe enclosure budget rejected; revise by June."],
+                None,
+            ),
+        );
+        let fourth = store.index(&cfg, &embedder, false).expect("fourth run");
+        assert_eq!(fourth.files_rechunked, 1);
+        assert_eq!(fourth.documents_extracted, 1);
+        assert!(fourth.chunks_embedded >= 1);
+        assert!(chunks_containing(&conn, "budget rejected") >= 1);
+        assert_eq!(chunks_containing(&conn, "budget approved"), 0);
+
+        // A repaired file stops failing.
+        write_bytes(
+            &project.join("corrupt.pptx"),
+            &fixtures::pptx(&[&["Fixed deck"]], &[None]),
+        );
+        let fifth = store.index(&cfg, &embedder, false).expect("fifth run");
+        assert_eq!(fifth.documents_extracted, 1);
+        assert_eq!(
+            fifth.documents_failed, 1,
+            "big.docx was never indexed, so every rescan of the project refuses it again"
+        );
+        assert!(manifest("corrupt.pptx").expect("repaired row").0 >= 1);
+        assert_eq!(manifest("big.docx"), None);
+
+        // A previously indexed document that becomes unparseable keeps everything it had:
+        // chunks, vectors and manifest row (with the old hash and stat, so it is retried on
+        // the next full revisit), while the project itself stays complete: its signature
+        // advances and the gate skips it next run. Only the failure counter and warning say
+        // anything happened.
+        let report_before = manifest("report.docx").expect("report row");
+        let report_rows = chunk_rows_for(&conn, "report.docx");
+        assert!(report_rows.0 >= 1 && report_rows.0 == report_rows.1);
+        write_bytes(
+            &project.join("report.docx"),
+            b"PK\x03\x04 the document got corrupted on disk",
+        );
+        let sixth = store.index(&cfg, &embedder, false).expect("sixth run");
+        assert_eq!(sixth.updated_projects, 1);
+        assert_eq!(
+            sixth.documents_failed, 2,
+            "report.docx now, big.docx as always"
+        );
+        assert_eq!(sixth.documents_extracted, 0);
+        assert_eq!(sixth.chunks_deleted, 0);
+        assert_eq!(sixth.chunks_embedded, 0);
+        assert_eq!(sixth.projects_incomplete, 0, "the project is complete");
+        assert_eq!(
+            sixth.files_selected, 7,
+            "docs only (beta is skipped): the carried report.docx counts, big.docx is absent"
+        );
+        assert_eq!(
+            sixth.files_unchanged, 7,
+            "report.docx is carried as unchanged"
+        );
+        assert_eq!(chunk_rows_for(&conn, "report.docx"), report_rows);
+        assert!(
+            chunks_containing(&conn, "budget rejected") >= 1,
+            "old text kept"
+        );
+        assert_eq!(
+            manifest("report.docx"),
+            Some(report_before.clone()),
+            "manifest entry not advanced"
+        );
+        let docs_row = project_row(&conn, &project);
+        assert!(!docs_row.index_in_progress);
+        let seventh = store.index(&cfg, &embedder, false).expect("seventh run");
+        assert_eq!(
+            seventh.skipped_projects, 2,
+            "signature published; not retried"
+        );
+        assert_eq!(seventh.documents_failed, 0);
+        // A forced revisit reports the failures again and still keeps the old content.
+        let forced = store.index(&cfg, &embedder, true).expect("forced run");
+        assert_eq!(forced.documents_failed, 2);
+        assert_eq!(forced.chunks_deleted, 0);
+        assert_eq!(chunk_rows_for(&conn, "report.docx"), report_rows);
+        assert_eq!(manifest("report.docx"), Some(report_before));
+    }
+
+    #[test]
+    fn with_index_documents_off_documents_are_not_selected_and_html_stays_raw() {
+        use super::documents::fixtures;
+        let store = TestStore::new("documents-off");
+        // The toggle is process-wide; the store lock serialises the indexing tests, and the
+        // walk-level tests with document suffixes all hold it.
+        set_index_documents(false);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert!(!is_indexable_suffix(".docx"));
+            assert!(is_indexable_suffix(".html"));
+            let root = store.corpus_root("root");
+            let project = root.join("docs");
+            write(&project.join("readme.md"), "plain notes");
+            write_bytes(
+                &project.join("report.docx"),
+                &fixtures::docx(&["Giraffe enclosure budget"], None),
+            );
+            write_bytes(
+                &project.join("page.html"),
+                b"<html><body><script>var hidden = 'scriptonly';</script><p>Otter plan</p></body></html>",
+            );
+            store.track(&root);
+            let cfg = store.cfg(&root, &[("index_documents", "false")]);
+            assert!(!cfg.index_documents);
+            let embedder = TestEmbedder::new(&cfg, false);
+            let stats = store.index(&cfg, &embedder, false).expect("run");
+            assert_eq!(stats.files_selected, 2, "readme and html only");
+            assert_eq!(stats.documents_extracted, 0);
+            assert_eq!(stats.documents_failed, 0);
+            let conn = store.conn();
+            assert_eq!(chunks_containing(&conn, "Giraffe"), 0);
+            assert!(
+                chunks_containing(&conn, "<script>") >= 1,
+                "raw markup, as before"
+            );
+        }));
+        set_index_documents(true);
+        assert!(is_indexable_suffix(".docx"));
+        outcome.unwrap();
+    }
+
+    #[test]
+    fn caps_evict_deterministically_and_report_it() {
+        let store = TestStore::new("caps");
+        let root = store.corpus_root("root");
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        for (name, text) in [
+            ("a.md", "alpha first file"),
+            ("b.md", "alpha second file"),
+            ("c.md", "alpha third file"),
+        ] {
+            write(&root.join("alpha").join(name), text);
+            set_mtime(&root.join("alpha").join(name), t0);
+        }
+        write(&root.join("beta").join("notes.md"), "beta notes");
+        store.track(&root);
+        let cfg = store.cfg(&root, &[("max_files_per_project", "2")]);
+        assert_eq!(ScanCaps::from_cfg(&cfg).max_files_per_project, 2);
+        let embedder = TestEmbedder::new(&cfg, false);
+
+        // Equal mtimes: the path tie-break selects a.md and b.md; c.md is evicted.
+        let first = store.index(&cfg, &embedder, false).expect("first run");
+        assert_eq!(first.files_selected, 3, "2 in alpha + 1 in beta");
+        assert_eq!(first.files_evicted_by_cap, 1);
+        let conn = store.conn();
+        let selected = |conn: &Connection| -> Vec<String> {
+            let mut stmt = conn
+                .prepare("SELECT rel_path FROM project_files WHERE project_id = (SELECT id FROM projects WHERE path LIKE '%/alpha') ORDER BY rel_path")
+                .unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(selected(&conn), vec!["a.md", "b.md"]);
+
+        // Editing c.md makes it the newest: it displaces exactly one file, b.md (a.md wins the
+        // tie on path), whose rows are pruned; counters name the eviction.
+        write(&root.join("alpha").join("c.md"), "alpha third file, edited");
+        set_mtime(
+            &root.join("alpha").join("c.md"),
+            t0 + Duration::from_secs(60),
+        );
+        let second = store.index(&cfg, &embedder, false).expect("second run");
+        assert_eq!(second.updated_projects, 1);
+        assert_eq!(second.files_evicted_by_cap, 1);
+        assert_eq!(second.chunks_embedded, 1, "c.md");
+        assert_eq!(second.chunks_deleted, 1, "b.md");
+        assert_eq!(selected(&conn), vec!["a.md", "c.md"]);
+        assert_eq!(chunk_rows_for(&conn, "b.md"), (0, 0));
+        assert_eq!(chunk_rows_for(&conn, "a.md"), (1, 1));
+
+        // A second identical run is skipped by the gate; a forced one evicts the same file
+        // again and deletes nothing.
+        let third = store.index(&cfg, &embedder, false).expect("third run");
+        assert_eq!(third.skipped_projects, 2);
+        assert_eq!(third.chunks_deleted, 0);
+        let forced = store.index(&cfg, &embedder, true).expect("forced run");
+        assert_eq!(forced.files_evicted_by_cap, 1);
+        assert_eq!(forced.chunks_deleted, 0);
+        assert_eq!(forced.chunks_embedded, 0);
+        assert_eq!(forced.chunks_reused, 3);
+        assert_eq!(selected(&conn), vec!["a.md", "c.md"]);
+    }
+
+    #[test]
+    fn a_changed_embedding_fingerprint_revisits_unchanged_projects_and_reembeds_only_mismatches() {
+        let store = TestStore::new("fingerprint");
+        let root = two_project_root(&store, "root");
+        store.track(&root);
+        let cfg = store.cfg(&root, &[]);
+        let plain = TestEmbedder::new(&cfg, false);
+        let first = store.index(&cfg, &plain, false).expect("first run");
+        assert_eq!(first.chunks_embedded, 3);
+        let conn = store.conn();
+        assert_eq!(
+            app_state_get(&conn, APP_STATE_EMBED_FINGERPRINT).unwrap(),
+            Some("ollama:test-local|64|0|1".to_string())
+        );
+        let second = store.index(&cfg, &plain, false).expect("second run");
+        assert_eq!(second.skipped_projects, 2);
+
+        // One chunk already carries a vector produced under the new identity.
+        let a_chunk: i64 = conn
+            .query_row(
+                "SELECT id FROM project_chunks WHERE doc_rel_path = 'a.md'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "UPDATE project_chunk_vectors SET normalized = 1 WHERE chunk_id = ?1",
+            params![a_chunk],
+        )
+        .unwrap();
+
+        // Same files, same model, normalisation flipped: every project is revisited, the one
+        // matching vector is reused, the other two (and both summaries) are re-embedded.
+        let normalized = TestEmbedder::new(&cfg, true);
+        let third = store.index(&cfg, &normalized, false).expect("third run");
+        assert_eq!(third.skipped_projects, 0);
+        assert_eq!(third.updated_projects, 2);
+        assert_eq!(third.files_rechunked, 3);
+        assert_eq!(third.chunks_reused, 1);
+        assert_eq!(third.chunks_embedded, 2);
+        assert_eq!(third.vectorized_projects, 2);
+        assert_eq!(
+            app_state_get(&conn, APP_STATE_EMBED_FINGERPRINT).unwrap(),
+            Some("ollama:test-local|64|1|1".to_string())
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM project_vectors WHERE normalized = 1"
+            ),
+            2
+        );
+        let fourth = store.index(&cfg, &normalized, false).expect("fourth run");
+        assert_eq!(fourth.skipped_projects, 2);
+    }
+
+    #[test]
+    fn lance_rows_are_repaired_from_sqlite_without_embedding() {
+        let store = TestStore::new("lance-repair");
+        let root = two_project_root(&store, "root");
+        store.track(&root);
+        let cfg = store.cfg(&root, &[]);
+        let embedder = TestEmbedder::new(&cfg, false);
+        let first = store.index(&cfg, &embedder, false).expect("first run");
+        assert_eq!(first.chunks_embedded, 3);
+        assert_eq!(first.retrieval_synced_chunks, 3);
+        let conn = store.conn();
+        assert_eq!(
+            app_state_get(&conn, APP_STATE_LANCE_DIRTY).unwrap(),
+            Some("0".to_string())
+        );
+        let ids: Vec<i64> = {
+            let mut stmt = conn
+                .prepare("SELECT chunk_id FROM project_chunk_vectors ORDER BY chunk_id")
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+
+        // Damage LanceDB directly: two rows gone, one orphan added; mark dirty as an
+        // interrupted write would have.
+        with_lance_store(|s| lance_store::delete_chunks(s, &ids[..2])).expect("delete");
+        with_lance_store(|s| lance_store::upsert_chunks(s, &[(999_999, vec![0.5f32; 64])]))
+            .expect("orphan");
+        assert_eq!(with_lance_store(|s| lance_store::count(s)).unwrap(), 2);
+        app_state_set(&conn, APP_STATE_LANCE_DIRTY, "1").unwrap();
+        let before = embedder.embedded_texts().len();
+
+        let second = store.index(&cfg, &embedder, false).expect("repair run");
+        assert_eq!(second.lance_repaired, 2);
+        assert_eq!(second.lance_orphans_removed, 1);
+        assert_eq!(second.chunks_embedded, 0);
+        assert_eq!(second.skipped_projects, 2);
+        assert_eq!(
+            embedder.embedded_texts().len(),
+            before,
+            "no embedding call was made"
+        );
+        let mut lance_ids = with_lance_store(|s| lance_store::list_chunk_ids(s)).unwrap();
+        lance_ids.sort();
+        assert_eq!(lance_ids, ids);
+        assert_eq!(
+            app_state_get(&conn, APP_STATE_LANCE_DIRTY).unwrap(),
+            Some("0".to_string())
+        );
+
+        // A failed *update*: sqlite committed a new vector and the pending id, LanceDB still
+        // holds the old row under the same id. The repair rewrites it (ids alone would not).
+        let sqlite_vec: Vec<f32> = {
+            let blob: Vec<u8> = conn
+                .query_row(
+                    "SELECT vector FROM project_chunk_vectors WHERE chunk_id = ?1",
+                    params![ids[0]],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            blob_to_f32_vec(&blob)
+        };
+        let mut wrong = vec![0.0f32; 64];
+        wrong[0] = 1.0;
+        with_lance_store(|s| lance_store::upsert_chunks(s, &[(ids[0], wrong.clone())]))
+            .expect("stale row");
+        lance_pending_add(&conn, &ids[..1]).unwrap();
+        app_state_set(&conn, APP_STATE_LANCE_DIRTY, "1").unwrap();
+        let before_stale =
+            with_lance_store(|s| lance_store::search_vectors(s, &sqlite_vec, 1)).unwrap();
+        assert!(
+            !before_stale.contains_key(&ids[0]) || before_stale.len() > 1,
+            "precondition: the stale row does not match its sqlite vector best"
+        );
+        let stale_run = store.index(&cfg, &embedder, false).expect("stale-row run");
+        assert_eq!(stale_run.lance_repaired, 1);
+        assert_eq!(stale_run.chunks_embedded, 0);
+        assert_eq!(with_lance_store(|s| lance_store::count(s)).unwrap(), 3);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM lance_pending"), 0);
+        let after = with_lance_store(|s| lance_store::search_vectors(s, &sqlite_vec, 1)).unwrap();
+        assert_eq!(after.keys().copied().collect::<Vec<i64>>(), vec![ids[0]]);
+
+        // A clean marker means no comparison on the fast path ...
+        with_lance_store(|s| lance_store::delete_chunks(s, &ids[..1])).expect("delete one");
+        let third = store.index(&cfg, &embedder, false).expect("clean run");
+        assert_eq!(third.lance_repaired, 0);
+        assert_eq!(with_lance_store(|s| lance_store::count(s)).unwrap(), 2);
+        // ... while prune's forced reconciliation always repairs.
+        let report =
+            repair_lance_from_sqlite(&conn, &embedder.model_key(), true).expect("forced repair");
+        assert_eq!(report.rebuilt, 1);
+        assert_eq!(report.orphans_removed, 0);
+        assert_eq!(with_lance_store(|s| lance_store::count(s)).unwrap(), 3);
+
+        // An absent marker (a store from before the marker existed) reconciles once.
+        conn.execute(
+            "DELETE FROM app_state WHERE key = ?1",
+            params![APP_STATE_LANCE_DIRTY],
+        )
+        .unwrap();
+        with_lance_store(|s| lance_store::delete_chunks(s, &ids[2..])).expect("delete last");
+        let fourth = store.index(&cfg, &embedder, false).expect("first-time run");
+        assert_eq!(fourth.lance_repaired, 1);
+        assert_eq!(with_lance_store(|s| lance_store::count(s)).unwrap(), 3);
+    }
+
+    /// Every row of a project that a failed run must leave alone, as printable lines.
+    fn project_snapshot(conn: &Connection, project_path: &Path) -> Vec<String> {
+        let path = normalize_path(&project_path.to_string_lossy())
+            .to_string_lossy()
+            .to_string();
+        let mut out: Vec<String> = Vec::new();
+        let mut push_rows = |sql: &str| {
+            let mut stmt = conn.prepare(sql).expect(sql);
+            let cols = stmt.column_count();
+            let rows = stmt
+                .query_map(params![path], |r| {
+                    let mut line = Vec::new();
+                    for i in 0..cols {
+                        let v: rusqlite::types::Value = r.get(i)?;
+                        line.push(match v {
+                            rusqlite::types::Value::Null => "NULL".to_string(),
+                            rusqlite::types::Value::Integer(n) => n.to_string(),
+                            rusqlite::types::Value::Real(f) => format!("{}", f),
+                            rusqlite::types::Value::Text(t) => t,
+                            rusqlite::types::Value::Blob(b) => format!("blob:{}", b.len()),
+                        });
+                    }
+                    Ok(line.join("|"))
+                })
+                .expect("query");
+            for row in rows {
+                out.push(row.expect("row"));
+            }
+        };
+        push_rows("SELECT 'project', title, summary, project_mtime, scan_signature FROM projects WHERE path = ?1");
+        push_rows("SELECT 'chunk', c.id, c.doc_path, c.chunk_index, c.text_hash, c.text FROM project_chunks c JOIN projects p ON p.id = c.project_id WHERE p.path = ?1 ORDER BY c.id");
+        push_rows("SELECT 'vector', v.chunk_id, v.model, v.dim, v.embed_input_hash, v.normalized, v.pipeline_version, length(v.vector) FROM project_chunk_vectors v JOIN project_chunks c ON c.id = v.chunk_id JOIN projects p ON p.id = c.project_id WHERE p.path = ?1 ORDER BY v.chunk_id");
+        push_rows("SELECT 'manifest', f.rel_path, f.file_size, f.file_mtime, f.content_hash, f.chunk_count FROM project_files f JOIN projects p ON p.id = f.project_id WHERE p.path = ?1 ORDER BY f.rel_path");
+        push_rows("SELECT 'pvector', pv.model, pv.dim, length(pv.vector) FROM project_vectors pv JOIN projects p ON p.id = pv.project_id WHERE p.path = ?1");
+        push_rows("SELECT 'edge', e.dst, e.kind, e.weight FROM project_edges e JOIN projects p ON p.id = e.src_project_id WHERE p.path = ?1 ORDER BY e.dst, e.kind");
+        out
+    }
+
+    #[test]
+    fn a_polling_pass_releases_the_writer_lock_before_the_loop_sleeps() {
+        let store = TestStore::new("poll-lock");
+        let root = two_project_root(&store, "root");
+        store.track(&root);
+        let cfg = store.cfg(
+            &root,
+            &[
+                ("embed_backend", "hash"),
+                ("embed_model", HASH_BACKEND_MODEL),
+            ],
+        );
+        // One real polling pass (the hash backend embeds offline).
+        let stats = run_watch_poll_once(&store.dir, &cfg, true).expect("poll pass");
+        assert_eq!(stats.updated_projects, 2);
+        assert!(index_run_verdict(&stats).is_ok());
+
+        // A second process takes the writer lock right away: the pass did not keep it for the
+        // sleep that follows in the loop.
+        let exe = env::current_exe().expect("test exe");
+        let mut child = Command::new(&exe)
+            .args([
+                "writer_lock_tests::hold_writer_lock_helper",
+                "--exact",
+                "--nocapture",
+            ])
+            .env("RETRIVIO_TEST_HOLD_LOCK", &store.dir)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn helper");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !store.dir.join("held").exists() {
+            assert!(
+                Instant::now() < deadline,
+                "the other process never got the lock: the polling pass must have kept it"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        let err = WriterLock::try_acquire(&store.dir).expect_err("held by the other process");
+        assert!(is_index_busy_error(&err), "{}", err);
+        unsafe {
+            libc::kill(child.id() as libc::pid_t, libc::SIGKILL);
+        }
+        let _ = child.wait();
+        // And once it is gone the next pass runs again (nothing to do).
+        let again = run_watch_poll_once(&store.dir, &cfg, true).expect("second pass");
+        assert_eq!(again.skipped_projects, 2);
+    }
+
+    #[test]
+    fn a_failure_between_embedding_and_publish_leaves_the_project_untouched() {
+        let store = TestStore::new("publish-atomic");
+        let root = two_project_root(&store, "root");
+        store.track(&root);
+        let cfg = store.cfg(&root, &[]);
+        let embedder = TestEmbedder::new(&cfg, false);
+        let first = store.index(&cfg, &embedder, false).expect("first run");
+        assert_eq!(first.chunks_embedded, 3);
+        let conn = store.conn();
+        let alpha = root.join("alpha");
+        let before = project_snapshot(&conn, &alpha);
+        assert!(before.iter().filter(|l| l.starts_with("chunk|")).count() == 2);
+
+        // Edit one file, add another, delete nothing; the run embeds both changed chunks and
+        // then fails right before the publish transaction.
+        write(
+            &alpha.join("b.md"),
+            "alpha two rewritten about ui and frontend",
+        );
+        write(&alpha.join("c.md"), "alpha three brand new file");
+        let embedded_before = embedder.embedded_texts().len();
+        INJECT_FAIL_BEFORE_PUBLISH.store(true, Ordering::SeqCst);
+        let failed = store.index(&cfg, &embedder, false).expect("run completes");
+        assert!(
+            !INJECT_FAIL_BEFORE_PUBLISH.load(Ordering::SeqCst),
+            "hook consumed"
+        );
+        assert_eq!(failed.projects_failed, 1);
+        assert_eq!(failed.updated_projects, 0);
+        assert_eq!(failed.skipped_projects, 1, "beta");
+        assert!(
+            failed.stopped.is_empty(),
+            "a project failure does not stop the run"
+        );
+        assert!(
+            failed.failures[0].contains("injected failure between embedding and publish"),
+            "{:?}",
+            failed.failures
+        );
+        assert_eq!(
+            embedder.embedded_texts().len(),
+            embedded_before + 3,
+            "the failure came after the embedding: two chunks and the changed summary"
+        );
+        assert!(index_run_verdict(&failed).is_err());
+
+        // Nothing of the project changed: not a chunk, vector, manifest row, summary vector,
+        // edge, signature or summary. Only the in-progress marker says a run was here.
+        let after = project_snapshot(&conn, &alpha);
+        assert_eq!(after, before);
+        assert!(project_row(&conn, &alpha).index_in_progress);
+        assert_eq!(chunk_rows_for(&conn, "c.md"), (0, 0));
+        assert_vectors_match_their_chunk_text(&conn, 3);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM lance_pending"), 0);
+        assert_eq!(with_lance_store(|s| lance_store::count(s)).unwrap(), 3);
+
+        // The next run publishes it: two chunks embedded again (they were never stored), one
+        // reused, the marker cleared, the signature advanced.
+        let next = store.index(&cfg, &embedder, false).expect("retry run");
+        assert_eq!(next.projects_failed, 0);
+        assert_eq!(next.updated_projects, 1);
+        assert_eq!(next.chunks_embedded, 2);
+        assert_eq!(next.chunks_reused, 1);
+        let row = project_row(&conn, &alpha);
+        assert!(!row.index_in_progress);
+        assert!(row.scan_signature.starts_with("3:"));
+        assert_eq!(chunk_rows_for(&conn, "c.md"), (1, 1));
+        assert_vectors_match_their_chunk_text(&conn, 4);
+        assert_eq!(with_lance_store(|s| lance_store::count(s)).unwrap(), 4);
+        assert!(index_run_verdict(&next).is_ok());
+    }
+
+    #[test]
+    fn a_collector_panic_fails_only_that_project_and_freezes_the_fingerprints() {
+        let store = TestStore::new("collector-panic");
+        let root = two_project_root(&store, "root");
+        store.track(&root);
+        let cfg = store.cfg(&root, &[]);
+        let embedder = TestEmbedder::new(&cfg, false);
+        store.index(&cfg, &embedder, false).expect("first run");
+        let conn = store.conn();
+        let alpha = root.join("alpha");
+        let before = project_snapshot(&conn, &alpha);
+        assert!(app_state_get(&conn, APP_STATE_EMBED_FINGERPRINT)
+            .unwrap()
+            .is_some());
+
+        // Force a revisit of every project (fingerprint absent) and make alpha's collector
+        // panic; beta gets a real edit so it has work to do.
+        conn.execute(
+            "DELETE FROM app_state WHERE key = ?1",
+            params![APP_STATE_EMBED_FINGERPRINT],
+        )
+        .unwrap();
+        write(
+            &alpha.join("a.md"),
+            "alpha one edited while the collector is broken",
+        );
+        write(&root.join("beta").join("notes.md"), "beta notes, edited");
+        *INJECT_COLLECTOR_PANIC.lock().unwrap() = Some("alpha".to_string());
+        let panicked = store.index(&cfg, &embedder, false).expect("run completes");
+        *INJECT_COLLECTOR_PANIC.lock().unwrap() = None;
+        assert_eq!(panicked.projects_failed, 1);
+        assert!(
+            panicked.failures[0].contains("collecting the project panicked")
+                && panicked.failures[0].contains("injected collector panic"),
+            "{:?}",
+            panicked.failures
+        );
+        assert_eq!(panicked.updated_projects, 1, "beta went through");
+        assert_eq!(panicked.chunks_embedded, 1, "beta's edited chunk");
+        assert!(panicked.stopped.is_empty());
+        assert!(index_run_verdict(&panicked).is_err());
+        // Alpha: untouched, not even marked in progress (its row was never begun), and its
+        // edges to beta survive because the failed project stays in the graph.
+        assert_eq!(project_snapshot(&conn, &alpha), before);
+        assert!(!project_row(&conn, &alpha).index_in_progress);
+        assert_eq!(
+            app_state_get(&conn, APP_STATE_EMBED_FINGERPRINT).unwrap(),
+            None,
+            "a run with a failed project never advances the fingerprint"
+        );
+
+        // Healed: alpha is revisited (the fingerprint is still absent), its edit lands, the
+        // fingerprint is written.
+        let healed = store.index(&cfg, &embedder, false).expect("healed run");
+        assert_eq!(healed.projects_failed, 0);
+        assert!(healed.updated_projects >= 1);
+        assert!(chunks_containing(&conn, "edited while the collector is broken") >= 1);
+        assert!(app_state_get(&conn, APP_STATE_EMBED_FINGERPRINT)
+            .unwrap()
+            .is_some());
+        assert!(index_run_verdict(&healed).is_ok());
+    }
+
+    #[test]
+    fn lance_repair_fails_closed_on_a_malformed_sqlite_vector() {
+        let store = TestStore::new("lance-fail-closed");
+        let root = two_project_root(&store, "root");
+        store.track(&root);
+        let cfg = store.cfg(&root, &[]);
+        let embedder = TestEmbedder::new(&cfg, false);
+        store.index(&cfg, &embedder, false).expect("first run");
+        let conn = store.conn();
+        let ids: Vec<i64> = {
+            let mut stmt = conn
+                .prepare("SELECT chunk_id FROM project_chunk_vectors ORDER BY chunk_id")
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        let good_blob: Vec<u8> = conn
+            .query_row(
+                "SELECT vector FROM project_chunk_vectors WHERE chunk_id = ?1",
+                params![ids[1]],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        // One sqlite vector is malformed (two bytes, not 64 floats), its LanceDB row is gone,
+        // its id is pending and the marker is set: exactly the state a repair must refuse.
+        conn.execute(
+            "UPDATE project_chunk_vectors SET vector = x'0000' WHERE chunk_id = ?1",
+            params![ids[0]],
+        )
+        .unwrap();
+        with_lance_store(|s| lance_store::delete_chunks(s, &ids[..1])).expect("delete");
+        lance_pending_add(&conn, &ids[..1]).unwrap();
+        app_state_set(&conn, APP_STATE_LANCE_DIRTY, "1").unwrap();
+
+        let refused = store.index(&cfg, &embedder, false).expect("run completes");
+        assert!(
+            refused.lance_error.contains("repair refused")
+                && refused.lance_error.contains(&format!("chunk {}", ids[0])),
+            "{}",
+            refused.lance_error
+        );
+        assert_eq!(refused.lance_repaired, 0);
+        assert_eq!(refused.skipped_projects, 2, "sqlite content is untouched");
+        assert!(index_run_verdict(&refused).is_err());
+        assert_eq!(
+            app_state_get(&conn, APP_STATE_LANCE_DIRTY).unwrap(),
+            Some("1".to_string()),
+            "marker kept"
+        );
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM lance_pending"),
+            1,
+            "pending id kept"
+        );
+        assert_eq!(with_lance_store(|s| lance_store::count(s)).unwrap(), 2);
+
+        // With the blob restored the next run repairs and clears both.
+        conn.execute(
+            "UPDATE project_chunk_vectors SET vector = ?1 WHERE chunk_id = ?2",
+            params![good_blob, ids[0]],
+        )
+        .unwrap();
+        let repaired = store.index(&cfg, &embedder, false).expect("repair run");
+        assert!(repaired.lance_error.is_empty(), "{}", repaired.lance_error);
+        assert_eq!(repaired.lance_repaired, 1);
+        assert_eq!(
+            app_state_get(&conn, APP_STATE_LANCE_DIRTY).unwrap(),
+            Some("0".to_string())
+        );
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM lance_pending"), 0);
+        assert_eq!(with_lance_store(|s| lance_store::count(s)).unwrap(), 3);
+        assert!(index_run_verdict(&repaired).is_ok());
+    }
+
+    #[test]
+    fn a_touched_but_identical_file_gets_its_new_stat_written_without_rechunking() {
+        let store = TestStore::new("restat");
+        let root = two_project_root(&store, "root");
+        store.track(&root);
+        let cfg = store.cfg(&root, &[]);
+        let embedder = TestEmbedder::new(&cfg, false);
+        store.index(&cfg, &embedder, false).expect("first run");
+        let conn = store.conn();
+        let stored_mtime = |conn: &Connection| -> f64 {
+            conn.query_row(
+                "SELECT file_mtime FROM project_files WHERE rel_path = 'a.md'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let before = stored_mtime(&conn);
+
+        // Touch: the signature changes (mtime), the content does not.
+        let later = SystemTime::now() + Duration::from_secs(120);
+        set_mtime(&root.join("alpha").join("a.md"), later);
+        let second = store.index(&cfg, &embedder, false).expect("second run");
+        assert_eq!(second.updated_projects, 1);
+        assert_eq!(second.files_rechunked, 0);
+        assert_eq!(second.files_unchanged, 2);
+        assert_eq!(second.chunks_embedded, 0);
+        assert_eq!(second.chunks_reused, 0, "nothing entered the work set");
+        let after = stored_mtime(&conn);
+        assert!(
+            after > before,
+            "manifest carries the new stat ({} -> {})",
+            before,
+            after
+        );
+        let expected = later.duration_since(UNIX_EPOCH).unwrap().as_secs_f64();
+        assert!((after - expected).abs() < 0.001);
+
+        // The next run finds the manifest stat equal again: no read, no hash, skipped.
+        let third = store.index(&cfg, &embedder, false).expect("third run");
+        assert_eq!(third.skipped_projects, 2);
+    }
 }
 
 fn find_repo_root() -> Option<PathBuf> {

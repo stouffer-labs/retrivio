@@ -1,6 +1,6 @@
 [package]
 name = "retrivio"
-version = "0.1.7"
+version = "0.2.0-dev"
 edition = "2021"
 license = "MIT"
 description = "Rust CLI entrypoint for Retrivio"
@@ -17,6 +17,11 @@ libc = "0.2"
 
 # File-level incremental change detection
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
+
+# Document extraction (documents.rs): Office/OpenDocument zips and text-based PDFs.
+# zip with the deflate codec only (no bzip2, zstd, lzma or AES); pdf-extract is pure Rust.
+zip = { version = "8.6", default-features = false, features = ["deflate-flate2"] }
+pdf-extract = "0.12.1"
 
 # Code intelligence — AST parsing via tree-sitter
 tree-sitter = "0.24"
