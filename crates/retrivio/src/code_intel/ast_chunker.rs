@@ -35,8 +35,6 @@ pub struct SemanticChunk {
     pub line_start: usize,
     /// 1-based line number where this chunk ends in the original file.
     pub line_end: usize,
-    /// Contextual header for embedding (e.g., "// File: src/auth.rs\n// Method: validate()").
-    pub context_header: String,
 }
 
 /// Analyze a source file and produce semantic chunks.
@@ -142,7 +140,6 @@ fn chunk_from_ast(
                     parent_context,
                     line_start,
                     line_end,
-                    context_header: String::new(), // filled in later by chunk_header module
                 });
             } else {
                 // Large definition: try to split at method/function boundaries within it
@@ -159,7 +156,6 @@ fn chunk_from_ast(
                             parent_context: parent_context.clone(),
                             line_start: lc.1,
                             line_end: lc.2,
-                            context_header: String::new(),
                         });
                     }
                 } else {
@@ -186,7 +182,6 @@ fn chunk_from_ast(
                     parent_context: String::new(),
                     line_start,
                     line_end,
-                    context_header: String::new(),
                 },
             );
         } else {
@@ -201,7 +196,6 @@ fn chunk_from_ast(
                         parent_context: String::new(),
                         line_start: lc.1,
                         line_end: lc.2,
-                        context_header: String::new(),
                     },
                 );
             }
@@ -223,7 +217,6 @@ fn chunk_from_ast(
                         parent_context: String::new(),
                         line_start: 1,
                         line_end,
-                        context_header: String::new(),
                     },
                 );
             } else {
@@ -238,7 +231,6 @@ fn chunk_from_ast(
                             parent_context: String::new(),
                             line_start: lc.1,
                             line_end: lc.2,
-                            context_header: String::new(),
                         },
                     );
                 }
@@ -386,7 +378,6 @@ fn split_large_definition(
             parent_context: String::new(),
             line_start: node.start_position().row + 1,
             line_end: body.start_position().row + 1,
-            context_header: String::new(),
         });
     }
 
@@ -418,7 +409,6 @@ fn split_large_definition(
                     parent_context: parent_context.clone(),
                     line_start: child.start_position().row + 1,
                     line_end: child.end_position().row + 1,
-                    context_header: String::new(),
                 });
             } else {
                 // Even the method is too large — split at blank lines
@@ -431,7 +421,6 @@ fn split_large_definition(
                         parent_context: parent_context.clone(),
                         line_start: lc.1,
                         line_end: lc.2,
-                        context_header: String::new(),
                     });
                 }
             }
@@ -501,7 +490,6 @@ fn fallback_chunk(source: &str, _rel_path: &str, max_chars: usize) -> Vec<Semant
             parent_context: String::new(),
             line_start: 1,
             line_end,
-            context_header: String::new(),
         }];
     }
 
@@ -541,7 +529,6 @@ fn fallback_chunk(source: &str, _rel_path: &str, max_chars: usize) -> Vec<Semant
                 parent_context: String::new(),
                 line_start,
                 line_end,
-                context_header: String::new(),
             });
         }
 

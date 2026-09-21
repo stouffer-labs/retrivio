@@ -122,7 +122,7 @@ pub fn is_document_only_suffix(suffix: &str) -> bool {
 ///
 /// The indexer itself sizes, reads and hashes the file first and calls
 /// [`extract_from_bytes`]; this whole-file entry point is the module's standalone API.
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn extract_document_text(
     path: &Path,
     max_bytes: u64,
@@ -384,7 +384,7 @@ impl<'a> XmlScanner<'a> {
     /// The end of a tag opened at `self.pos` (which is past `<`): the first `>` outside
     /// quotes. Returns the index relative to `self.pos` and whether it was found.
     fn tag_end(&self) -> Option<usize> {
-        let bytes = self.src[self.pos..].as_bytes();
+        let bytes = &self.src.as_bytes()[self.pos..];
         let mut quote: Option<u8> = None;
         for (i, &b) in bytes.iter().enumerate() {
             match (quote, b) {

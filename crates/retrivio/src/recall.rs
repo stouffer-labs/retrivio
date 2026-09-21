@@ -8,7 +8,7 @@
 //! (thresholds on the pre-recency base score, identical-content and series collapse, per-project
 //! caps, tier-first ordering inside the relevance band), print the sanitized block and update
 //! prompt-free session state. Every failure in hook mode exits 0 without output; only `--query`
-//! runs may exit 1. The process runs in hook mode (`super::set_hook_mode`): credential refresh
+//! runs may exit 1. The process runs in hook mode (`crate::embed::set_hook_mode`): credential refresh
 //! commands are never spawned.
 //!
 //! The pure pieces (skip rules, term extraction, sanitizing, redaction, lead selection, block
@@ -35,7 +35,9 @@ use sha1::{Digest, Sha1};
 use super::dossier;
 use super::freshness;
 use super::roles::{self, Role};
-use super::{ConfigValues, RankOptions, RankedFileResult};
+use crate::config::ConfigValues;
+use crate::rank::RankOptions;
+use crate::rank::RankedFileResult;
 
 /// Whole-run budget (the hook timeout in the CLIs is 5 s): the process must have printed its
 /// output and exited by then.
@@ -71,8 +73,6 @@ const DOSSIER_MAX_PROJECTS: usize = 5;
 const MAX_TERMS: usize = 8;
 const MIN_TERM_CHARS: usize = 3;
 const SHOWN_CAP: usize = 200;
-/// Term hashes kept per session at most.
-const TERM_HASHES_MAX: usize = 12;
 const LOG_MAX_BYTES: u64 = 1_000_000;
 const PRUNE_INTERVAL_SECS: f64 = 3600.0;
 /// Session-state persistence is skipped when the run is already this far along: the write is
@@ -390,8 +390,7 @@ fn is_slash_command(prompt: &str) -> bool {
 /// Whole prompt (trimmed, lowercased, trailing punctuation stripped, spaces collapsed) is an ack.
 fn is_ack(prompt: &str) -> bool {
     let lowered = prompt.trim().to_lowercase();
-    let stripped =
-        lowered.trim_end_matches(|c: char| matches!(c, '.' | '!' | '?' | ',' | ';' | ':'));
+    let stripped = lowered.trim_end_matches(['.', '!', '?', ',', ';', ':']);
     let normalized = stripped.split_whitespace().collect::<Vec<_>>().join(" ");
     ACKS.contains(&normalized.as_str())
 }
@@ -1355,7 +1354,7 @@ fn dossier_rows(
         .iter()
         .filter(|r| Path::new(&r.path).is_file())
         .filter(|r| params.roots.is_empty() || under_any_root(&r.path, &params.roots))
-        .filter(|r| super::passes_raw_floor(r.raw_similarity, floor))
+        .filter(|r| crate::rank::passes_raw_floor(r.raw_similarity, floor))
         .cloned()
         .collect();
     // Recall asks the ranker for `include_superseded: true` (marks, no downrank) so that
@@ -1489,26 +1488,15 @@ fn at_word_start(chars: &[char], i: usize) -> bool {
 
 /// Case-sensitive `chars[i..]` starts with `s` (ASCII `s`).
 fn starts_with_at(chars: &[char], i: usize, s: &str) -> bool {
-    let mut k = i;
-    for b in s.chars() {
-        if k >= chars.len() || chars[k] != b {
-            return false;
-        }
-        k += 1;
-    }
-    true
+    let mut rest = chars[i.min(chars.len())..].iter();
+    s.chars().all(|b| rest.next() == Some(&b))
 }
 
 /// Case-insensitive variant of [`starts_with_at`] for ASCII-lowercase keys.
 fn matches_key_at(chars: &[char], i: usize, key: &str) -> bool {
-    let mut k = i;
-    for b in key.chars() {
-        if k >= chars.len() || chars[k].to_ascii_lowercase() != b {
-            return false;
-        }
-        k += 1;
-    }
-    true
+    let mut rest = chars[i.min(chars.len())..].iter();
+    key.chars()
+        .all(|b| rest.next().map(|c| c.to_ascii_lowercase()) == Some(b))
 }
 
 fn is_b64url_char(c: char) -> bool {
@@ -2248,7 +2236,7 @@ fn project_contains_cwd(project: &str, cwd: &Path) -> bool {
 /// The absolute floor (`recall_min_abs_score`) is an honest number: in semantic mode it is
 /// applied to each candidate's raw cosine similarity (the min-max normalised fusion score
 /// says nothing absolute, its top is always 1.0) under the same contract as search
-/// (`super::passes_raw_floor`): a floor above 0 admits only a finite cosine at or above it,
+/// (`crate::rank::passes_raw_floor`): a floor above 0 admits only a finite cosine at or above it,
 /// so a candidate without one (found by keywords only, or with a corrupt vector) fails
 /// closed; a floor of 0 is off and applies no cosine requirement. In lexical mode, where no
 /// cosine exists, the floor applies to the coverage-based base score as before. Machine
@@ -2259,13 +2247,18 @@ fn prefilter(mut cands: Vec<Candidate>, p: &SelectParams, semantic: bool) -> Vec
     }
     cands.retain(|c| !c.noise);
     if semantic {
-        cands.retain(|c| super::passes_raw_floor(c.raw_similarity, p.min_abs_score));
+        cands.retain(|c| crate::rank::passes_raw_floor(c.raw_similarity, p.min_abs_score));
     }
     sort_by_base(&mut cands);
     let Some(top) = cands.first().map(|c| c.base_score) else {
         return Vec::new();
     };
-    if !semantic && !(top >= p.min_abs_score) {
+    if !semantic
+        && !matches!(
+            top.partial_cmp(&p.min_abs_score),
+            Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
+        )
+    {
         return Vec::new();
     }
     let floor = top * p.min_score_ratio;
@@ -2360,7 +2353,7 @@ fn better_copy(a: &Candidate, b: &Candidate) -> bool {
 
 /// Copies of one file collapse to one candidate, with the same identity as file search: the
 /// manifest hash of the whole file, and either the same file name or one copy under a copy
-/// directory (`super::same_file_copy`). Two byte-identical documents that meet neither rule
+/// directory (`crate::rank::same_file_copy`). Two byte-identical documents that meet neither rule
 /// stay two candidates. The survivor keeps its own score and cosine.
 fn collapse_identical(cands: Vec<Candidate>) -> Vec<Candidate> {
     let mut out: Vec<Candidate> = Vec::new();
@@ -2371,7 +2364,7 @@ fn collapse_identical(cands: Vec<Candidate>) -> Vec<Candidate> {
         }
         let dup = out.iter().position(|o| {
             o.content_hash == c.content_hash
-                && super::same_file_copy(rel_or_path(o), rel_or_path(&c))
+                && crate::rank::same_file_copy(rel_or_path(o), rel_or_path(&c))
         });
         match dup {
             Some(idx) => {
@@ -2388,7 +2381,7 @@ fn collapse_identical(cands: Vec<Candidate>) -> Vec<Candidate> {
 /// Supersession in recall, soft and state-only, the same rule as file search: `state` files
 /// of one series (same project, parent directory and normalised stem) are revisions of one
 /// document. The newest by revision date (ties: the higher score, then the lexicographically
-/// later path, as in `super::mark_superseded`) is the head and counts the others
+/// later path, as in `crate::rank::mark_superseded`) is the head and counts the others
 /// (`older_versions`); the others get `superseded_by = head` and, unless the prompt asks for
 /// history (`full_strength`), the same x 0.85 as search. Nothing is removed: the per-project
 /// cap in `finalize_leads` keeps the head in front, and an older member can still surface
@@ -2441,8 +2434,8 @@ fn collapse_series(mut cands: Vec<Candidate>, full_strength: bool) -> Vec<Candid
             c.superseded_by = Some(head_path.clone());
             c.older_versions = 0;
             if !full_strength {
-                c.score *= super::SUPERSEDED_FACTOR;
-                c.base_score *= super::SUPERSEDED_FACTOR;
+                c.score *= crate::rank::SUPERSEDED_FACTOR;
+                c.base_score *= crate::rank::SUPERSEDED_FACTOR;
             }
         }
     }
@@ -2683,17 +2676,13 @@ fn system_message_for(leads: &[Candidate]) -> String {
 // ---------------------------------------------------------------------------------------------
 
 #[derive(Clone, Debug, Default, PartialEq)]
-/// Per-session memory (`~/.retrivio/recall/<sha1(session id)>.json`, mode 0600): the lead
-/// paths already shown, and the previous turn's search terms as salted hashes. Nothing
-/// prompt-derived is stored in clear: the hashes let a later turn tell whether it continues
-/// the previous topic (equal hashes) without holding a single word of it, and the salt is
-/// random per session so equal terms hash differently in different sessions.
+/// Per-session memory (`~/.retrivio/recall/<sha1(session id)>.json`, mode 0600): the absolute
+/// paths of the leads already shown in this session, and the time of the last write. Nothing
+/// prompt-derived is stored: no query text, no search terms, no hashes of either. (Earlier 0.2
+/// builds also kept the previous turn's terms as salted hashes; nothing consumed them, so the
+/// field went; `salt` and `term_hashes` keys in an older file are ignored.)
 struct SessionState {
     shown: Vec<String>,
-    /// Random per-session salt (hex), created with the file.
-    salt: String,
-    /// `term_hash(salt, term)` of the previous turn's terms, in order.
-    term_hashes: Vec<String>,
     updated_at: f64,
 }
 
@@ -2701,49 +2690,6 @@ fn sha1_hex(s: &str) -> String {
     let mut hasher = Sha1::new();
     hasher.update(s.as_bytes());
     format!("{:x}", hasher.finalize())
-}
-
-/// Salt for a new session file: 16 random bytes from `/dev/urandom` when it can be read,
-/// otherwise the process id, the clock and the session hash mixed through SHA-256. Distinct
-/// per session; stored next to the hashes (the usual salted-hash layout).
-fn new_salt(session_hash: &str) -> String {
-    use sha2::Digest as _;
-    if let Ok(mut f) = fs::File::open("/dev/urandom") {
-        let mut buf = [0u8; 16];
-        if f.read_exact(&mut buf).is_ok() {
-            return buf.iter().map(|b| format!("{:02x}", b)).collect();
-        }
-    }
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let mut h = sha2::Sha256::new();
-    h.update(session_hash.as_bytes());
-    h.update(nanos.to_le_bytes());
-    h.update(process::id().to_le_bytes());
-    let digest = h.finalize();
-    digest
-        .iter()
-        .take(16)
-        .map(|b| format!("{:02x}", b))
-        .collect()
-}
-
-/// Non-reversible identifier of a term inside one session: SHA-256 over the session salt
-/// and the lowercased term, first 16 hex digits.
-fn term_hash(salt: &str, term: &str) -> String {
-    use sha2::Digest as _;
-    let mut h = sha2::Sha256::new();
-    h.update(salt.as_bytes());
-    h.update([0u8]);
-    h.update(term.trim().to_lowercase().as_bytes());
-    let digest = h.finalize();
-    digest
-        .iter()
-        .take(8)
-        .map(|b| format!("{:02x}", b))
-        .collect()
 }
 
 fn session_file(dir: &Path, hash: &str) -> PathBuf {
@@ -2784,12 +2730,6 @@ fn load_state(path: &Path) -> SessionState {
     };
     SessionState {
         shown: strings("shown"),
-        salt: v
-            .get("salt")
-            .and_then(|x| x.as_str())
-            .map(|s| s.to_string())
-            .unwrap_or_default(),
-        term_hashes: strings("term_hashes"),
         updated_at: v.get("updated_at").and_then(|x| x.as_f64()).unwrap_or(0.0),
     }
 }
@@ -2799,8 +2739,6 @@ fn load_state(path: &Path) -> SessionState {
 fn save_state(path: &Path, state: &SessionState) -> std::io::Result<()> {
     let body = json!({
         "shown": state.shown,
-        "salt": state.salt,
-        "term_hashes": state.term_hashes,
         "updated_at": state.updated_at,
     })
     .to_string();
@@ -2850,33 +2788,12 @@ fn acquire_lock(lock_path: &Path, now: f64) -> bool {
     false
 }
 
-/// Hashes stored for this turn's terms: secret-redacted first (a term that still looks like a
-/// secret is dropped, hash or not), at most [`TERM_HASHES_MAX`], deduplicated.
-fn storable_term_hashes(salt: &str, terms: &[String]) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for t in terms {
-        let red = redact_secrets(t);
-        if red.contains(REDACTED) || red.trim().is_empty() {
-            continue;
-        }
-        let h = term_hash(salt, &red);
-        if !out.contains(&h) {
-            out.push(h);
-        }
-        if out.len() >= TERM_HASHES_MAX {
-            break;
-        }
-    }
-    out
-}
-
 /// Read/modify/write of the session file under the lock. Never stores the prompt or any
-/// term text: only shown paths and salted term hashes.
+/// term text: only the shown paths.
 fn update_session_state(
     dir: &Path,
     hash: &str,
     newly_shown: &[String],
-    terms: &[String],
     now: f64,
 ) -> Result<(), String> {
     ensure_private_dir(dir).map_err(|e| format!("state dir: {}", e))?;
@@ -2895,10 +2812,6 @@ fn update_session_state(
         let drop = st.shown.len() - SHOWN_CAP;
         st.shown.drain(..drop);
     }
-    if st.salt.is_empty() {
-        st.salt = new_salt(hash);
-    }
-    st.term_hashes = storable_term_hashes(&st.salt, terms);
     st.updated_at = now;
     let res = save_state(&path, &st).map_err(|e| format!("state write: {}", e));
     let _ = fs::remove_file(&lock);
@@ -3062,7 +2975,7 @@ impl Reporter {
     ) -> ! {
         let line = format!(
             "{} {} {} {}ms cand={} leads={}{}{}",
-            iso_utc(super::now_ts()),
+            iso_utc(crate::util::now_ts()),
             self.hash8,
             mode,
             self.started.elapsed().as_millis(),
@@ -3138,7 +3051,7 @@ fn note_slow_semantic(breaker: &Path) {
     {
         Ok(mut f) => {
             use std::io::Write;
-            let _ = writeln!(f, "{} timeout", iso_utc(super::now_ts()));
+            let _ = writeln!(f, "{} timeout", iso_utc(crate::util::now_ts()));
         }
         Err(_) => {
             let recent = fs::metadata(&marker)
@@ -3156,7 +3069,7 @@ fn note_slow_semantic(breaker: &Path) {
                 .open(&marker)
             {
                 use std::io::Write;
-                let _ = writeln!(f, "{} timeout", iso_utc(super::now_ts()));
+                let _ = writeln!(f, "{} timeout", iso_utc(crate::util::now_ts()));
             }
         }
     }
@@ -3173,7 +3086,10 @@ fn trip_breaker(path: &Path, reason: &str) {
         .filter(|c| !c.is_control())
         .take(200)
         .collect();
-    let _ = fs::write(path, format!("{} {}\n", iso_utc(super::now_ts()), reason));
+    let _ = fs::write(
+        path,
+        format!("{} {}\n", iso_utc(crate::util::now_ts()), reason),
+    );
 }
 
 fn semantic_rows(
@@ -3181,8 +3097,8 @@ fn semantic_rows(
     db_path: &Path,
     query: &str,
 ) -> Result<Vec<RankedFileResult>, String> {
-    let conn = super::open_db_read_only(db_path)?;
-    super::rank_files_native_with(
+    let conn = crate::db::open_db_read_only(db_path)?;
+    crate::rank::rank_files_native_with(
         &conn,
         cfg,
         query,
@@ -3204,8 +3120,8 @@ fn lexical_rows(
     db_path: &Path,
     terms: &[String],
 ) -> Result<Vec<RankedFileResult>, String> {
-    let conn = super::open_db_read_only(db_path)?;
-    Ok(super::lexical_file_candidates(
+    let conn = crate::db::open_db_read_only(db_path)?;
+    Ok(crate::rank::lexical_file_candidates(
         &conn,
         cfg,
         terms,
@@ -3296,11 +3212,11 @@ fn chunk_text(conn: &Connection, chunk_id: i64) -> Option<String> {
 /// Worker body: retrieve, keep existing files, (lexical) verify term coverage, threshold,
 /// refine the shortlist, select.
 fn run_pipeline(job: PipelineJob) -> Result<PipelineOutput, String> {
-    super::set_hook_mode();
+    crate::embed::set_hook_mode();
     let (rows, mode) = retrieve(&job)?;
     let candidates = rows.len();
     let rp = RecencyParams::from_cfg(&job.cfg);
-    let conn = super::open_db_read_only(&job.db_path).ok();
+    let conn = crate::db::open_db_read_only(&job.db_path).ok();
     let mut existing: Vec<Candidate> = rows
         .iter()
         .filter(|r| Path::new(&r.path).is_file())
@@ -3395,7 +3311,7 @@ fn run_pipeline(job: PipelineJob) -> Result<PipelineOutput, String> {
     }
     if let Some(conn) = conn.as_ref() {
         let paths: Vec<String> = shortlist.iter().map(|c| c.path.clone()).collect();
-        let hashes = super::file_content_hashes(conn, &paths);
+        let hashes = crate::rank::file_content_hashes(conn, &paths);
         for c in shortlist.iter_mut() {
             if let Some(h) = hashes.get(&c.path) {
                 c.content_hash = h.clone();
@@ -3421,7 +3337,7 @@ fn run_pipeline(job: PipelineJob) -> Result<PipelineOutput, String> {
 pub fn run_recall_cmd(args: &[OsString]) {
     let started = Instant::now();
     // Hook mode from the first instruction: nothing below may spawn a credential refresh.
-    super::set_hook_mode();
+    crate::embed::set_hook_mode();
     let opts = match parse_args(args) {
         Ok(o) => o,
         Err(e) => {
@@ -3435,7 +3351,7 @@ pub fn run_recall_cmd(args: &[OsString]) {
     }
     let dry_run = opts.query.is_some();
     let proc_cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let data_root = super::data_dir(&proc_cwd);
+    let data_root = crate::config::data_dir(&proc_cwd);
     let (parsed_input, stdin_truncated) = if !dry_run && !std::io::stdin().is_terminal() {
         let (raw, truncated) = read_all_stdin();
         (parse_hook_input(&raw), truncated)
@@ -3481,11 +3397,11 @@ pub fn run_recall_cmd(args: &[OsString]) {
         .cwd
         .clone()
         .or_else(|| stdin_input.cwd.clone())
-        .map(|c| super::normalize_path(&c))
+        .map(|c| crate::util::normalize_path(&c))
         .unwrap_or_else(|| proc_cwd.clone());
     let state_dir = data_root.join("recall");
     let session_hash = session_id.as_deref().map(sha1_hex);
-    let now = super::now_ts();
+    let now = crate::util::now_ts();
     let rep = Reporter {
         log_path: data_root.join("recall.log"),
         hash8: session_hash
@@ -3512,8 +3428,10 @@ pub fn run_recall_cmd(args: &[OsString]) {
         rep.finish_with(&format!("skipped:{}", reason), 0, 0, truncated_token, 0);
     }
 
-    let cfg = ConfigValues::from_map(super::load_config_values(&super::config_path(&proc_cwd)));
-    let db_path = super::db_path(&proc_cwd);
+    let cfg = ConfigValues::from_map(crate::config::load_config_values(
+        &crate::config::config_path(&proc_cwd),
+    ));
+    let db_path = crate::config::db_path(&proc_cwd);
     if !db_path.is_file() {
         rep.note(&format!("no index at {}", db_path.display()));
         rep.finish("error:no-index", 0, 0, if dry_run { 1 } else { 0 });
@@ -3635,12 +3553,11 @@ pub fn run_recall_cmd(args: &[OsString]) {
             // Best effort on a side thread: waited for until STATE_WRITE_CUTOFF, then left
             // behind (the process exits; a half-written temp file is pruned by a later run).
             let (stx, srx) = mpsc::channel();
-            let (dir, hash, shown_c, terms_c) =
-                (state_dir.clone(), h.clone(), shown.clone(), terms.clone());
+            let (dir, hash, shown_c) = (state_dir.clone(), h.clone(), shown.clone());
             let spawned = thread::Builder::new()
                 .name("recall-state".to_string())
                 .spawn(move || {
-                    let _ = stx.send(update_session_state(&dir, &hash, &shown_c, &terms_c, now));
+                    let _ = stx.send(update_session_state(&dir, &hash, &shown_c, now));
                 });
             if spawned.is_ok() {
                 let cutoff = started + STATE_WRITE_CUTOFF;
@@ -3864,7 +3781,7 @@ mod tests {
     #[test]
     fn query_truncation_respects_char_boundaries() {
         // One 1300-character word: head and tail are cut at character boundaries.
-        let long: String = std::iter::repeat('é').take(1300).collect();
+        let long: String = std::iter::repeat_n('é', 1300).collect();
         let q = derive_query(&long);
         assert!(q.chars().count() <= QUERY_MAX_CHARS);
         assert!(q.starts_with(&"é".repeat(QUERY_HEAD_CHARS)));
@@ -4153,7 +4070,7 @@ mod tests {
             "{}",
             block.chars().count()
         );
-        assert!(n >= 1 && n < 3, "n={}", n);
+        assert!((1..3).contains(&n), "n={}", n);
         assert!(block.contains("1. p1"));
         assert!(!block.contains("3. p3"));
         assert_eq!(dossier_shown(&paths[..3], n).len(), n);
@@ -4167,7 +4084,7 @@ mod tests {
         let Ok(dir) = env::var("RETRIVIO_RECALL_CHILD_DATA_DIR") else {
             return;
         };
-        super::super::test_support::install_process_data_dir(Path::new(&dir));
+        crate::test_support::install_process_data_dir(Path::new(&dir));
         let args: Vec<OsString> = env::var("RETRIVIO_RECALL_CHILD_ARGS")
             .ok()
             .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
@@ -4237,7 +4154,7 @@ mod tests {
     /// empty) output and one log line each. Timings are printed for the run record.
     #[test]
     fn hook_runs_finish_under_the_deadline_on_hostile_input() {
-        use super::super::test_support::{TestEmbedder, TestStore};
+        use crate::test_support::{TestEmbedder, TestStore};
         let store = TestStore::new("recall-e2e");
         let root = store.corpus_root("root");
         let write = |rel: &str, text: &str| {
@@ -4875,15 +4792,17 @@ mod tests {
         let dir = scratch("secret-terms");
         let state_dir = dir.join("recall");
         let hash = sha1_hex("session-secrets");
-        update_session_state(&state_dir, &hash, &[], &terms, 1_800_000_000.0).unwrap();
+        update_session_state(&state_dir, &hash, &[], 1_800_000_000.0).unwrap();
         let st = load_state(&session_file(&state_dir, &hash));
-        assert!(!st.term_hashes.is_empty());
-        assert!(st
-            .term_hashes
-            .iter()
-            .all(|h| h.len() == 16 && h.chars().all(|c| c.is_ascii_hexdigit())));
-        // Not a single term reaches the disk in clear: neither the secrets nor "deploy".
+        assert!(st.shown.is_empty());
+        // Nothing of the prompt reaches the disk: neither the secrets nor "deploy", and no
+        // hash of them either; the file holds shown paths and the write time only.
         let raw = fs::read_to_string(session_file(&state_dir, &hash)).unwrap();
+        assert!(
+            !raw.contains("term_hashes") && !raw.contains("salt"),
+            "{}",
+            raw
+        );
         for word in ["hunter2", "abc", "deploy", "password", "token"] {
             assert!(!raw.contains(word), "{} in {}", word, raw);
         }
@@ -5016,8 +4935,8 @@ mod tests {
         assert_eq!(older.superseded_by.as_deref(), Some(h2.path.as_str()));
         assert_eq!(older.older_versions, 0);
         assert!(
-            (older.score - h1.score * super::super::SUPERSEDED_FACTOR).abs() < 1e-12
-                && (older.base_score - h1.base_score * super::super::SUPERSEDED_FACTOR).abs()
+            (older.score - h1.score * crate::rank::SUPERSEDED_FACTOR).abs() < 1e-12
+                && (older.base_score - h1.base_score * crate::rank::SUPERSEDED_FACTOR).abs()
                     < 1e-12,
             "the same x0.85 as search"
         );
@@ -5563,7 +5482,7 @@ mod tests {
         );
         assert!(block.starts_with("<retrivio_leads>\n"));
         assert!(block.ends_with("\n</retrivio_leads>"));
-        assert!(n >= 1 && n < 5, "kept {}", n);
+        assert!((1..5).contains(&n), "kept {}", n);
         assert_eq!(block.matches("\n1. ").count(), 1);
         assert_eq!(block.matches(&format!("\n{}. ", n)).count(), 1);
         assert_eq!(block.matches(&format!("\n{}. ", n + 1)).count(), 0);
@@ -5776,7 +5695,7 @@ mod tests {
             .collect();
         let (block, n) = build_dossier_block(&lines);
         assert!(block.chars().count() <= BLOCK_MAX_CHARS);
-        assert!(n >= 1 && n < 5, "kept {} project lines", n);
+        assert!((1..5).contains(&n), "kept {} project lines", n);
         assert!(block.contains("Topic dossier: 5 projects"));
         assert!(block.contains(dossier::INSTRUCTION));
         assert!(block.starts_with("<retrivio_leads>\n"));
@@ -5936,7 +5855,7 @@ mod tests {
         assert_eq!(no_prompt.prompt, "");
         assert_eq!(no_prompt.session_id.as_deref(), Some("s"));
         // Stdin is capped: bytes past the cap are dropped and reported.
-        let big = vec![b'a'; 100];
+        let big = [b'a'; 100];
         let (text, truncated) = read_capped(&mut &big[..], 64);
         assert_eq!(text.len(), 64);
         assert!(truncated);
@@ -5994,47 +5913,30 @@ mod tests {
         let hash = sha1_hex("session-1");
         assert_eq!(hash.len(), 40);
         let now = 1_800_000_000.0;
-        update_session_state(
-            &state_dir,
-            &hash,
-            &["/r/a.md".to_string()],
-            &["bedrock".to_string(), "us-west-2".to_string()],
-            now,
-        )
-        .unwrap();
+        update_session_state(&state_dir, &hash, &["/r/a.md".to_string()], now).unwrap();
         update_session_state(
             &state_dir,
             &hash,
             &["/r/b.md".to_string(), "/r/a.md".to_string()],
-            &["orion".to_string(), "token=abc".to_string()],
             now + 1.0,
         )
         .unwrap();
         let st = load_state(&session_file(&state_dir, &hash));
         assert_eq!(st.shown, vec!["/r/a.md".to_string(), "/r/b.md".to_string()]);
-        // Terms are stored as salted hashes: the secret-looking term is dropped before
-        // hashing, the salt is created with the file and kept, and the hash is reproducible
-        // within the session (dedupe by equality) but not across sessions (other salt).
-        assert_eq!(st.salt.len(), 32, "{}", st.salt);
-        assert_eq!(st.term_hashes, vec![term_hash(&st.salt, "orion")]);
-        assert_ne!(
-            term_hash(&st.salt, "orion"),
-            term_hash("other-salt", "orion")
-        );
-        assert_eq!(term_hash(&st.salt, "Orion "), term_hash(&st.salt, "orion"));
         assert_eq!(st.updated_at, now + 1.0);
+        // The file holds exactly the shown paths and the write time.
         let raw = fs::read_to_string(session_file(&state_dir, &hash)).unwrap();
-        assert!(
-            !raw.contains("orion") && !raw.contains("bedrock") && !raw.contains("last_terms"),
-            "{}",
-            raw
-        );
-        // The salt survives later updates, so hashes stay comparable across turns.
-        update_session_state(&state_dir, &hash, &[], &["orion".to_string()], now + 1.5).unwrap();
-        let again = load_state(&session_file(&state_dir, &hash));
-        assert_eq!(again.salt, st.salt);
-        assert_eq!(again.term_hashes, st.term_hashes);
-        // A legacy file with `last_terms` loads without them.
+        let parsed: Value = serde_json::from_str(&raw).unwrap();
+        let mut keys: Vec<&str> = parsed
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["shown", "updated_at"], "{}", raw);
+        // Files written by earlier builds (`last_terms`, then `salt` + `term_hashes`) load with
+        // their shown paths; the other keys are ignored.
         let legacy = state_dir.join("legacy.json");
         fs::write(
             &legacy,
@@ -6043,7 +5945,14 @@ mod tests {
         .unwrap();
         let old = load_state(&legacy);
         assert_eq!(old.shown, vec!["/r/x.md".to_string()]);
-        assert!(old.term_hashes.is_empty() && old.salt.is_empty());
+        fs::write(
+            &legacy,
+            r#"{"shown":["/r/y.md"],"salt":"00ff","term_hashes":["abcd"],"updated_at":2.0}"#,
+        )
+        .unwrap();
+        let old = load_state(&legacy);
+        assert_eq!(old.shown, vec!["/r/y.md".to_string()]);
+        assert_eq!(old.updated_at, 2.0);
         fs::remove_file(&legacy).unwrap();
         assert!(!state_dir.join(format!("{}.lock", hash)).exists());
         #[cfg(unix)]
@@ -6061,7 +5970,7 @@ mod tests {
         assert!(!raw.contains("prompt"));
         // Cap at SHOWN_CAP keeps the most recent entries.
         let many: Vec<String> = (0..250).map(|i| format!("/r/m{}.md", i)).collect();
-        update_session_state(&state_dir, &hash, &many, &[], now + 2.0).unwrap();
+        update_session_state(&state_dir, &hash, &many, now + 2.0).unwrap();
         let st2 = load_state(&session_file(&state_dir, &hash));
         assert_eq!(st2.shown.len(), SHOWN_CAP);
         assert_eq!(st2.shown.last().unwrap(), "/r/m249.md");
@@ -6075,8 +5984,7 @@ mod tests {
             .unwrap()
             .as_secs_f64();
         assert!(
-            update_session_state(&state_dir, &hash, &["/r/zz.md".to_string()], &[], real_now)
-                .is_err()
+            update_session_state(&state_dir, &hash, &["/r/zz.md".to_string()], real_now).is_err()
         );
         assert_eq!(
             fs::read_to_string(session_file(&state_dir, &hash)).unwrap(),

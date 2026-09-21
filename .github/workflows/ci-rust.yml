@@ -34,13 +34,10 @@ jobs:
         run: cargo check --all-targets
 
       - name: Test
-        # Serial: the crate keeps scan settings in process-wide state (skip set, index_documents), so
-        # parallel test threads race on them. Slice 5 makes that state explicit.
-        run: cargo test -- --test-threads=1
+        run: cargo test
 
-      # Reported, not enforced, until the dead-code removal lands; then restore `-D warnings`.
       - name: Clippy
-        run: cargo clippy --all-targets
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: Format
         run: cargo fmt --check

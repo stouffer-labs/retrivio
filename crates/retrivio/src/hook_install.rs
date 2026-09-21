@@ -775,26 +775,27 @@ fn base_home() -> Result<PathBuf, String> {
             return Ok(PathBuf::from(trimmed));
         }
     }
-    super::home_dir().ok_or_else(|| "cannot determine home directory (HOME unset)".to_string())
+    crate::util::home_dir()
+        .ok_or_else(|| "cannot determine home directory (HOME unset)".to_string())
 }
 
 fn resolve_bin(explicit: Option<&str>) -> Result<PathBuf, String> {
     if let Some(raw) = explicit {
-        let path = super::expand_tilde(raw);
+        let path = crate::util::expand_tilde(raw);
         let canon = fs::canonicalize(&path).map_err(|e| format!("--bin {}: {}", raw, e))?;
-        if !super::is_executable_file(&canon) {
+        if !crate::util::is_executable_file(&canon) {
             return Err(format!("--bin {}: not an executable file", canon.display()));
         }
         return Ok(canon);
     }
     if let Ok(exe) = env::current_exe() {
         if let Ok(canon) = fs::canonicalize(&exe) {
-            if super::is_executable_file(&canon) {
+            if crate::util::is_executable_file(&canon) {
                 return Ok(canon);
             }
         }
     }
-    if let Some(path) = super::resolve_retrivio_command_path_native() {
+    if let Some(path) = crate::mcp::resolve_retrivio_command_path_native() {
         return Ok(fs::canonicalize(&path).unwrap_or(path));
     }
     Err("cannot resolve the retrivio binary path; pass --bin <path>".to_string())
@@ -1036,7 +1037,7 @@ fn confirm(auto_yes: bool, question: &str) -> bool {
     if auto_yes {
         return true;
     }
-    super::prompt_yes_no(question, true).unwrap_or(false)
+    crate::util::prompt_yes_no(question, true).unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -1369,7 +1370,7 @@ fn hook_status(opts: &HookOpts) -> Result<(), String> {
                 for bin in &installed_bins {
                     let path = Path::new(bin);
                     let exists = path.is_file();
-                    let executable = super::is_executable_file(path);
+                    let executable = crate::util::is_executable_file(path);
                     let matches = match (&current_bin, fs::canonicalize(path)) {
                         (Some(cur), Ok(canon)) => canon == *cur,
                         _ => false,
@@ -2027,13 +2028,13 @@ fn codex_list_hooks(server: &mut AppServer, home: &Path) -> Result<Value, String
     server.call(&build_hooks_list_request(id, home))
 }
 
+/// Per-binary Codex hook trust entries, plus the note the app server returned, if any.
+type CodexTrustReport = (Vec<(String, Vec<CodexHookTrust>)>, Option<String>);
+
 /// Read-only: for each binary in `bins`, our exact hooks and their trust status as Codex sees
 /// them, plus the `codexHome` the app-server reported. `Err` = app-server unavailable (codex
 /// missing, too old, or not answering).
-fn codex_hook_trust_report(
-    home: &Path,
-    bins: &[String],
-) -> Result<(Vec<(String, Vec<CodexHookTrust>)>, Option<String>), String> {
+fn codex_hook_trust_report(home: &Path, bins: &[String]) -> Result<CodexTrustReport, String> {
     let (mut server, codex_home) = codex_app_server_connect(home)?;
     let listed = codex_list_hooks(&mut server, home)?;
     let hooks_json = Cli::Codex.hooks_file(home);
@@ -2217,8 +2218,9 @@ fn service_run() -> Result<(), String> {
     let bin = env::current_exe().map_err(|e| format!("current_exe: {}", e))?;
     // SAFETY: installing a minimal async-signal-safe handler that only stores a flag.
     unsafe {
-        libc::signal(libc::SIGTERM, service_on_signal as usize);
-        libc::signal(libc::SIGINT, service_on_signal as usize);
+        let handler = service_on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
+        libc::signal(libc::SIGTERM, handler);
+        libc::signal(libc::SIGINT, handler);
     }
     let mut backoff: u64 = 60;
     while !SERVICE_STOP.load(Ordering::SeqCst) {
@@ -2352,7 +2354,7 @@ fn service_install(opts: &HookOpts) -> Result<(), String> {
     match launchctl(&["bootstrap", &domain, &plist_str]) {
         Ok(_) => {
             println!("  loaded {}", target);
-            return Ok(());
+            Ok(())
         }
         Err(first) => {
             // Already loaded (EEXIST / "already bootstrapped" / I/O error 5): reload so the new
@@ -2477,7 +2479,7 @@ fn find_on_path(name: &str, path: &str) -> Option<PathBuf> {
     path.split(':')
         .filter(|d| !d.is_empty())
         .map(|d| Path::new(d).join(name))
-        .find(|p| super::is_executable_file(p))
+        .find(|p| crate::util::is_executable_file(p))
 }
 
 /// The `PATH` value inside a rendered launchd plist (`EnvironmentVariables` -> `PATH`), XML

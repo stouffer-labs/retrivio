@@ -132,7 +132,7 @@ fn stem_tokens(file_name: &str) -> Vec<String> {
         Some((s, ext)) if !s.is_empty() && ext.chars().all(|c| c.is_ascii_alphanumeric()) => s,
         _ => lower.as_str(),
     };
-    stem.split(|c: char| matches!(c, '-' | '_' | ' ' | '.' | '(' | ')' | '[' | ']'))
+    stem.split(['-', '_', ' ', '.', '(', ')', '[', ']'])
         .filter(|t| !t.is_empty())
         .map(|t| t.to_string())
         .collect()
@@ -377,9 +377,7 @@ fn first_heading(head: &str) -> Option<String> {
         return None;
     }
     let body = after.trim_start();
-    let stop = body
-        .find(|c: char| c == '\n' || c == '#')
-        .unwrap_or(body.len());
+    let stop = body.find(['\n', '#']).unwrap_or(body.len());
     let title = body[..stop].trim();
     if title.is_empty() {
         None
@@ -607,7 +605,7 @@ pub fn normalize_stem(file_name: &str) -> String {
     };
     let blanked = blank_dates_and_copy_markers(stem);
     let toks: Vec<&str> = blanked
-        .split(|c: char| matches!(c, '-' | '_' | ' ' | '.' | '(' | ')' | '[' | ']'))
+        .split(['-', '_', ' ', '.', '(', ')', '[', ']'])
         .filter(|tok| !tok.is_empty())
         .collect();
     let mut parts: Vec<&str> = Vec::with_capacity(toks.len());

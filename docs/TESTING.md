@@ -29,9 +29,9 @@ Every L2/L3 run writes its own report; keep it. Convention: `tmp/harness-runs/<d
 ## L0: unit tests, formatting, lints, public tree
 
 ```bash
-cargo test -p retrivio -- --test-threads=1   # serial: process-wide scan settings; expected: "test result: ok. N passed; 0 failed"
+cargo test -p retrivio                 # expected: "test result: ok. N passed; 0 failed" (twice: unit tests, then the binary end-to-end test)
 cargo fmt --check                      # expected: no output, exit 0
-cargo clippy -p retrivio               # reported, not gating: note the warning count in the run record
+cargo clippy --all-targets -- -D warnings   # expected: no warnings, exit 0 (gating; a targeted allow needs a same-line reason)
 scripts/check-public-tree.sh           # expected: "check-public-tree: ok (N tracked files)"
 ```
 
@@ -152,6 +152,8 @@ Raw output of every check (`stdout`, `stderr`, Codex last message, return code, 
 ## L4: background watcher
 
 Run this on a machine where the watcher may run against the live index (it indexes; it is not read-only), after L1 to L3 are clean.
+
+The watcher must not be blocked on a macOS privacy prompt. An unsigned or ad-hoc-signed local build is asked for access to Documents (and the other protected folders) again after every rebuild, and a launchd agent has no window to answer in, so the process sits at the prompt: `retrivio service status` shows a pid but `~/.retrivio/watch.log` gets no bootstrap tick. `log show --last 30m --predicate 'subsystem == "com.apple.TCC"' | grep -i retrivio` shows TCC's activity for retrivio (look for `kTCCServiceSystemPolicyDocumentsFolder`), and the dialog itself is on the desktop. Sign local builds with `scripts/sign-macos.sh` and a self-signed identity (`docs/DISTRIBUTION.md`, "Code signing on macOS"), in this order: `retrivio service uninstall`, `cargo build --release -p retrivio`, `scripts/sign-macos.sh`, `retrivio service install` (the script refuses to sign a running binary); without an identity the ad-hoc signature re-prompts per build. The grant is expected to survive rebuilds because the designated requirement the script prints (`codesign -d -r-`) is the same for every build signed with that certificate and identifier; confirm it once on the machine: rebuild, sign and reinstall twice, compare the requirement line each time, and check that no new prompt appears (no new TCC line in the `log show` output above, and the bootstrap tick in `~/.retrivio/watch.log`). Record the requirement lines with the L4 result.
 
 ```bash
 retrivio service install                 # launchd agent com.stouffer-labs.retrivio.watch; watch --quiet --interval 300

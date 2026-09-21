@@ -4,7 +4,7 @@
 // then resolves them to file paths within the project.
 
 use super::lang_support::{self, LanguageId};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// A raw import extracted from source code.
 #[derive(Debug, Clone)]

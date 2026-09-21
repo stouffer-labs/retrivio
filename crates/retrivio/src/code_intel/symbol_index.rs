@@ -12,7 +12,6 @@ pub struct ExtractedSymbol {
     pub signature: String,   // first line or function signature
     pub doc_comment: String, // preceding doc comment
     pub visibility: String,  // "pub", "private", "protected", ""
-    pub parent_name: String, // empty for top-level, parent symbol name for nested
 }
 
 /// Extract symbols from a source file.
@@ -83,7 +82,6 @@ fn extract_from_node(
                             signature: sig,
                             doc_comment: doc,
                             visibility: vis,
-                            parent_name: parent_name.to_string(),
                         });
                     }
                 }
@@ -110,7 +108,6 @@ fn extract_from_node(
             signature: sig,
             doc_comment: doc,
             visibility: vis,
-            parent_name: parent_name.to_string(),
         });
 
         // Recurse into bodies of classes, structs, impl blocks to find methods
