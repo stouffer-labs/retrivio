@@ -12,6 +12,10 @@ use std::{env, fs, process};
 
 use crate::config_tui::run_stty_capture;
 
+/// Remove CSI sequences (`ESC [`, parameters and intermediates, then a final byte anywhere in
+/// `@`..`~`, 0x40–0x7E) and SS3 sequences (`ESC O x`). Any other ESC is dropped on its own,
+/// the character after it kept. String sequences (OSC, DCS, APC, PM, SOS) are the
+/// picker's `strip_esc_strings` job.
 pub(crate) fn strip_terminal_control_sequences(raw: &str) -> String {
     let mut cleaned = String::with_capacity(raw.len());
     let mut chars = raw.chars().peekable();
@@ -24,7 +28,7 @@ pub(crate) fn strip_terminal_control_sequences(raw: &str) -> String {
             Some('[') => {
                 chars.next();
                 for next in chars.by_ref() {
-                    if next.is_ascii_alphabetic() || next == '~' {
+                    if ('\u{40}'..='\u{7e}').contains(&next) {
                         break;
                     }
                 }
@@ -521,4 +525,22 @@ pub(crate) fn expand_tilde<S: AsRef<str>>(s: S) -> PathBuf {
 pub(crate) fn shell_escape(s: &str) -> String {
     let escaped = s.replace('\'', "'\"'\"'");
     format!("'{}'", escaped)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn csi_ends_at_any_final_byte() {
+        // `@` (0x40) and `{` (0x7B) are final bytes too, not only letters and `~`.
+        assert_eq!(strip_terminal_control_sequences("\x1b[1@text"), "text");
+        assert_eq!(strip_terminal_control_sequences("\x1b[1{x"), "x");
+        assert_eq!(strip_terminal_control_sequences("\x1b[?25lshown"), "shown");
+        assert_eq!(
+            strip_terminal_control_sequences("a\x1b[38;5;196mb\x1b[0m\x1b[2~c"),
+            "abc"
+        );
+        assert_eq!(strip_terminal_control_sequences("\x1bOAup"), "up");
+    }
 }

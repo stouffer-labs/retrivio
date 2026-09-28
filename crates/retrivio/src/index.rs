@@ -20,6 +20,7 @@ use crate::db::{
     APP_STATE_ACTIVE_MODEL_KEY, APP_STATE_EMBED_FINGERPRINT, APP_STATE_LANCE_DIRTY,
     APP_STATE_REEMBED_REQUIRED, APP_STATE_SCAN_CAPS_FINGERPRINT,
 };
+use crate::describe_store::describe_pending;
 use crate::embed::{
     build_embedder, embed_runtime_snapshot, ensure_native_embed_backend,
     reset_embed_runtime_metrics, Embedder,
@@ -189,6 +190,15 @@ pub(crate) struct IndexStats {
     /// Documents that yielded no text (over a bound, corrupt, parser error or panic, PDF
     /// child killed). A previously indexed one keeps its old content.
     pub(crate) documents_failed: i64,
+    /// Files whose title and kind were (re)described this run (picker metadata; no embedding).
+    pub(crate) files_described: i64,
+    /// Of those, files that could not be read: they carry the file-name title and are retried
+    /// on the next run.
+    pub(crate) files_describe_failed: i64,
+    /// Projects whose synopsis was (re)described this run.
+    pub(crate) projects_described: i64,
+    /// Picker metadata rows dropped because their file left the manifest.
+    pub(crate) file_meta_pruned: i64,
     /// Projects whose run failed (collector panic, sqlite or code-intelligence error, the
     /// embedding failure that stopped the run). Each keeps its previous state: old signature,
     /// nothing pruned, nothing published; the fingerprints do not advance. `index` exits
@@ -1233,6 +1243,45 @@ pub(crate) fn run_native_index_with_embedder(
     conn.execute_batch("PRAGMA optimize;")
         .map_err(|e| format!("database optimize failed: {}", e))?;
     stats.elapsed_total_ms = t_start.elapsed().as_millis() as u64;
+    // Picker metadata (titles, kinds, README synopses): a metadata-only pass over manifest
+    // rows that lack a current description. Reads file heads only; no chunk, vector or
+    // embedding is touched. Skipped on reembed, which changes no file.
+    if reason != "reembed" {
+        let limits = caps.extract_limits();
+        match describe_pending(&conn, &settings, &limits, 100_000) {
+            Ok(report) => {
+                stats.files_described = report.files_described as i64;
+                stats.files_describe_failed = report.files_failed as i64;
+                stats.projects_described = report.projects_described as i64;
+                stats.file_meta_pruned = report.rows_pruned as i64;
+                if emit_progress
+                    && (report.files_described > 0
+                        || report.projects_described > 0
+                        || report.rows_pruned > 0)
+                {
+                    progress_clear_line();
+                    let failed = if report.files_failed > 0 {
+                        format!(" ({} failed, will retry)", report.files_failed)
+                    } else {
+                        String::new()
+                    };
+                    let pruned = if report.rows_pruned > 0 {
+                        format!(", {} orphaned rows pruned", report.rows_pruned)
+                    } else {
+                        String::new()
+                    };
+                    println!(
+                        "{}: described {} files{} and {} projects{} (titles and kinds for the picker; no embedding)",
+                        reason, report.files_described, failed, report.projects_described, pruned
+                    );
+                }
+            }
+            Err(e) => {
+                progress_clear_line();
+                eprintln!("warning: picker metadata pass failed: {}", e);
+            }
+        }
+    }
     Ok(stats)
 }
 
@@ -1273,6 +1322,17 @@ pub(crate) fn print_index_stats(stats: &IndexStats, cfg: &ConfigValues) {
     println!(
         "documents extracted: {} (failed: {})",
         stats.documents_extracted, stats.documents_failed
+    );
+    println!(
+        "picker metadata described: {} files ({} failed, will retry), {} projects{}",
+        stats.files_described,
+        stats.files_describe_failed,
+        stats.projects_described,
+        if stats.file_meta_pruned > 0 {
+            format!(", {} orphaned rows pruned", stats.file_meta_pruned)
+        } else {
+            String::new()
+        }
     );
     if stats.projects_failed > 0 {
         println!(

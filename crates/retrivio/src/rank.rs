@@ -149,30 +149,30 @@ LIMIT ?2
 
 #[derive(Clone)]
 pub(crate) struct EvidenceHit {
-    chunk_id: i64,
+    pub(crate) chunk_id: i64,
     pub(crate) chunk_index: i64,
-    doc_path: String,
+    pub(crate) doc_path: String,
     pub(crate) doc_rel_path: String,
     pub(crate) score: f64,
-    semantic: f64,
-    lexical: f64,
-    graph: f64,
+    pub(crate) semantic: f64,
+    pub(crate) lexical: f64,
+    pub(crate) graph: f64,
     pub(crate) relation: String,
-    quality: f64,
+    pub(crate) quality: f64,
     pub(crate) excerpt: String,
     // Freshness (spec §4) and role (slice 3)
-    content_date: f64,
-    date_source: &'static str,
-    age_days: f64,
-    freshness_tier: String,
-    is_record: bool,
-    role: &'static str,
-    verify: bool,
-    noise: bool,
-    raw_similarity: Option<f64>,
-    recency: f64,
+    pub(crate) content_date: f64,
+    pub(crate) date_source: &'static str,
+    pub(crate) age_days: f64,
+    pub(crate) freshness_tier: String,
+    pub(crate) is_record: bool,
+    pub(crate) role: &'static str,
+    pub(crate) verify: bool,
+    pub(crate) noise: bool,
+    pub(crate) raw_similarity: Option<f64>,
+    pub(crate) recency: f64,
     /// Which signals contributed (slice 4); see [`why_string`].
-    why: String,
+    pub(crate) why: String,
 }
 
 #[derive(Clone)]

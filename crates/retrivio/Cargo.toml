@@ -40,3 +40,6 @@ tokio = { version = "1", features = ["rt-multi-thread"] }
 arrow-array = "57"
 arrow-schema = "57"
 futures = "0.3"
+
+# Picker column layout by terminal cell width (pick_view.rs)
+unicode-width = "0.2"
