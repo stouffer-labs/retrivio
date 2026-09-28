@@ -1102,7 +1102,7 @@ impl ScanCaps {
     /// The bounds one document extraction gets: the text cut at about `max_file_chars`
     /// characters (the collector cuts at exactly that many afterwards), the archive and PDF
     /// bounds from the config keys.
-    fn extract_limits(&self) -> documents::ExtractLimits {
+    pub(crate) fn extract_limits(&self) -> documents::ExtractLimits {
         documents::ExtractLimits {
             archive_uncompressed_bytes: self.max_document_uncompressed_bytes,
             pdf_timeout: Duration::from_millis(self.document_extract_timeout_ms),

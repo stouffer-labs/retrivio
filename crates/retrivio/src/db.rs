@@ -1551,6 +1551,7 @@ CREATE INDEX IF NOT EXISTS idx_file_dep_edges_target ON file_dependency_edges(ta
     ensure_projects_scan_columns(conn)?;
     ensure_chunk_vector_identity_columns(conn)?;
     ensure_project_vector_identity_columns(conn)?;
+    crate::describe_store::ensure_describe_tables(conn)?;
     Ok(())
 }
 

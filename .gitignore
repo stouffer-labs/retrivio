@@ -15,3 +15,6 @@ docs/superpowers/
 *.jsonl
 # os
 .DS_Store
+
+# Subagent-driven-development scratch (ledger, briefs, review packages)
+.superpowers/

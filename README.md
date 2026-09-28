@@ -376,6 +376,7 @@ Testing: [`docs/TESTING.md`](docs/TESTING.md) is the layered test plan (unit tes
 | `retrivio config set <key> <value>` | Set one key with validation and clamping |
 | `retrivio search [--view projects\|files] [--limit <n>] [--since <days>] [--json] <query>` | Search; `--json` prints the API `/search` payload, `--since` is a files-view hard filter on content date |
 | `retrivio dossier [--limit <n>] [--json] <topic>` | Cross-folder topic dossier: the top projects (default 6, max 8) that hold material about the topic, one entry file each, evidence counts, reasons and related projects; `--json` prints the `topic-dossier-v1` payload the MCP tool `topic_dossier` returns (see "Topic dossier") |
+| `retrivio [jump] [--files\|--dirs] [--limit <n>] [query...]` | Interactive fzf picker over projects (`--files` for files); a bare `retrivio` or `retrivio <words>` runs the same command; prints the selected path for a shell wrapper to `cd` into (see "Jump picker") |
 
 ### Tracking & Indexing
 
@@ -400,6 +401,25 @@ Testing: [`docs/TESTING.md`](docs/TESTING.md) is the layered test plan (unit tes
 | `retrivio hook [install\|uninstall\|status] [--claude] [--codex] [--yes]` | Manage the proactive-recall hooks in `~/.claude/settings.json` and `~/.codex/hooks.json` |
 | `retrivio service [install\|uninstall\|status]` | Background watcher as a launchd agent (macOS); prints a systemd unit on Linux |
 | `retrivio mcp [serve\|doctor\|register\|unregister]` | MCP server and registration with Claude Code, Codex, Kiro, Gemini CLI |
+
+### Jump picker
+
+`retrivio` (or `retrivio <words>`) opens an fzf picker that re-ranks on every keystroke. It needs fzf 0.35 or newer; live reflow of the rows when the terminal is resized needs fzf 0.46 or newer (an older fzf keeps working without it). Rows are title first:
+
+```
+type     title                                              where                                        when  match
+md       Acme Planning Suite "Semantic Layer" review        202606-navigating…/Acme/20260918-…-review.md 10d   both · seed
+```
+
+- **type**: what the file is (`md`, `txt`, `email`, `transcr`, `handoff`, `notes`, `slides`, `spec`, `deck`, `sheet`, `pdf`, `html`, `doc`, `code`, `config`, `data`), from the file's content and path. Project rows show `dir`.
+- **title**: the document's own title: front-matter `title:`, Office/HTML metadata, the first `# ` heading, a crawler `Title:` line, an email `Subject:`, the first sentence of prose, or the humanised file name. Code rows show the matched symbol and file (`parent::symbol · file.rs`); config, data and dotfiles keep their file name. Projects show the folder name; the **about** column is the README's first heading and paragraph, else `N files · top: <best matching document>`.
+- **where**: project and path, with the middle elided so the file name stays whole.
+- **when**: age of the content date (`10d`, `3mo`, `2y`).
+- **match**: words, never numbers. `words` = the query terms occur, `meaning` = strong semantic match, `both`, `path` = the path matched, `weak`; then the graph relation: `seed`, `project`, `linked`. The fused score is relative to the other results of the same query, so it is not shown as a number in the list.
+
+The preview pane shows the full title; kind · role · date · project · path; a plain-English **why** (with the raw signal values dimmed after it); the query-centred snippet with the matched terms underlined and `(chunk i of n)`; and the best related document by title. The column thresholds apply to the usable width (the terminal minus fzf's border and gutter): narrow terminals drop the `when` column below about 120 columns and the `where` column below about 100.
+
+Titles and kinds are stored in `file_meta` and `project_meta`, filled by a metadata-only pass at the end of every `retrivio index` (it reads the head of new or changed text files and a bounded extraction of Office and HTML documents; PDFs keep their file name; a new extractor version re-describes every file; nothing is embedded). A store indexed by an older release shows file-name titles until its next index run. A file that cannot be read gets its file-name title and is retried on the next index (the summary says `picker metadata described: N files (M failed, will retry)`); rows for files that left the manifest are pruned at the end of the pass. Every displayed string is stripped of terminal control sequences before it is coloured.
 
 ### Watch Notes
 
